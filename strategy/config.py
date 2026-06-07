@@ -57,8 +57,10 @@ class StrategyConfig:
     take_profit_edge_fraction: float = 0.35
     max_take_profit_pct: float = 1.00
     spread_compression_exit_pct: float = 50.0
-    # Paper-test spread risk cap. This is intentionally tighter than the
-    # previous -5% experiment because the observed losers dwarfed winners.
+    # Paper experiment: disabled to test whether hedged spreads eventually
+    # mean-revert when we stop crystallising spread-widening losses. Keep the
+    # threshold available so it can be re-enabled without code changes.
+    stop_loss_enabled: bool = False
     stop_loss_pct: float = -1.00
     min_remaining_edge_pct: float = 0.03
     min_profit_to_exit_remaining_edge_pct: float = 0.05

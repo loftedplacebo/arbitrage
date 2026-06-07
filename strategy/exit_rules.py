@@ -113,7 +113,7 @@ def evaluate_exit(
         or not opportunity.short_close_fillable
     )
     if close_liquidity_bad:
-        if estimated_net_pnl_pct <= config.stop_loss_pct:
+        if config.stop_loss_enabled and estimated_net_pnl_pct <= config.stop_loss_pct:
             return ExitDecision(
                 True,
                 "close_liquidity_warning_stop_loss",
@@ -136,7 +136,7 @@ def evaluate_exit(
             estimated_net_pnl_pct,
         )
 
-    if estimated_net_pnl_pct <= config.stop_loss_pct:
+    if config.stop_loss_enabled and estimated_net_pnl_pct <= config.stop_loss_pct:
         return ExitDecision(True, "stop_loss_reached", estimated_net_pnl, estimated_net_pnl_pct)
 
     take_profit_pct = calculate_take_profit_pct(position, config)

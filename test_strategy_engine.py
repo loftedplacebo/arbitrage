@@ -288,7 +288,7 @@ def test_funding_capture_cannot_bypass_safety():
 
 def test_exit_holds_for_favourable_funding_but_stop_loss_overrides():
     now = datetime.now(timezone.utc)
-    config = StrategyConfig(min_remaining_edge_pct=0.03, stop_loss_pct=-0.30)
+    config = StrategyConfig(min_remaining_edge_pct=0.03, stop_loss_enabled=True, stop_loss_pct=-0.30)
     position = make_position()
     opportunity = make_opportunity(
         timestamp_utc=now,
@@ -444,7 +444,27 @@ def test_slight_negative_funding_near_event_decent_profit_holds():
     assert decision.reason == "hold_negative_funding_small_profit_buffer_ok"
 
 
-def test_stop_loss_overrides_negative_funding_hold():
+def test_stop_loss_disabled_holds_spread_widening_loss():
+    now = datetime.now(timezone.utc)
+    position = make_position()
+    opportunity = make_opportunity(
+        long_close_avg_price=90.0,
+        short_close_avg_price=110.0,
+        funding_benefit_pct=0.01,
+        long_next_funding_time_utc=now + timedelta(minutes=120),
+        short_next_funding_time_utc=now + timedelta(minutes=120),
+    )
+    decision = evaluate_exit(
+        position,
+        opportunity,
+        StrategyConfig(stop_loss_enabled=False, stop_loss_pct=-1.00),
+        now=now,
+    )
+    assert decision.should_exit is False
+    assert decision.reason == "hold"
+
+
+def test_stop_loss_enabled_overrides_negative_funding_hold():
     now = datetime.now(timezone.utc)
     position = make_position()
     opportunity = make_opportunity(
@@ -457,7 +477,7 @@ def test_stop_loss_overrides_negative_funding_hold():
     decision = evaluate_exit(
         position,
         opportunity,
-        StrategyConfig(stop_loss_pct=-1.00),
+        StrategyConfig(stop_loss_enabled=True, stop_loss_pct=-1.00),
         now=now,
     )
     assert decision.should_exit is True
@@ -506,7 +526,7 @@ def test_close_liquidity_warning_stop_loss_exits():
     decision = evaluate_exit(
         position,
         opportunity,
-        StrategyConfig(stop_loss_pct=-1.00),
+        StrategyConfig(stop_loss_enabled=True, stop_loss_pct=-1.00),
         now=datetime.now(timezone.utc),
     )
     assert decision.should_exit is True
@@ -644,7 +664,8 @@ if __name__ == "__main__":
     test_materially_negative_funding_near_event_exits_even_when_profitable()
     test_negative_funding_near_event_small_profit_exits()
     test_slight_negative_funding_near_event_decent_profit_holds()
-    test_stop_loss_overrides_negative_funding_hold()
+    test_stop_loss_disabled_holds_spread_widening_loss()
+    test_stop_loss_enabled_overrides_negative_funding_hold()
     test_close_liquidity_warning_holds_first_scan()
     test_close_liquidity_warning_persistent_exits()
     test_close_liquidity_warning_stop_loss_exits()

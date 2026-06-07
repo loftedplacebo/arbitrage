@@ -167,6 +167,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Min take profit %: {config.min_take_profit_pct:g}")
     print(f"  Take profit edge fraction: {config.take_profit_edge_fraction:g}")
     print(f"  Max take profit %: {config.max_take_profit_pct:g}")
+    print(f"  Stop loss enabled: {config.stop_loss_enabled}")
     print(f"  Stop loss pct: {config.stop_loss_pct:g}")
     print(f"  Min profit to exit remaining edge %: {config.min_profit_to_exit_remaining_edge_pct:g}")
     print(f"  Exit on missing opportunity: {config.exit_on_missing_opportunity}")
