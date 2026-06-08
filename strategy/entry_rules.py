@@ -113,7 +113,8 @@ def evaluate_entry(
         and opportunity.validated_spread_pct >= config.min_validated_spread_pct
     )
     normal_edge_ok = (
-        normal_timing_ok
+        config.normal_entries_enabled
+        and normal_timing_ok
         and normal_spread_ok
         and opportunity.net_edge_ex_funding_pct >= config.min_net_spread_ex_funding_pct
         and opportunity.net_edge_inc_funding_pct >= config.min_net_edge_inc_funding_pct
@@ -131,8 +132,6 @@ def evaluate_entry(
     )
 
     if not normal_edge_ok and not funding_capture_edge_ok:
-        if normal_edge_without_timing_ok and not normal_timing_ok:
-            return EntryDecision(False, "normal_entry_too_close_to_funding", opportunity.opportunity_key)
         if funding_capture_ready:
             return EntryDecision(False, "funding_capture_edge_below_threshold", opportunity.opportunity_key)
         if (
@@ -141,6 +140,10 @@ def evaluate_entry(
             and opportunity.funding_benefit_pct >= config.min_funding_benefit_for_capture_pct
         ):
             return EntryDecision(False, "funding_capture_not_ready", opportunity.opportunity_key)
+        if normal_edge_without_timing_ok and not config.normal_entries_enabled:
+            return EntryDecision(False, "normal_entries_disabled", opportunity.opportunity_key)
+        if normal_edge_without_timing_ok and not normal_timing_ok:
+            return EntryDecision(False, "normal_entry_too_close_to_funding", opportunity.opportunity_key)
         if not normal_spread_ok:
             return EntryDecision(False, "validated_spread_below_threshold", opportunity.opportunity_key)
         if opportunity.net_edge_ex_funding_pct < config.min_net_spread_ex_funding_pct:

@@ -38,6 +38,10 @@ class StrategyConfig:
     max_daily_entries: int = 500
     max_consecutive_losses: int = 10
 
+    # Paper experiment: focus the next run on funding-capture entries. Normal
+    # spread-only entries were the weaker cohort in the previous run.
+    normal_entries_enabled: bool = False
+
     # Normal spread trades should have a high spread and high net edge.
     # These thresholds are intentionally conservative because the entry signal
     # must survive close-side fees, close slippage, and spread movement.
@@ -53,9 +57,9 @@ class StrategyConfig:
     # dynamic based on entry edge.
     take_profit_pct: float = 0.35
     use_dynamic_take_profit: bool = True
-    min_take_profit_pct: float = 0.35
-    take_profit_edge_fraction: float = 0.35
-    max_take_profit_pct: float = 1.00
+    min_take_profit_pct: float = 0.50
+    take_profit_edge_fraction: float = 0.50
+    max_take_profit_pct: float = 1.50
     spread_compression_exit_pct: float = 50.0
     # Paper experiment: disabled to test whether hedged spreads eventually
     # mean-revert when we stop crystallising spread-widening losses. Keep the
@@ -65,9 +69,11 @@ class StrategyConfig:
     min_remaining_edge_pct: float = 0.03
     min_profit_to_exit_remaining_edge_pct: float = 0.05
     max_hold_hours: float = 24.0
+    max_hold_exit_requires_profit: bool = True
     max_missing_scans_before_exit: int = 3
     exit_on_missing_opportunity: bool = False
     max_existing_position_loss_pct_for_add: float = -0.30
+    block_adds_when_funding_negative: bool = True
 
     estimated_entry_fee_pct: float = 0.10
     estimated_exit_fee_pct: float = 0.10
@@ -87,6 +93,9 @@ class StrategyConfig:
     hold_through_favourable_funding: bool = True
     hold_funding_window_minutes: float = 30.0
     funding_exit_decision_window_minutes: float = 15.0
+    # Paper experiment: negative funding is a warning/do-not-add signal, not a
+    # forced realised loss while testing whether widened spreads recover.
+    exit_on_negative_funding: bool = False
     exit_negative_funding_if_losing: bool = True
     funding_flip_exit_requires_loss: bool = True
     max_negative_funding_tolerated_pct: float = -0.03

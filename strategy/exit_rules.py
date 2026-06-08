@@ -164,6 +164,14 @@ def evaluate_exit(
         return ExitDecision(True, "remaining_edge_too_low", estimated_net_pnl, estimated_net_pnl_pct)
 
     if opportunity.funding_benefit_pct is not None and opportunity.funding_benefit_pct < 0:
+        if not config.exit_on_negative_funding:
+            return ExitDecision(
+                False,
+                "negative_funding_exit_disabled_hold",
+                estimated_net_pnl,
+                estimated_net_pnl_pct,
+            )
+
         if not negative_funding_event_near(opportunity, config, now):
             return ExitDecision(
                 False,
@@ -221,6 +229,13 @@ def evaluate_exit(
 
     hold_hours = (now - position.created_at).total_seconds() / 3600
     if hold_hours >= config.max_hold_hours:
+        if config.max_hold_exit_requires_profit and estimated_net_pnl <= 0:
+            return ExitDecision(
+                False,
+                "max_hold_reached_unprofitable_hold",
+                estimated_net_pnl,
+                estimated_net_pnl_pct,
+            )
         return ExitDecision(True, "max_hold_hours_reached", estimated_net_pnl, estimated_net_pnl_pct)
 
     return ExitDecision(False, "hold", estimated_net_pnl, estimated_net_pnl_pct)

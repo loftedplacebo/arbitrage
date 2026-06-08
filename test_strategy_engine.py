@@ -203,9 +203,13 @@ def test_funding_capture_ready_window():
 def test_entry_normal_and_funding_capture_modes():
     now = datetime.now(timezone.utc)
     normal = make_opportunity(timestamp_utc=now)
-    normal_decision = evaluate_entry(normal, {}, StrategyConfig(), now=now)
+    normal_decision = evaluate_entry(normal, {}, StrategyConfig(normal_entries_enabled=True), now=now)
     assert normal_decision.should_enter is True
     assert normal_decision.reason == "entry_ok"
+
+    default_normal_decision = evaluate_entry(normal, {}, StrategyConfig(), now=now)
+    assert default_normal_decision.should_enter is False
+    assert default_normal_decision.reason == "normal_entries_disabled"
 
     funding_capture = make_opportunity(
         timestamp_utc=now,
@@ -233,7 +237,7 @@ def test_normal_entry_too_close_to_funding_rejected_without_benefit():
         long_next_funding_time_utc=now + timedelta(minutes=30),
         short_next_funding_time_utc=now + timedelta(minutes=30),
     )
-    decision = evaluate_entry(opportunity, {}, StrategyConfig(), now=now)
+    decision = evaluate_entry(opportunity, {}, StrategyConfig(normal_entries_enabled=True), now=now)
     assert decision.should_enter is False
     assert decision.reason == "normal_entry_too_close_to_funding"
 
@@ -249,7 +253,7 @@ def test_normal_entry_near_funding_allowed_when_favourable():
         long_next_funding_time_utc=now + timedelta(minutes=30),
         short_next_funding_time_utc=now + timedelta(minutes=30),
     )
-    decision = evaluate_entry(opportunity, {}, StrategyConfig(), now=now)
+    decision = evaluate_entry(opportunity, {}, StrategyConfig(normal_entries_enabled=True), now=now)
     assert decision.should_enter is True
     assert decision.reason == "entry_ok"
 
@@ -352,9 +356,29 @@ def test_negative_funding_far_away_holds():
         long_next_funding_time_utc=now + timedelta(minutes=120),
         short_next_funding_time_utc=now + timedelta(minutes=120),
     )
-    decision = evaluate_exit(position, opportunity, StrategyConfig(take_profit_pct=1.0), now=now)
+    decision = evaluate_exit(
+        position,
+        opportunity,
+        StrategyConfig(take_profit_pct=1.0, exit_on_negative_funding=True),
+        now=now,
+    )
     assert decision.should_exit is False
     assert decision.reason == "funding_negative_but_not_near_event"
+
+
+def test_negative_funding_default_exit_disabled_holds():
+    now = datetime.now(timezone.utc)
+    position = make_position()
+    opportunity = make_opportunity(
+        long_close_avg_price=99.99,
+        short_close_avg_price=101.0,
+        funding_benefit_pct=-0.01,
+        long_next_funding_time_utc=now + timedelta(minutes=10),
+        short_next_funding_time_utc=now + timedelta(minutes=10),
+    )
+    decision = evaluate_exit(position, opportunity, StrategyConfig(), now=now)
+    assert decision.should_exit is False
+    assert decision.reason == "negative_funding_exit_disabled_hold"
 
 
 def test_negative_funding_near_event_losing_exits():
@@ -367,7 +391,7 @@ def test_negative_funding_near_event_losing_exits():
         long_next_funding_time_utc=now + timedelta(minutes=10),
         short_next_funding_time_utc=now + timedelta(minutes=10),
     )
-    decision = evaluate_exit(position, opportunity, StrategyConfig(), now=now)
+    decision = evaluate_exit(position, opportunity, StrategyConfig(exit_on_negative_funding=True), now=now)
     assert decision.should_exit is True
     assert decision.reason == "negative_funding_near_event_losing"
 
@@ -388,6 +412,7 @@ def test_materially_negative_funding_near_event_exits_even_when_profitable():
         StrategyConfig(
             max_negative_funding_tolerated_pct=-0.03,
             take_profit_pct=1.0,
+            exit_on_negative_funding=True,
         ),
         now=now,
     )
@@ -412,6 +437,7 @@ def test_negative_funding_near_event_small_profit_exits():
             estimated_exit_fee_pct=0.0,
             min_profit_to_hold_negative_funding_pct=0.10,
             take_profit_pct=1.0,
+            exit_on_negative_funding=True,
         ),
         now=now,
     )
@@ -437,11 +463,41 @@ def test_slight_negative_funding_near_event_decent_profit_holds():
             min_profit_to_hold_negative_funding_pct=0.10,
             max_negative_funding_tolerated_pct=-0.03,
             take_profit_pct=1.0,
+            exit_on_negative_funding=True,
         ),
         now=now,
     )
     assert decision.should_exit is False
     assert decision.reason == "hold_negative_funding_small_profit_buffer_ok"
+
+
+def test_max_hold_requires_profit_by_default():
+    now = datetime.now(timezone.utc)
+    old_position = make_position(created_at=now - timedelta(hours=25), updated_at=now)
+    losing = make_opportunity(
+        timestamp_utc=now,
+        long_close_avg_price=99.90,
+        short_close_avg_price=101.0,
+        funding_benefit_pct=0.01,
+    )
+    decision = evaluate_exit(old_position, losing, StrategyConfig(), now=now)
+    assert decision.should_exit is False
+    assert decision.reason == "max_hold_reached_unprofitable_hold"
+
+    profitable = make_opportunity(
+        timestamp_utc=now,
+        long_close_avg_price=100.20,
+        short_close_avg_price=101.0,
+        funding_benefit_pct=0.01,
+    )
+    decision = evaluate_exit(
+        old_position,
+        profitable,
+        StrategyConfig(estimated_exit_fee_pct=0.0),
+        now=now,
+    )
+    assert decision.should_exit is True
+    assert decision.reason == "max_hold_hours_reached"
 
 
 def test_stop_loss_disabled_holds_spread_widening_loss():
@@ -559,6 +615,19 @@ def test_existing_losing_position_blocks_new_slice():
     assert decision.reason == "existing_position_too_negative_to_add"
 
 
+def test_existing_position_negative_funding_blocks_new_slice():
+    opportunity = make_opportunity(funding_benefit_pct=-0.01)
+    existing = make_position()
+    decision = evaluate_entry_risk(
+        opportunity=opportunity,
+        open_positions={opportunity.position_key: existing},
+        config=StrategyConfig(),
+        desired_notional_usd=100.0,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "existing_position_negative_funding_no_add"
+
+
 def test_stock_like_symbols_are_not_crypto():
     for symbol in [
         "QCOMUSDT",
@@ -664,6 +733,8 @@ if __name__ == "__main__":
     test_materially_negative_funding_near_event_exits_even_when_profitable()
     test_negative_funding_near_event_small_profit_exits()
     test_slight_negative_funding_near_event_decent_profit_holds()
+    test_negative_funding_default_exit_disabled_holds()
+    test_max_hold_requires_profit_by_default()
     test_stop_loss_disabled_holds_spread_widening_loss()
     test_stop_loss_enabled_overrides_negative_funding_hold()
     test_close_liquidity_warning_holds_first_scan()
@@ -671,6 +742,7 @@ if __name__ == "__main__":
     test_close_liquidity_warning_stop_loss_exits()
     test_existing_position_with_close_liquidity_warning_blocks_new_slice()
     test_existing_losing_position_blocks_new_slice()
+    test_existing_position_negative_funding_blocks_new_slice()
     test_stock_like_symbols_are_not_crypto()
     test_default_strategy_blocks_known_synthetic_symbols()
     test_paper_execution_uses_opportunity_timestamp_for_fills()

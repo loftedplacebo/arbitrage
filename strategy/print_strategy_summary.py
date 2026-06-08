@@ -95,6 +95,8 @@ def run(args: argparse.Namespace) -> None:
         "projected_negative_funding_too_high",
         "negative_funding_near_event_profit_too_small",
         "hold_negative_funding_small_profit_buffer_ok",
+        "negative_funding_exit_disabled_hold",
+        "max_hold_reached_unprofitable_hold",
     ]
     funding_timing_counts = Counter({
         reason: exit_reasons.get(reason, 0)
@@ -144,6 +146,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Max symbol notional: ${config.max_symbol_notional_usd:,.2f}")
     print(f"  Max exchange notional: ${config.max_exchange_notional_usd:,.2f}")
     print(f"  Funding capture enabled: {config.funding_capture_enabled}")
+    print(f"  Normal spread entries enabled: {config.normal_entries_enabled}")
     print(f"  Funding capture window minutes: {config.funding_capture_window_minutes:g}")
     print(f"  Min validated spread %: {config.min_validated_spread_pct:g}")
     print(f"  Min net spread ex funding %: {config.min_net_spread_ex_funding_pct:g}")
@@ -171,8 +174,11 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Stop loss pct: {config.stop_loss_pct:g}")
     print(f"  Min profit to exit remaining edge %: {config.min_profit_to_exit_remaining_edge_pct:g}")
     print(f"  Exit on missing opportunity: {config.exit_on_missing_opportunity}")
+    print(f"  Max hold exit requires profit: {config.max_hold_exit_requires_profit}")
     print(f"  Max existing position loss pct for add: {config.max_existing_position_loss_pct_for_add:g}")
+    print(f"  Block adds when funding negative: {config.block_adds_when_funding_negative}")
     print(f"  Funding exit decision window minutes: {config.funding_exit_decision_window_minutes:g}")
+    print(f"  Exit on negative funding: {config.exit_on_negative_funding}")
 
     print("\nOpen positions by symbol")
     if not by_symbol:

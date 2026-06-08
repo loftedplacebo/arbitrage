@@ -55,6 +55,13 @@ def evaluate_entry_risk(
         return RiskDecision(False, "existing_position_close_liquidity_warning")
 
     if existing and existing.total_notional_usd > 0:
+        if (
+            config.block_adds_when_funding_negative
+            and opportunity.funding_benefit_pct is not None
+            and opportunity.funding_benefit_pct < 0
+        ):
+            return RiskDecision(False, "existing_position_negative_funding_no_add")
+
         existing_pnl_pct = (existing.estimated_net_pnl / existing.total_notional_usd) * 100
         if existing_pnl_pct < config.max_existing_position_loss_pct_for_add:
             return RiskDecision(False, "existing_position_too_negative_to_add")
