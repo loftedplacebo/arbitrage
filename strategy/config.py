@@ -23,6 +23,8 @@ class StrategyConfig:
         "RDDTUSDT",
         "SOXSUSDT",
         "SQQQUSDT",
+        "XOMUSDT",
+        "NATGASUSDT",
     })
 
     max_slice_notional_usd: float = 500.0

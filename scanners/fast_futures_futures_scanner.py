@@ -81,6 +81,8 @@ TOKENISED_STOCK_KEYWORDS = [
     "ARM",
     "AAOI",
     "SPCX",
+    "XOM",
+    "NATGAS",
     "XAU",
     "XAUT",
     "PAXG",

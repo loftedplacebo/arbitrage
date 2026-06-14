@@ -694,6 +694,8 @@ def test_stock_like_symbols_are_not_crypto():
         "SQQQUSDT",
         "ANTHROPICUSDT",
         "BPUSDT",
+        "XOMUSDT",
+        "NATGASUSDT",
     ]:
         assert classify_instrument(symbol) == "tokenised_stock_or_synthetic"
 
