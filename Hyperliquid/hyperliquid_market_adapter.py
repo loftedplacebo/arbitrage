@@ -111,16 +111,35 @@ class HyperliquidMarketAdapter:
         )
 
     def get_futures_usdt_symbols(self) -> set[str]:
-        mids = self.get_all_mids()
+        meta, contexts = self.get_meta_and_asset_contexts()
+        universe = meta.get("universe") or []
         symbols = set()
-        for coin, mid in mids.items():
+
+        for asset, context in zip(universe, contexts):
+            coin = str(asset.get("name") or "") if isinstance(asset, dict) else ""
+            if not self._is_supported_perp_coin(coin):
+                continue
+
+            if isinstance(asset, dict) and asset.get("isDelisted") is True:
+                continue
+
+            if not isinstance(context, dict):
+                continue
+
             try:
-                price = float(mid)
+                price = float(context.get("midPx") or 0)
+                volume_usdt = float(context.get("dayNtlVlm") or 0)
+                open_interest = float(context.get("openInterest") or 0)
             except (TypeError, ValueError):
                 continue
-            coin = str(coin)
-            if math.isfinite(price) and price > 0 and self._is_supported_perp_coin(coin):
-                symbols.add(self._standard_symbol_from_coin(str(coin)))
+
+            if (
+                math.isfinite(price)
+                and price > 0
+                and volume_usdt > 0
+                and open_interest > 0
+            ):
+                symbols.add(self._standard_symbol_from_coin(coin))
         return symbols
 
     def get_fast_futures_tickers(self) -> dict[str, dict]:
@@ -129,25 +148,31 @@ class HyperliquidMarketAdapter:
         expose bid/ask. We use mids only for fast candidate discovery; deep
         validation always re-prices with the L2 order book before paper entry.
         """
-        _, _ = self.get_meta_and_asset_contexts()
-        mids = self.get_all_mids()
+        meta, contexts = self.get_meta_and_asset_contexts()
+        universe = meta.get("universe") or []
         output = {}
 
-        for coin, mid_raw in mids.items():
-            coin = str(coin)
+        for asset, context in zip(universe, contexts):
+            coin = str(asset.get("name") or "") if isinstance(asset, dict) else ""
             if not self._is_supported_perp_coin(coin):
                 continue
 
+            if isinstance(asset, dict) and asset.get("isDelisted") is True:
+                continue
+
+            if not isinstance(context, dict):
+                continue
+
             try:
-                mid = float(mid_raw)
+                mid = float(context.get("midPx") or 0)
+                volume_usdt = float(context.get("dayNtlVlm") or 0)
+                open_interest = float(context.get("openInterest") or 0)
             except (TypeError, ValueError):
                 continue
 
-            if not math.isfinite(mid) or mid <= 0:
+            if not math.isfinite(mid) or mid <= 0 or volume_usdt <= 0 or open_interest <= 0:
                 continue
 
-            context = self._asset_context_by_coin.get(coin, {})
-            volume_usdt = float(context.get("dayNtlVlm") or 0) if isinstance(context, dict) else 0.0
             symbol = self._standard_symbol_from_coin(coin)
 
             output[symbol] = {
