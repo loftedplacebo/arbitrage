@@ -38,9 +38,11 @@ class StrategyConfig:
     max_daily_entries: int = 500
     max_consecutive_losses: int = 10
 
-    # Paper experiment: focus the next run on funding-capture entries. Normal
-    # spread-only entries were the weaker cohort in the previous run.
-    normal_entries_enabled: bool = False
+    # Spread arbitrage is the primary strategy. Funding is a modifier: it can
+    # improve priority or block a hostile setup, but it must not rescue a weak
+    # spread.
+    normal_entries_enabled: bool = True
+    funding_capture_entries_enabled: bool = False
 
     # Normal spread trades should have a high spread and high net edge.
     # These thresholds are intentionally conservative because the entry signal
@@ -48,6 +50,12 @@ class StrategyConfig:
     min_net_spread_ex_funding_pct: float = 0.50
     min_net_edge_inc_funding_pct: float = 0.50
     min_validated_spread_pct: float = 0.75
+    require_route_stats_for_entry: bool = True
+    min_route_observations_for_entry: int = 30
+    min_route_spread_percentile: float = 0.80
+    min_route_spread_zscore: float = 1.00
+    max_route_spread_trend_pct: float = 0.20
+    max_adverse_funding_for_spread_entry_pct: float = -0.03
     normal_entry_min_minutes_to_funding: float = 60.0
     normal_entry_allow_near_funding_if_benefit_pct: float = 0.05
     min_persistence_count: int = 2

@@ -147,6 +147,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Max exchange notional: ${config.max_exchange_notional_usd:,.2f}")
     print(f"  Funding capture enabled: {config.funding_capture_enabled}")
     print(f"  Normal spread entries enabled: {config.normal_entries_enabled}")
+    print(f"  Funding-capture standalone entries enabled: {config.funding_capture_entries_enabled}")
     print(f"  Funding capture window minutes: {config.funding_capture_window_minutes:g}")
     print(f"  Min validated spread %: {config.min_validated_spread_pct:g}")
     print(f"  Min net spread ex funding %: {config.min_net_spread_ex_funding_pct:g}")
@@ -156,6 +157,12 @@ def run(args: argparse.Namespace) -> None:
         "  Normal entry near-funding benefit allowance %: "
         f"{config.normal_entry_allow_near_funding_if_benefit_pct:g}"
     )
+    print(f"  Require route stats for entry: {config.require_route_stats_for_entry}")
+    print(f"  Min route observations for entry: {config.min_route_observations_for_entry}")
+    print(f"  Min route spread percentile: {config.min_route_spread_percentile:g}")
+    print(f"  Min route spread z-score: {config.min_route_spread_zscore:g}")
+    print(f"  Max route spread trend %: {config.max_route_spread_trend_pct:g}")
+    print(f"  Max adverse funding for spread entry %: {config.max_adverse_funding_for_spread_entry_pct:g}")
     print(f"  Min funding benefit for capture %: {config.min_funding_benefit_for_capture_pct:g}")
     print(
         "  Funding capture min net spread ex funding %: "

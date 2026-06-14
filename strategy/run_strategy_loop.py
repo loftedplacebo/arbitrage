@@ -76,8 +76,11 @@ def choose_best_entry_rows(
         best = max(
             notional_rows,
             key=lambda item: (
-                item.net_edge_inc_funding_pct if item.net_edge_inc_funding_pct is not None else -999,
                 item.net_edge_ex_funding_pct if item.net_edge_ex_funding_pct is not None else -999,
+                item.validated_spread_pct if item.validated_spread_pct is not None else -999,
+                item.route_spread_percentile if item.route_spread_percentile is not None else -999,
+                item.route_spread_zscore if item.route_spread_zscore is not None else -999,
+                item.net_edge_inc_funding_pct if item.net_edge_inc_funding_pct is not None else -999,
                 -abs(config.max_slice_notional_usd - item.notional_usdt)
                 if item.notional_usdt <= config.max_slice_notional_usd
                 else -999_999 - item.notional_usdt,
@@ -87,8 +90,11 @@ def choose_best_entry_rows(
 
     selected.sort(
         key=lambda item: (
-            item.net_edge_inc_funding_pct if item.net_edge_inc_funding_pct is not None else -999,
             item.net_edge_ex_funding_pct if item.net_edge_ex_funding_pct is not None else -999,
+            item.validated_spread_pct if item.validated_spread_pct is not None else -999,
+            item.route_spread_percentile if item.route_spread_percentile is not None else -999,
+            item.route_spread_zscore if item.route_spread_zscore is not None else -999,
+            item.net_edge_inc_funding_pct if item.net_edge_inc_funding_pct is not None else -999,
         ),
         reverse=True,
     )

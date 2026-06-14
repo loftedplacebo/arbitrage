@@ -59,6 +59,34 @@ def normal_entry_funding_timing_ok(
     )
 
 
+def route_spread_quality_decision(
+    opportunity: ValidatedOpportunity,
+    config: StrategyConfig,
+) -> tuple[bool, str]:
+    if not config.require_route_stats_for_entry:
+        return True, "route_spread_quality_ok"
+
+    if opportunity.route_observation_count < config.min_route_observations_for_entry:
+        return False, "route_observation_count_below_threshold"
+
+    if opportunity.route_spread_percentile is None or opportunity.route_spread_zscore is None:
+        return False, "route_stats_missing"
+
+    if opportunity.route_spread_percentile < config.min_route_spread_percentile:
+        return False, "route_spread_percentile_below_threshold"
+
+    if opportunity.route_spread_zscore < config.min_route_spread_zscore:
+        return False, "route_spread_zscore_below_threshold"
+
+    if (
+        opportunity.route_spread_trend_pct is not None
+        and opportunity.route_spread_trend_pct > config.max_route_spread_trend_pct
+    ):
+        return False, "route_spread_still_widening"
+
+    return True, "route_spread_quality_ok"
+
+
 def evaluate_entry(
     opportunity: ValidatedOpportunity,
     open_positions: dict[str, Position],
@@ -107,15 +135,22 @@ def evaluate_entry(
     if age_seconds > config.max_data_age_seconds:
         return EntryDecision(False, "stale_opportunity", opportunity.opportunity_key)
 
+    route_quality_ok, route_quality_reason = route_spread_quality_decision(opportunity, config)
     normal_timing_ok = normal_entry_funding_timing_ok(opportunity, config, now)
     normal_spread_ok = (
         opportunity.validated_spread_pct is not None
         and opportunity.validated_spread_pct >= config.min_validated_spread_pct
     )
+    funding_not_hostile = (
+        opportunity.funding_benefit_pct is None
+        or opportunity.funding_benefit_pct >= config.max_adverse_funding_for_spread_entry_pct
+    )
     normal_edge_ok = (
         config.normal_entries_enabled
+        and route_quality_ok
         and normal_timing_ok
         and normal_spread_ok
+        and funding_not_hostile
         and opportunity.net_edge_ex_funding_pct >= config.min_net_spread_ex_funding_pct
         and opportunity.net_edge_inc_funding_pct >= config.min_net_edge_inc_funding_pct
     )
@@ -126,16 +161,23 @@ def evaluate_entry(
     )
     funding_capture_ready = evaluate_funding_capture_ready(opportunity, config, now)
     funding_capture_edge_ok = (
-        funding_capture_ready
+        config.funding_capture_entries_enabled
+        and route_quality_ok
+        and funding_capture_ready
         and opportunity.net_edge_ex_funding_pct >= config.funding_capture_min_net_spread_ex_funding_pct
         and opportunity.net_edge_inc_funding_pct >= config.funding_capture_min_net_edge_inc_funding_pct
     )
 
     if not normal_edge_ok and not funding_capture_edge_ok:
-        if funding_capture_ready:
+        if not route_quality_ok:
+            return EntryDecision(False, route_quality_reason, opportunity.opportunity_key)
+        if not funding_not_hostile:
+            return EntryDecision(False, "funding_hostile_for_spread_entry", opportunity.opportunity_key)
+        if funding_capture_ready and config.funding_capture_entries_enabled:
             return EntryDecision(False, "funding_capture_edge_below_threshold", opportunity.opportunity_key)
         if (
-            config.funding_capture_enabled
+            config.funding_capture_entries_enabled
+            and config.funding_capture_enabled
             and opportunity.funding_benefit_pct is not None
             and opportunity.funding_benefit_pct >= config.min_funding_benefit_for_capture_pct
         ):
@@ -165,5 +207,7 @@ def evaluate_entry(
     if not risk.allowed:
         return EntryDecision(False, risk.reason, opportunity.opportunity_key, desired_notional)
 
-    reason = "entry_ok" if normal_edge_ok else "funding_capture_entry_ok"
+    reason = "spread_entry_funding_bonus_ok" if normal_edge_ok and funding_capture_ready else "spread_entry_ok"
+    if funding_capture_edge_ok:
+        reason = "funding_capture_entry_ok"
     return EntryDecision(True, reason, opportunity.opportunity_key, desired_notional)

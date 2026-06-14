@@ -96,6 +96,13 @@ def to_kucoin_futures_symbol(standard_symbol: str) -> str:
     return f"{base}{quote}M"
 
 
+def to_hyperliquid_symbol(standard_symbol: str) -> str:
+    base, quote = split_standard_symbol(standard_symbol)
+    if quote not in {"USDT", "USDC", "USD"}:
+        raise ValueError(f"Unsupported Hyperliquid quote asset: {quote}")
+    return base
+
+
 def standard_to_exchange_symbol(
     standard_symbol: str,
     exchange: str,
@@ -119,5 +126,10 @@ def standard_to_exchange_symbol(
         if market_type == "futures":
             return to_kucoin_futures_symbol(standard_symbol)
         return to_kucoin_spot_symbol(standard_symbol)
+
+    if exchange == "hyperliquid":
+        if market_type != "futures":
+            raise ValueError("Hyperliquid adapter only supports futures")
+        return to_hyperliquid_symbol(standard_symbol)
 
     raise ValueError(f"Unsupported exchange: {exchange}")

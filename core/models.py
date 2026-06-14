@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Literal, Optional
 
 
-Exchange = Literal["binance", "kucoin", "mexc", "bitget"]
+Exchange = Literal["binance", "kucoin", "mexc", "bitget", "hyperliquid"]
 MarketType = Literal["spot", "futures"]
 TradeSide = Literal["buy", "sell"]
 OpportunityType = Literal["spot_futures", "futures_futures"]

@@ -6,6 +6,7 @@ import itertools
 import re
 import sys
 import time
+import statistics
 from collections import defaultdict, deque
 from pathlib import Path
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from Binance.binance_market_adapter import BinanceMarketAdapter
 from Bitget.bitget_market_adapter import BitgetMarketAdapter
 from Mexc.mexc_market_adapter import MexcMarketAdapter
 from Kucoin.kucoin_market_adapter import KucoinMarketAdapter
+from Hyperliquid.hyperliquid_market_adapter import HyperliquidMarketAdapter
 
 from core.orderbook import estimate_execution_from_orderbook
 from core.scoring import calculate_net_edge_pct, classify_opportunity
@@ -36,6 +38,8 @@ FAST_SCAN_CRYPTO_ONLY = False
 ML_OBSERVATION_LOGGING_ENABLED = True
 ML_FAST_SPREAD_LOG_THRESHOLD_PCT = 0.03
 ML_MAX_FAST_OBSERVATIONS = 2_000
+ROUTE_STATS_HISTORY_SCANS = 720
+ROUTE_STATS_BOOTSTRAP_MAX_ROWS = 200_000
 
 
 # -----------------------------
@@ -161,6 +165,102 @@ def persistence_key(row: dict) -> str:
 
 def candidate_key(row: dict) -> str:
     return f"{row['symbol']}|{row['direction']}"
+
+
+def route_key(row: dict) -> str:
+    return (
+        f"{row['symbol']}|"
+        f"{row['long_exchange']}|"
+        f"{row['short_exchange']}|"
+        f"{row['direction']}"
+    )
+
+
+def calculate_route_stats(history: deque, current_spread_pct: float | None) -> dict:
+    values = [float(value) for value in history if value is not None]
+    if current_spread_pct is None or not values:
+        return {
+            "route_observation_count": len(values),
+            "route_spread_mean_pct": None,
+            "route_spread_median_pct": None,
+            "route_spread_min_pct": None,
+            "route_spread_max_pct": None,
+            "route_spread_std_pct": None,
+            "route_spread_zscore": None,
+            "route_spread_percentile": None,
+            "route_spread_trend_pct": None,
+        }
+
+    mean = statistics.fmean(values)
+    median = statistics.median(values)
+    min_value = min(values)
+    max_value = max(values)
+    std = statistics.pstdev(values) if len(values) > 1 else 0.0
+    zscore = (current_spread_pct - mean) / std if std > 1e-9 else 0.0
+    percentile = sum(1 for value in values if value <= current_spread_pct) / len(values)
+    recent_values = values[-min(5, len(values)):]
+    trend = current_spread_pct - statistics.fmean(recent_values)
+
+    return {
+        "route_observation_count": len(values),
+        "route_spread_mean_pct": mean,
+        "route_spread_median_pct": median,
+        "route_spread_min_pct": min_value,
+        "route_spread_max_pct": max_value,
+        "route_spread_std_pct": std,
+        "route_spread_zscore": zscore,
+        "route_spread_percentile": percentile,
+        "route_spread_trend_pct": trend,
+    }
+
+
+def annotate_route_stats(rows: list[dict], route_spread_history: dict[str, deque]) -> list[dict]:
+    for row in rows:
+        stats = calculate_route_stats(
+            route_spread_history.get(route_key(row), deque(maxlen=ROUTE_STATS_HISTORY_SCANS)),
+            row.get("fast_spread_pct"),
+        )
+        row.update(stats)
+    return rows
+
+
+def update_route_spread_history(rows: list[dict], route_spread_history: dict[str, deque]) -> None:
+    for row in rows:
+        spread = row.get("fast_spread_pct")
+        if spread is None:
+            continue
+        route_spread_history.setdefault(
+            route_key(row),
+            deque(maxlen=ROUTE_STATS_HISTORY_SCANS),
+        ).append(float(spread))
+
+
+def bootstrap_route_spread_history() -> dict[str, deque]:
+    history: dict[str, deque] = {}
+    files = sorted(ML_OUTPUT_DIR.glob("fast_spread_observations_*.csv"), reverse=True)
+    rows = []
+    remaining = ROUTE_STATS_BOOTSTRAP_MAX_ROWS
+
+    for path in files:
+        if remaining <= 0:
+            break
+        try:
+            with path.open("r", newline="", encoding="utf-8") as f:
+                file_rows = list(csv.DictReader(f))
+        except OSError:
+            continue
+        rows.extend(file_rows[-remaining:])
+        remaining = ROUTE_STATS_BOOTSTRAP_MAX_ROWS - len(rows)
+
+    rows.sort(key=lambda row: row.get("timestamp_utc", ""))
+    for row in rows[-ROUTE_STATS_BOOTSTRAP_MAX_ROWS:]:
+        try:
+            row["fast_spread_pct"] = float(row.get("fast_spread_pct") or 0)
+        except (TypeError, ValueError):
+            continue
+        update_route_spread_history([row], history)
+
+    return history
 
 
 # -----------------------------
@@ -415,10 +515,11 @@ def write_fast_candidates_to_csv(candidates: list[dict], timestamp: datetime) ->
             writer.writeheader()
 
         for row in candidates:
-            writer.writerow({
+            output_row = {
                 "timestamp_utc": timestamp.isoformat(),
                 **row,
-            })
+            }
+            writer.writerow({field: output_row.get(field) for field in fieldnames})
 
     return output_file
 
@@ -511,6 +612,15 @@ def deep_validate_candidate(
                 if long_close_sell.is_fillable and short_close_buy.is_fillable
                 else None
             ),
+            "route_observation_count": candidate.get("route_observation_count"),
+            "route_spread_mean_pct": candidate.get("route_spread_mean_pct"),
+            "route_spread_median_pct": candidate.get("route_spread_median_pct"),
+            "route_spread_min_pct": candidate.get("route_spread_min_pct"),
+            "route_spread_max_pct": candidate.get("route_spread_max_pct"),
+            "route_spread_std_pct": candidate.get("route_spread_std_pct"),
+            "route_spread_zscore": candidate.get("route_spread_zscore"),
+            "route_spread_percentile": candidate.get("route_spread_percentile"),
+            "route_spread_trend_pct": candidate.get("route_spread_trend_pct"),
         }
 
         if not long_buy.is_fillable or not short_sell.is_fillable:
@@ -767,6 +877,15 @@ def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> 
         "funding_benefit_pct",
         "slippage_pct",
         "close_slippage_pct",
+        "route_observation_count",
+        "route_spread_mean_pct",
+        "route_spread_median_pct",
+        "route_spread_min_pct",
+        "route_spread_max_pct",
+        "route_spread_std_pct",
+        "route_spread_zscore",
+        "route_spread_percentile",
+        "route_spread_trend_pct",
         "fees_pct",
         "net_edge_ex_funding_pct",
         "net_edge_inc_funding_pct",
@@ -810,6 +929,7 @@ def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> 
 def run_scan_once(
     adapters: dict,
     persistence_history: dict[str, deque],
+    route_spread_history: dict[str, deque],
 ) -> tuple[list[dict], list[dict]]:
     timestamp = utc_now()
 
@@ -833,6 +953,7 @@ def run_scan_once(
         except Exception as exc:
             print(f"Error fetching fast tickers for {name}: {exc}")
 
+    observations = []
     if ML_OBSERVATION_LOGGING_ENABLED:
         observations = build_fast_observations(ticker_data)
         ml_output_file = write_fast_observations_to_csv(observations, timestamp)
@@ -842,6 +963,8 @@ def run_scan_once(
             print("No ML fast spread observations found.")
 
     candidates = build_fast_candidates(ticker_data)
+    candidates = annotate_route_stats(candidates, route_spread_history)
+    update_route_spread_history(observations, route_spread_history)
 
     print("\nTop fast spread candidates")
     print(
@@ -1041,14 +1164,21 @@ def main():
         "bitget": BitgetMarketAdapter(),
         "mexc": MexcMarketAdapter(),
         "kucoin": KucoinMarketAdapter(),
+        "hyperliquid": HyperliquidMarketAdapter(),
     }
 
     persistence_history: dict[str, deque] = {}
+    route_spread_history = bootstrap_route_spread_history()
+    print(
+        "Loaded route spread history for "
+        f"{len(route_spread_history)} routes from ML observations."
+    )
 
     if not args.loop:
         run_scan_once(
             adapters=adapters,
             persistence_history=persistence_history,
+            route_spread_history=route_spread_history,
         )
         return
 
@@ -1059,6 +1189,7 @@ def main():
             run_scan_once(
                 adapters=adapters,
                 persistence_history=persistence_history,
+                route_spread_history=route_spread_history,
             )
             time.sleep(args.interval)
         except KeyboardInterrupt:

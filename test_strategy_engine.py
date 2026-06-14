@@ -2,14 +2,15 @@ from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 
 from strategy.config import StrategyConfig
-from scanners.fast_futures_futures_scanner import classify_instrument
-from strategy.entry_rules import evaluate_entry, evaluate_funding_capture_ready
+from scanners.fast_futures_futures_scanner import calculate_route_stats, classify_instrument
+from strategy.entry_rules import evaluate_entry, evaluate_funding_capture_ready, route_spread_quality_decision
 from strategy.exit_rules import estimate_position_pnl, evaluate_exit
 from strategy.models import Position, ValidatedOpportunity, format_datetime
 from strategy.paper_execution import PaperExecutionEngine
 from strategy.position_store import CsvPositionStore
 from strategy.risk_rules import evaluate_entry_risk
 from strategy.run_strategy_loop import choose_best_entry_rows, process_scan
+from core.symbols import standard_to_exchange_symbol
 
 
 def make_opportunity(**overrides):
@@ -43,6 +44,15 @@ def make_opportunity(**overrides):
         "long_close_fillable": True,
         "short_close_fillable": True,
         "close_slippage_pct": 0.0,
+        "route_observation_count": 100,
+        "route_spread_mean_pct": 0.3,
+        "route_spread_median_pct": 0.25,
+        "route_spread_min_pct": 0.05,
+        "route_spread_max_pct": 1.2,
+        "route_spread_std_pct": 0.2,
+        "route_spread_zscore": 2.5,
+        "route_spread_percentile": 0.95,
+        "route_spread_trend_pct": 0.0,
         "persistence_count": 2,
         "persistent": True,
         "spread_ready": True,
@@ -203,13 +213,13 @@ def test_funding_capture_ready_window():
 def test_entry_normal_and_funding_capture_modes():
     now = datetime.now(timezone.utc)
     normal = make_opportunity(timestamp_utc=now)
-    normal_decision = evaluate_entry(normal, {}, StrategyConfig(normal_entries_enabled=True), now=now)
+    normal_decision = evaluate_entry(normal, {}, StrategyConfig(), now=now)
     assert normal_decision.should_enter is True
-    assert normal_decision.reason == "entry_ok"
+    assert normal_decision.reason == "spread_entry_ok"
 
-    default_normal_decision = evaluate_entry(normal, {}, StrategyConfig(), now=now)
-    assert default_normal_decision.should_enter is False
-    assert default_normal_decision.reason == "normal_entries_disabled"
+    disabled_normal_decision = evaluate_entry(normal, {}, StrategyConfig(normal_entries_enabled=False), now=now)
+    assert disabled_normal_decision.should_enter is False
+    assert disabled_normal_decision.reason == "normal_entries_disabled"
 
     funding_capture = make_opportunity(
         timestamp_utc=now,
@@ -220,10 +230,15 @@ def test_entry_normal_and_funding_capture_modes():
         long_next_funding_time_utc=now + timedelta(minutes=30),
         short_next_funding_time_utc=now + timedelta(minutes=30),
     )
-    capture_config = StrategyConfig()
+    capture_config = StrategyConfig(funding_capture_entries_enabled=True)
     capture_decision = evaluate_entry(funding_capture, {}, capture_config, now=now)
     assert capture_decision.should_enter is True
     assert capture_decision.reason == "funding_capture_entry_ok"
+
+    spread_first_config = StrategyConfig()
+    spread_first_decision = evaluate_entry(funding_capture, {}, spread_first_config, now=now)
+    assert spread_first_decision.should_enter is False
+    assert spread_first_decision.reason == "validated_spread_below_threshold"
 
 
 def test_normal_entry_too_close_to_funding_rejected_without_benefit():
@@ -255,12 +270,49 @@ def test_normal_entry_near_funding_allowed_when_favourable():
     )
     decision = evaluate_entry(opportunity, {}, StrategyConfig(normal_entries_enabled=True), now=now)
     assert decision.should_enter is True
-    assert decision.reason == "entry_ok"
+    assert decision.reason == "spread_entry_funding_bonus_ok"
+
+
+def test_route_spread_quality_required_for_default_entry():
+    config = StrategyConfig()
+    weak_route = make_opportunity(route_spread_percentile=0.60, route_spread_zscore=2.0)
+    ok, reason = route_spread_quality_decision(weak_route, config)
+    assert ok is False
+    assert reason == "route_spread_percentile_below_threshold"
+
+    strong_route = make_opportunity(route_spread_percentile=0.90, route_spread_zscore=1.5)
+    ok, reason = route_spread_quality_decision(strong_route, config)
+    assert ok is True
+    assert reason == "route_spread_quality_ok"
+
+
+def test_route_stats_calculate_percentile_zscore_and_trend():
+    stats = calculate_route_stats([0.1, 0.2, 0.3, 0.4], 0.5)
+    assert stats["route_observation_count"] == 4
+    assert stats["route_spread_percentile"] == 1.0
+    assert stats["route_spread_zscore"] > 1.0
+    assert stats["route_spread_trend_pct"] > 0
+
+
+def test_funding_capture_does_not_rescue_weak_spread_by_default():
+    now = datetime.now(timezone.utc)
+    opportunity = make_opportunity(
+        timestamp_utc=now,
+        validated_spread_pct=0.60,
+        net_edge_ex_funding_pct=0.25,
+        net_edge_inc_funding_pct=0.40,
+        funding_benefit_pct=0.05,
+        long_next_funding_time_utc=now + timedelta(minutes=30),
+        short_next_funding_time_utc=now + timedelta(minutes=30),
+    )
+    decision = evaluate_entry(opportunity, {}, StrategyConfig(), now=now)
+    assert decision.should_enter is False
+    assert decision.reason == "validated_spread_below_threshold"
 
 
 def test_funding_capture_cannot_bypass_safety():
     now = datetime.now(timezone.utc)
-    config = StrategyConfig()
+    config = StrategyConfig(funding_capture_entries_enabled=True)
     funding_fields = {
         "timestamp_utc": now,
         "net_edge_ex_funding_pct": 0.25,
@@ -283,7 +335,7 @@ def test_funding_capture_cannot_bypass_safety():
     blocked = evaluate_entry(
         make_opportunity(**funding_fields),
         {},
-        StrategyConfig(max_daily_entries=0),
+        StrategyConfig(max_daily_entries=0, funding_capture_entries_enabled=True),
         now=now,
         daily_entry_count=0,
     )
@@ -646,6 +698,10 @@ def test_stock_like_symbols_are_not_crypto():
         assert classify_instrument(symbol) == "tokenised_stock_or_synthetic"
 
 
+def test_hyperliquid_symbol_mapping():
+    assert standard_to_exchange_symbol("BTCUSDT", "hyperliquid", "futures") == "BTC"
+
+
 def test_default_strategy_blocks_known_synthetic_symbols():
     now = datetime.now(timezone.utc)
     opportunity = make_opportunity(symbol="APLDUSDT", timestamp_utc=now)
@@ -725,6 +781,9 @@ if __name__ == "__main__":
     test_entry_normal_and_funding_capture_modes()
     test_normal_entry_too_close_to_funding_rejected_without_benefit()
     test_normal_entry_near_funding_allowed_when_favourable()
+    test_route_spread_quality_required_for_default_entry()
+    test_route_stats_calculate_percentile_zscore_and_trend()
+    test_funding_capture_does_not_rescue_weak_spread_by_default()
     test_funding_capture_cannot_bypass_safety()
     test_exit_holds_for_favourable_funding_but_stop_loss_overrides()
     test_remaining_edge_low_requires_profitable_exit_buffer()
@@ -744,6 +803,7 @@ if __name__ == "__main__":
     test_existing_losing_position_blocks_new_slice()
     test_existing_position_negative_funding_blocks_new_slice()
     test_stock_like_symbols_are_not_crypto()
+    test_hyperliquid_symbol_mapping()
     test_default_strategy_blocks_known_synthetic_symbols()
     test_paper_execution_uses_opportunity_timestamp_for_fills()
     test_strategy_loop_increments_and_resets_close_liquidity_warning_count()

@@ -86,6 +86,15 @@ class ValidatedOpportunity:
     long_close_fillable: bool
     short_close_fillable: bool
     close_slippage_pct: Optional[float]
+    route_observation_count: int
+    route_spread_mean_pct: Optional[float]
+    route_spread_median_pct: Optional[float]
+    route_spread_min_pct: Optional[float]
+    route_spread_max_pct: Optional[float]
+    route_spread_std_pct: Optional[float]
+    route_spread_zscore: Optional[float]
+    route_spread_percentile: Optional[float]
+    route_spread_trend_pct: Optional[float]
     persistence_count: int
     persistent: bool
     spread_ready: bool
@@ -155,6 +164,15 @@ class ValidatedOpportunity:
             long_close_fillable=parse_bool(row.get("long_close_fillable", row.get("long_fillable"))),
             short_close_fillable=parse_bool(row.get("short_close_fillable", row.get("short_fillable"))),
             close_slippage_pct=parse_float(row.get("close_slippage_pct")),
+            route_observation_count=parse_int(row.get("route_observation_count")),
+            route_spread_mean_pct=parse_float(row.get("route_spread_mean_pct")),
+            route_spread_median_pct=parse_float(row.get("route_spread_median_pct")),
+            route_spread_min_pct=parse_float(row.get("route_spread_min_pct")),
+            route_spread_max_pct=parse_float(row.get("route_spread_max_pct")),
+            route_spread_std_pct=parse_float(row.get("route_spread_std_pct")),
+            route_spread_zscore=parse_float(row.get("route_spread_zscore")),
+            route_spread_percentile=parse_float(row.get("route_spread_percentile")),
+            route_spread_trend_pct=parse_float(row.get("route_spread_trend_pct")),
             persistence_count=parse_int(row.get("persistence_count")),
             persistent=parse_bool(row.get("persistent")),
             spread_ready=parse_bool(row.get("spread_ready")),
