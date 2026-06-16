@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Iterable
 
-from core.models import Exchange, OrderBook
+from core.models import FundingInfo, OrderBook
 
 
 def utc_now() -> datetime:
@@ -63,6 +63,7 @@ class DepthTarget:
 class CacheStats:
     ticker_counts: dict[str, int]
     orderbook_counts: dict[str, int]
+    funding_counts: dict[str, int]
     active_depth_targets: dict[str, int]
 
 
@@ -79,6 +80,7 @@ class MarketDataCache:
         self._lock = RLock()
         self._tickers: dict[tuple[str, str], CachedTicker] = {}
         self._orderbooks: dict[tuple[str, str], OrderBook] = {}
+        self._funding: dict[tuple[str, str], FundingInfo] = {}
         self._depth_targets: dict[tuple[str, str], DepthTarget] = {}
 
     def update_ticker(self, ticker: CachedTicker) -> None:
@@ -116,7 +118,17 @@ class MarketDataCache:
         observed_at_utc: datetime | None = None,
     ) -> None:
         observed_at_utc = observed_at_utc or utc_now()
+        funding_info = FundingInfo(
+            exchange=exchange,
+            standard_symbol=symbol,
+            exchange_symbol=symbol,
+            funding_rate=funding_rate,
+            next_funding_time_utc=next_funding_time_utc,
+            funding_interval_hours=None,
+            observed_at_utc=observed_at_utc,
+        )
         with self._lock:
+            self._funding[(exchange, symbol)] = funding_info
             existing = self._tickers.get((exchange, symbol))
             if not existing:
                 return
@@ -131,6 +143,26 @@ class MarketDataCache:
                 ask_qty=existing.ask_qty,
                 funding_rate=funding_rate if funding_rate is not None else existing.funding_rate,
                 next_funding_time_utc=next_funding_time_utc or existing.next_funding_time_utc,
+                source=existing.source,
+            )
+
+    def update_funding_info(self, funding_info: FundingInfo) -> None:
+        with self._lock:
+            self._funding[(funding_info.exchange, funding_info.standard_symbol)] = funding_info
+            existing = self._tickers.get((funding_info.exchange, funding_info.standard_symbol))
+            if not existing:
+                return
+            self._tickers[(funding_info.exchange, funding_info.standard_symbol)] = CachedTicker(
+                exchange=existing.exchange,
+                symbol=existing.symbol,
+                bid=existing.bid,
+                ask=existing.ask,
+                volume_usdt=existing.volume_usdt,
+                observed_at_utc=existing.observed_at_utc,
+                bid_qty=existing.bid_qty,
+                ask_qty=existing.ask_qty,
+                funding_rate=funding_info.funding_rate,
+                next_funding_time_utc=funding_info.next_funding_time_utc,
                 source=existing.source,
             )
 
@@ -174,6 +206,22 @@ class MarketDataCache:
             return None
         return orderbook
 
+    def get_funding_info(
+        self,
+        exchange: str,
+        symbol: str,
+        *,
+        max_age_seconds: float,
+    ) -> FundingInfo | None:
+        now = utc_now()
+        with self._lock:
+            funding_info = self._funding.get((exchange, symbol))
+        if funding_info is None:
+            return None
+        if age_seconds(funding_info.observed_at_utc, now=now) > max_age_seconds:
+            return None
+        return funding_info
+
     def set_depth_targets(
         self,
         targets: Iterable[tuple[str, str]],
@@ -211,6 +259,10 @@ class MarketDataCache:
             for exchange, _symbol in self._orderbooks:
                 orderbook_counts[exchange] = orderbook_counts.get(exchange, 0) + 1
 
+            funding_counts: dict[str, int] = {}
+            for exchange, _symbol in self._funding:
+                funding_counts[exchange] = funding_counts.get(exchange, 0) + 1
+
             self._prune_depth_targets_locked()
             target_counts: dict[str, int] = {}
             for exchange, _symbol in self._depth_targets:
@@ -219,6 +271,7 @@ class MarketDataCache:
         return CacheStats(
             ticker_counts=ticker_counts,
             orderbook_counts=orderbook_counts,
+            funding_counts=funding_counts,
             active_depth_targets=target_counts,
         )
 

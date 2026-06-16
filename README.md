@@ -144,7 +144,9 @@ python scanners/fast_futures_futures_scanner.py \
   --interval 30 \
   --use-websocket-cache \
   --ws-depth-cache \
-  --ws-warmup-seconds 20
+  --ws-warmup-seconds 20 \
+  --ws-depth-wait-seconds 2 \
+  --funding-cache-seconds 60
 ```
 
 Websocket mode is hybrid and paper/data only. The scanner prefers fresh streamed

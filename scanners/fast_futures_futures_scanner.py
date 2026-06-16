@@ -27,7 +27,11 @@ from Hyperliquid.hyperliquid_market_adapter import HyperliquidMarketAdapter
 from core.orderbook import estimate_execution_from_orderbook
 from core.scoring import calculate_net_edge_pct, classify_opportunity
 from market_data.cache import MarketDataCache
-from market_data.scanner_integration import get_cached_orderbook
+from market_data.scanner_integration import (
+    get_cached_orderbook,
+    get_funding_info_with_cache,
+    wait_for_candidate_orderbooks,
+)
 from market_data.ws_service import WebsocketMarketDataService, WebsocketRuntimeConfig
 
 
@@ -571,6 +575,7 @@ def deep_validate_candidate(
     timestamp: datetime,
     market_data_cache: MarketDataCache | None = None,
     ws_orderbook_max_age_seconds: float = 5.0,
+    funding_cache_seconds: float = 60.0,
 ) -> list[dict]:
     """
     Deep-validate one fast candidate using real order books and funding.
@@ -604,8 +609,20 @@ def deep_validate_candidate(
         max_age_seconds=ws_orderbook_max_age_seconds,
     ) or short_adapter.get_futures_orderbook(symbol, limit=100)
 
-    long_funding = long_adapter.get_funding_info(symbol)
-    short_funding = short_adapter.get_funding_info(symbol)
+    long_funding = get_funding_info_with_cache(
+        cache=market_data_cache,
+        adapter=long_adapter,
+        exchange=long_exchange,
+        symbol=symbol,
+        max_age_seconds=funding_cache_seconds,
+    )
+    short_funding = get_funding_info_with_cache(
+        cache=market_data_cache,
+        adapter=short_adapter,
+        exchange=short_exchange,
+        symbol=symbol,
+        max_age_seconds=funding_cache_seconds,
+    )
 
     for notional in NOTIONALS_USDT:
         long_buy = estimate_execution_from_orderbook(
@@ -991,6 +1008,8 @@ def run_scan_once(
     ws_ticker_min_count: int = 25,
     ws_orderbook_max_age_seconds: float = 5.0,
     ws_depth_target_limit: int = DEEP_VALIDATE_TOP_N,
+    ws_depth_wait_seconds: float = 2.0,
+    funding_cache_seconds: float = 60.0,
 ) -> tuple[list[dict], list[dict]]:
     timestamp = utc_now()
 
@@ -1005,6 +1024,8 @@ def run_scan_once(
     print(f"ML fast spread threshold: {ML_FAST_SPREAD_LOG_THRESHOLD_PCT:.4f}%")
     print(f"Websocket ticker cache enabled: {use_websocket_cache}")
     print(f"Websocket depth cache enabled: {ws_depth_cache}")
+    print(f"Websocket depth wait seconds: {ws_depth_wait_seconds:g}")
+    print(f"Funding cache seconds: {funding_cache_seconds:g}")
 
     ticker_data = {}
 
@@ -1094,9 +1115,17 @@ def run_scan_once(
             deep_candidates,
             max_candidates=ws_depth_target_limit,
         )
+        ready, total = wait_for_candidate_orderbooks(
+            candidates=deep_candidates[:ws_depth_target_limit],
+            cache=market_data_cache,
+            timeout_seconds=ws_depth_wait_seconds,
+            poll_seconds=0.10,
+            max_age_seconds=ws_orderbook_max_age_seconds,
+        )
         if market_data_cache is not None:
             stats = market_data_cache.stats()
             print(f"Websocket depth targets: {stats.active_depth_targets}")
+            print(f"Websocket candidate books ready: {ready}/{total}")
 
     print(
         f"\nDeep-validating {len(deep_candidates)} candidates "
@@ -1118,6 +1147,7 @@ def run_scan_once(
                 timestamp=timestamp,
                 market_data_cache=market_data_cache if ws_depth_cache else None,
                 ws_orderbook_max_age_seconds=ws_orderbook_max_age_seconds,
+                funding_cache_seconds=funding_cache_seconds,
             )
             validated_results.extend(rows)
 
@@ -1278,6 +1308,18 @@ def parse_args() -> argparse.Namespace:
         help="Number of deep candidates used to drive websocket depth subscriptions",
     )
     parser.add_argument(
+        "--ws-depth-wait-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds to wait for both candidate leg order books before REST fallback",
+    )
+    parser.add_argument(
+        "--funding-cache-seconds",
+        type=float,
+        default=60.0,
+        help="Seconds to reuse cached funding info during deep validation",
+    )
+    parser.add_argument(
         "--ws-ticker-symbol-limit",
         type=int,
         default=0,
@@ -1348,6 +1390,8 @@ def main():
                 ws_ticker_min_count=args.ws_ticker_min_count,
                 ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,
                 ws_depth_target_limit=args.ws_depth_target_limit,
+                ws_depth_wait_seconds=args.ws_depth_wait_seconds,
+                funding_cache_seconds=args.funding_cache_seconds,
             )
             return
 
@@ -1367,6 +1411,8 @@ def main():
                     ws_ticker_min_count=args.ws_ticker_min_count,
                     ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,
                     ws_depth_target_limit=args.ws_depth_target_limit,
+                    ws_depth_wait_seconds=args.ws_depth_wait_seconds,
+                    funding_cache_seconds=args.funding_cache_seconds,
                 )
                 time.sleep(args.interval)
             except KeyboardInterrupt:

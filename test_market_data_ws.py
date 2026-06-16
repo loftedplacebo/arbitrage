@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from core.models import FundingInfo, OrderBook, OrderBookLevel
 from market_data.cache import CachedTicker, MarketDataCache
 from market_data.scanner_integration import (
     build_depth_targets_from_candidates,
+    count_candidate_orderbook_coverage,
+    get_funding_info_with_cache,
     get_ticker_data_with_cache,
+    wait_for_candidate_orderbooks,
 )
+from scanners.fast_futures_futures_scanner import deep_validate_candidate
 from market_data.ws_parsers import (
     parse_binance_book_ticker,
     parse_binance_depth,
@@ -110,6 +115,184 @@ def test_ticker_data_uses_cache_when_fresh_and_rest_when_cold():
     )
     assert source["binance"] == "rest"
     assert set(ticker_data["binance"]) == {"ETHUSDT"}
+
+
+def test_funding_info_cache_avoids_repeated_adapter_calls():
+    class DummyFundingAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        def get_funding_info(self, symbol):
+            self.calls += 1
+            return FundingInfo(
+                exchange="binance",
+                standard_symbol=symbol,
+                exchange_symbol=symbol,
+                funding_rate=0.0001,
+                next_funding_time_utc=None,
+                funding_interval_hours=8,
+                observed_at_utc=datetime.now(timezone.utc),
+            )
+
+    cache = MarketDataCache()
+    adapter = DummyFundingAdapter()
+
+    first = get_funding_info_with_cache(
+        cache=cache,
+        adapter=adapter,
+        exchange="binance",
+        symbol="BTCUSDT",
+        max_age_seconds=60,
+    )
+    second = get_funding_info_with_cache(
+        cache=cache,
+        adapter=adapter,
+        exchange="binance",
+        symbol="BTCUSDT",
+        max_age_seconds=60,
+    )
+
+    assert first.funding_rate == second.funding_rate
+    assert adapter.calls == 1
+    assert cache.stats().funding_counts == {"binance": 1}
+
+
+def test_wait_for_candidate_orderbooks_reports_ready_routes():
+    cache = MarketDataCache()
+    now = datetime.now(timezone.utc)
+    cache.update_orderbook(
+        OrderBook(
+            exchange="binance",
+            market_type="futures",
+            standard_symbol="BTCUSDT",
+            exchange_symbol="BTCUSDT",
+            bids=[OrderBookLevel(price=100.0, quantity=1.0)],
+            asks=[OrderBookLevel(price=101.0, quantity=1.0)],
+            observed_at_utc=now,
+        )
+    )
+    cache.update_orderbook(
+        OrderBook(
+            exchange="bitget",
+            market_type="futures",
+            standard_symbol="BTCUSDT",
+            exchange_symbol="BTCUSDT",
+            bids=[OrderBookLevel(price=100.0, quantity=1.0)],
+            asks=[OrderBookLevel(price=101.0, quantity=1.0)],
+            observed_at_utc=now,
+        )
+    )
+    candidates = [
+        {"symbol": "BTCUSDT", "long_exchange": "binance", "short_exchange": "bitget"},
+        {"symbol": "ETHUSDT", "long_exchange": "binance", "short_exchange": "bitget"},
+    ]
+
+    assert count_candidate_orderbook_coverage(
+        candidates=candidates,
+        cache=cache,
+        max_age_seconds=10,
+    ) == (1, 2)
+    assert wait_for_candidate_orderbooks(
+        candidates=candidates,
+        cache=cache,
+        timeout_seconds=0,
+        poll_seconds=0.05,
+        max_age_seconds=10,
+    ) == (1, 2)
+
+
+def test_deep_validation_uses_cached_books_and_funding():
+    class DummyAdapter:
+        def __init__(self, exchange):
+            self.exchange = exchange
+            self.orderbook_calls = 0
+            self.funding_calls = 0
+
+        def get_futures_orderbook(self, symbol, limit=100):
+            self.orderbook_calls += 1
+            raise AssertionError("REST orderbook should not be called when cache is fresh")
+
+        def get_funding_info(self, symbol):
+            self.funding_calls += 1
+            raise AssertionError("REST funding should not be called when cache is fresh")
+
+    now = datetime.now(timezone.utc)
+    cache = MarketDataCache()
+    cache.update_orderbook(
+        OrderBook(
+            exchange="binance",
+            market_type="futures",
+            standard_symbol="BTCUSDT",
+            exchange_symbol="BTCUSDT",
+            bids=[OrderBookLevel(price=99.0, quantity=100.0)],
+            asks=[OrderBookLevel(price=100.0, quantity=100.0)],
+            observed_at_utc=now,
+        )
+    )
+    cache.update_orderbook(
+        OrderBook(
+            exchange="bitget",
+            market_type="futures",
+            standard_symbol="BTCUSDT",
+            exchange_symbol="BTCUSDT",
+            bids=[OrderBookLevel(price=101.0, quantity=100.0)],
+            asks=[OrderBookLevel(price=102.0, quantity=100.0)],
+            observed_at_utc=now,
+        )
+    )
+    cache.update_funding_info(
+        FundingInfo(
+            exchange="binance",
+            standard_symbol="BTCUSDT",
+            exchange_symbol="BTCUSDT",
+            funding_rate=0.0001,
+            next_funding_time_utc=None,
+            funding_interval_hours=8,
+            observed_at_utc=now,
+        )
+    )
+    cache.update_funding_info(
+        FundingInfo(
+            exchange="bitget",
+            standard_symbol="BTCUSDT",
+            exchange_symbol="BTCUSDT",
+            funding_rate=0.0002,
+            next_funding_time_utc=None,
+            funding_interval_hours=8,
+            observed_at_utc=now,
+        )
+    )
+
+    adapters = {
+        "binance": DummyAdapter("binance"),
+        "bitget": DummyAdapter("bitget"),
+    }
+    rows = deep_validate_candidate(
+        candidate={
+            "symbol": "BTCUSDT",
+            "instrument_class": "crypto",
+            "long_exchange": "binance",
+            "short_exchange": "bitget",
+            "direction": "long_binance_short_bitget",
+            "fast_spread_pct": 1.0,
+            "long_ask": 100.0,
+            "short_bid": 101.0,
+            "combined_volume_usdt": 10_000_000.0,
+        },
+        adapters=adapters,
+        timestamp=now,
+        market_data_cache=cache,
+        ws_orderbook_max_age_seconds=10,
+        funding_cache_seconds=60,
+    )
+
+    assert rows
+    assert all(row["long_fillable"] and row["short_fillable"] for row in rows)
+    assert abs(rows[0]["validated_spread_pct"] - 1.0) < 1e-9
+    assert adapters["binance"].orderbook_calls == 0
+    assert adapters["bitget"].orderbook_calls == 0
+    assert adapters["binance"].funding_calls == 0
+    assert adapters["bitget"].funding_calls == 0
 
 
 def test_parse_binance_book_ticker_and_mark_price():
@@ -287,6 +470,9 @@ if __name__ == "__main__":
     test_depth_targets_expire()
     test_build_depth_targets_from_candidates_limits_and_dedupes()
     test_ticker_data_uses_cache_when_fresh_and_rest_when_cold()
+    test_funding_info_cache_avoids_repeated_adapter_calls()
+    test_wait_for_candidate_orderbooks_reports_ready_routes()
+    test_deep_validation_uses_cached_books_and_funding()
     test_parse_binance_book_ticker_and_mark_price()
     test_parse_binance_depth()
     test_parse_bitget_ticker_and_depth()
