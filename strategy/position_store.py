@@ -49,6 +49,7 @@ SLICE_FIELDS = [
 
 DECISION_FIELDS = [
     "timestamp_utc",
+    "experiment_id",
     "decision_type",
     "symbol",
     "position_id",
@@ -64,10 +65,35 @@ DECISION_FIELDS = [
     "entry_net_edge_pct",
     "effective_take_profit_pct",
     "use_dynamic_take_profit",
+    "validated_spread_pct",
+    "net_edge_ex_funding_pct",
+    "net_edge_inc_funding_pct",
+    "fast_spread_pct",
+    "slippage_pct",
+    "close_slippage_pct",
+    "route_observation_count",
+    "route_spread_percentile",
+    "route_spread_zscore",
+    "route_spread_trend_pct",
+    "route_spread_mean_pct",
+    "route_spread_median_pct",
+    "config_max_slice_notional_usd",
+    "config_max_slices_per_position",
+    "config_min_route_spread_percentile",
+    "config_min_route_spread_zscore",
+    "config_max_route_spread_trend_pct",
+    "config_min_validated_spread_pct",
+    "config_min_net_spread_ex_funding_pct",
+    "config_min_net_edge_inc_funding_pct",
+    "config_spread_compression_exit_pct",
+    "config_min_take_profit_pct",
+    "config_take_profit_edge_fraction",
+    "config_max_take_profit_pct",
 ]
 
 FILL_FIELDS = [
     "timestamp_utc",
+    "experiment_id",
     "event_type",
     "position_id",
     "slice_id",
@@ -88,6 +114,7 @@ PROCESSED_SCAN_FIELDS = ["timestamp_utc", "source_file", "processed_at_utc"]
 
 class CsvPositionStore:
     def __init__(self, config: StrategyConfig):
+        self.config = config
         self.data_dir = Path(config.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.positions_path = self.data_dir / "positions.csv"
@@ -153,12 +180,43 @@ class CsvPositionStore:
         entry_net_edge_pct: float | None = None,
         effective_take_profit_pct: float | None = None,
         use_dynamic_take_profit: bool | None = None,
+        validated_spread_pct: float | None = None,
+        net_edge_ex_funding_pct: float | None = None,
+        net_edge_inc_funding_pct: float | None = None,
+        fast_spread_pct: float | None = None,
+        slippage_pct: float | None = None,
+        close_slippage_pct: float | None = None,
+        route_observation_count: int | None = None,
+        route_spread_percentile: float | None = None,
+        route_spread_zscore: float | None = None,
+        route_spread_trend_pct: float | None = None,
+        route_spread_mean_pct: float | None = None,
+        route_spread_median_pct: float | None = None,
+        config_max_slice_notional_usd: float | None = None,
+        config_max_slices_per_position: int | None = None,
+        config_min_route_spread_percentile: float | None = None,
+        config_min_route_spread_zscore: float | None = None,
+        config_max_route_spread_trend_pct: float | None = None,
+        config_min_validated_spread_pct: float | None = None,
+        config_min_net_spread_ex_funding_pct: float | None = None,
+        config_min_net_edge_inc_funding_pct: float | None = None,
+        config_spread_compression_exit_pct: float | None = None,
+        config_min_take_profit_pct: float | None = None,
+        config_take_profit_edge_fraction: float | None = None,
+        config_max_take_profit_pct: float | None = None,
     ) -> None:
+        def optional_float(value: float | None) -> str:
+            return "" if value is None else f"{value:.8f}"
+
+        def optional_int(value: int | None) -> str:
+            return "" if value is None else str(value)
+
         self._append_row(
             self.decisions_path,
             DECISION_FIELDS,
             {
                 "timestamp_utc": format_datetime(utc_now()),
+                "experiment_id": self.config.experiment_id,
                 "decision_type": decision_type,
                 "symbol": symbol,
                 "position_id": position_id,
@@ -168,19 +226,42 @@ class CsvPositionStore:
                 "notional_usd": f"{notional_usd:.8f}",
                 "estimated_net_pnl_usd": f"{estimated_net_pnl_usd:.8f}",
                 "estimated_net_pnl_pct": f"{estimated_net_pnl_pct:.8f}",
-                "funding_benefit_pct": "" if funding_benefit_pct is None else f"{funding_benefit_pct:.8f}",
-                "min_minutes_to_funding": "" if min_minutes_to_funding is None else f"{min_minutes_to_funding:.8f}",
+                "funding_benefit_pct": optional_float(funding_benefit_pct),
+                "min_minutes_to_funding": optional_float(min_minutes_to_funding),
                 "funding_capture_ready": "" if funding_capture_ready is None else str(funding_capture_ready),
-                "entry_net_edge_pct": "" if entry_net_edge_pct is None else f"{entry_net_edge_pct:.8f}",
-                "effective_take_profit_pct": (
-                    "" if effective_take_profit_pct is None else f"{effective_take_profit_pct:.8f}"
-                ),
+                "entry_net_edge_pct": optional_float(entry_net_edge_pct),
+                "effective_take_profit_pct": optional_float(effective_take_profit_pct),
                 "use_dynamic_take_profit": "" if use_dynamic_take_profit is None else str(use_dynamic_take_profit),
+                "validated_spread_pct": optional_float(validated_spread_pct),
+                "net_edge_ex_funding_pct": optional_float(net_edge_ex_funding_pct),
+                "net_edge_inc_funding_pct": optional_float(net_edge_inc_funding_pct),
+                "fast_spread_pct": optional_float(fast_spread_pct),
+                "slippage_pct": optional_float(slippage_pct),
+                "close_slippage_pct": optional_float(close_slippage_pct),
+                "route_observation_count": optional_int(route_observation_count),
+                "route_spread_percentile": optional_float(route_spread_percentile),
+                "route_spread_zscore": optional_float(route_spread_zscore),
+                "route_spread_trend_pct": optional_float(route_spread_trend_pct),
+                "route_spread_mean_pct": optional_float(route_spread_mean_pct),
+                "route_spread_median_pct": optional_float(route_spread_median_pct),
+                "config_max_slice_notional_usd": optional_float(config_max_slice_notional_usd),
+                "config_max_slices_per_position": optional_int(config_max_slices_per_position),
+                "config_min_route_spread_percentile": optional_float(config_min_route_spread_percentile),
+                "config_min_route_spread_zscore": optional_float(config_min_route_spread_zscore),
+                "config_max_route_spread_trend_pct": optional_float(config_max_route_spread_trend_pct),
+                "config_min_validated_spread_pct": optional_float(config_min_validated_spread_pct),
+                "config_min_net_spread_ex_funding_pct": optional_float(config_min_net_spread_ex_funding_pct),
+                "config_min_net_edge_inc_funding_pct": optional_float(config_min_net_edge_inc_funding_pct),
+                "config_spread_compression_exit_pct": optional_float(config_spread_compression_exit_pct),
+                "config_min_take_profit_pct": optional_float(config_min_take_profit_pct),
+                "config_take_profit_edge_fraction": optional_float(config_take_profit_edge_fraction),
+                "config_max_take_profit_pct": optional_float(config_max_take_profit_pct),
             },
         )
 
     def append_fill(self, row: dict) -> None:
         output = {field: row.get(field, "") for field in FILL_FIELDS}
+        output["experiment_id"] = output.get("experiment_id") or self.config.experiment_id
         self._append_row(self.fills_path, FILL_FIELDS, output)
 
     def load_fills(self) -> list[dict]:

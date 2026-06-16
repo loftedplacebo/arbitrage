@@ -119,6 +119,58 @@ def decision_funding_context(
     }
 
 
+def decision_optimisation_context(
+    opportunity: ValidatedOpportunity | None,
+    config: StrategyConfig,
+) -> dict:
+    context = {
+        "validated_spread_pct": None,
+        "net_edge_ex_funding_pct": None,
+        "net_edge_inc_funding_pct": None,
+        "fast_spread_pct": None,
+        "slippage_pct": None,
+        "close_slippage_pct": None,
+        "route_observation_count": None,
+        "route_spread_percentile": None,
+        "route_spread_zscore": None,
+        "route_spread_trend_pct": None,
+        "route_spread_mean_pct": None,
+        "route_spread_median_pct": None,
+        "config_max_slice_notional_usd": config.max_slice_notional_usd,
+        "config_max_slices_per_position": config.max_slices_per_position,
+        "config_min_route_spread_percentile": config.min_route_spread_percentile,
+        "config_min_route_spread_zscore": config.min_route_spread_zscore,
+        "config_max_route_spread_trend_pct": config.max_route_spread_trend_pct,
+        "config_min_validated_spread_pct": config.min_validated_spread_pct,
+        "config_min_net_spread_ex_funding_pct": config.min_net_spread_ex_funding_pct,
+        "config_min_net_edge_inc_funding_pct": config.min_net_edge_inc_funding_pct,
+        "config_spread_compression_exit_pct": config.spread_compression_exit_pct,
+        "config_min_take_profit_pct": config.min_take_profit_pct,
+        "config_take_profit_edge_fraction": config.take_profit_edge_fraction,
+        "config_max_take_profit_pct": config.max_take_profit_pct,
+    }
+    if opportunity is None:
+        return context
+
+    context.update(
+        {
+            "validated_spread_pct": opportunity.validated_spread_pct,
+            "net_edge_ex_funding_pct": opportunity.net_edge_ex_funding_pct,
+            "net_edge_inc_funding_pct": opportunity.net_edge_inc_funding_pct,
+            "fast_spread_pct": opportunity.fast_spread_pct,
+            "slippage_pct": opportunity.slippage_pct,
+            "close_slippage_pct": opportunity.close_slippage_pct,
+            "route_observation_count": opportunity.route_observation_count,
+            "route_spread_percentile": opportunity.route_spread_percentile,
+            "route_spread_zscore": opportunity.route_spread_zscore,
+            "route_spread_trend_pct": opportunity.route_spread_trend_pct,
+            "route_spread_mean_pct": opportunity.route_spread_mean_pct,
+            "route_spread_median_pct": opportunity.route_spread_median_pct,
+        }
+    )
+    return context
+
+
 def process_scan(
     *,
     scan_time: str,
@@ -151,6 +203,7 @@ def process_scan(
             now=scan_rows[0].timestamp_utc,
         )
         funding_context = decision_funding_context(opportunity, config, decision_now)
+        optimisation_context = decision_optimisation_context(opportunity, config)
         store.append_decision(
             decision_type="EXIT",
             symbol=position.symbol,
@@ -165,6 +218,7 @@ def process_scan(
             effective_take_profit_pct=calculate_take_profit_pct(position, config),
             use_dynamic_take_profit=config.use_dynamic_take_profit,
             **funding_context,
+            **optimisation_context,
         )
         if exit_decision.should_exit:
             engine.close_position(position, opportunity, exit_decision.reason)
@@ -175,6 +229,7 @@ def process_scan(
 
     for opportunity in candidates:
         funding_context = decision_funding_context(opportunity, config, decision_now)
+        optimisation_context = decision_optimisation_context(opportunity, config)
         entry_decision = evaluate_entry(
             opportunity=opportunity,
             open_positions=positions,
@@ -194,6 +249,7 @@ def process_scan(
             entry_net_edge_pct=opportunity.net_edge_inc_funding_pct,
             use_dynamic_take_profit=config.use_dynamic_take_profit,
             **funding_context,
+            **optimisation_context,
         )
         if entry_decision.should_enter:
             engine.open_or_add_slice(

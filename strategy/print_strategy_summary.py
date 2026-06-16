@@ -139,8 +139,10 @@ def run(args: argparse.Namespace) -> None:
     print("Funding accrual: not implemented yet; paper PnL is spread-only minus estimated fees/slippage.")
 
     print("\nActive config")
+    print(f"  Experiment ID: {config.experiment_id}")
     print(f"  Max daily entries: {config.max_daily_entries}")
     print(f"  Max open positions: {config.max_open_positions}")
+    print(f"  Max slice notional: ${config.max_slice_notional_usd:,.2f}")
     print(f"  Max slices per position: {config.max_slices_per_position}")
     print(f"  Max total open notional: ${config.max_total_open_notional_usd:,.2f}")
     print(f"  Max symbol notional: ${config.max_symbol_notional_usd:,.2f}")

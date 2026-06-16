@@ -31,9 +31,10 @@ from core.scoring import calculate_net_edge_pct, classify_opportunity
 # -----------------------------
 # Fast scan config
 # -----------------------------
-FAST_SPREAD_THRESHOLD_PCT = 0.12
+EXPERIMENT_ID = "spread_ladder_20260616_v1"
+FAST_SPREAD_THRESHOLD_PCT = 0.08
 MIN_COMBINED_VOLUME_USDT = 1_000_000
-MAX_FAST_CANDIDATES = 300
+MAX_FAST_CANDIDATES = 500
 FAST_SCAN_CRYPTO_ONLY = False
 ML_OBSERVATION_LOGGING_ENABLED = True
 ML_FAST_SPREAD_LOG_THRESHOLD_PCT = 0.03
@@ -45,9 +46,9 @@ ROUTE_STATS_BOOTSTRAP_MAX_ROWS = 200_000
 # -----------------------------
 # Deep validation config
 # -----------------------------
-DEEP_VALIDATE_TOP_N = 80
+DEEP_VALIDATE_TOP_N = 150
 DEEP_VALIDATE_CRYPTO_ONLY = True
-NOTIONALS_USDT = [100, 500, 1_000, 2_500, 5_000]
+NOTIONALS_USDT = [100, 200, 300, 400, 500, 1_000, 2_500]
 
 # Rough taker/taker assumption for opening both futures legs only.
 # Later we should model entry + exit and exchange-specific maker/taker fees.
@@ -453,6 +454,7 @@ def write_fast_observations_to_csv(observations: list[dict], timestamp: datetime
 
     fieldnames = [
         "timestamp_utc",
+        "experiment_id",
         "observation_id",
         "symbol",
         "instrument_class",
@@ -467,9 +469,23 @@ def write_fast_observations_to_csv(observations: list[dict], timestamp: datetime
         "long_volume_usdt",
         "short_volume_usdt",
         "combined_volume_usdt",
+        "config_fast_spread_threshold_pct",
+        "config_ml_fast_spread_log_threshold_pct",
+        "config_min_combined_volume_usdt",
+        "config_max_fast_candidates",
+        "config_deep_validate_top_n",
+        "config_deep_validate_crypto_only",
+        "config_fast_scan_crypto_only",
+        "config_ml_max_fast_observations",
     ]
 
     file_exists = output_file.exists()
+    if file_exists:
+        with output_file.open("r", newline="", encoding="utf-8") as f:
+            existing_header = next(csv.reader(f), [])
+        if existing_header != fieldnames:
+            output_file = ML_OUTPUT_DIR / f"fast_spread_observations_{timestamp.strftime('%Y%m%d_%H%M%S')}.csv"
+            file_exists = output_file.exists()
 
     with output_file.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -480,7 +496,16 @@ def write_fast_observations_to_csv(observations: list[dict], timestamp: datetime
         for row in observations:
             writer.writerow({
                 "timestamp_utc": timestamp.isoformat(),
+                "experiment_id": EXPERIMENT_ID,
                 "observation_id": build_observation_id(timestamp, row),
+                "config_fast_spread_threshold_pct": FAST_SPREAD_THRESHOLD_PCT,
+                "config_ml_fast_spread_log_threshold_pct": ML_FAST_SPREAD_LOG_THRESHOLD_PCT,
+                "config_min_combined_volume_usdt": MIN_COMBINED_VOLUME_USDT,
+                "config_max_fast_candidates": MAX_FAST_CANDIDATES,
+                "config_deep_validate_top_n": DEEP_VALIDATE_TOP_N,
+                "config_deep_validate_crypto_only": DEEP_VALIDATE_CRYPTO_ONLY,
+                "config_fast_scan_crypto_only": FAST_SCAN_CRYPTO_ONLY,
+                "config_ml_max_fast_observations": ML_MAX_FAST_OBSERVATIONS,
                 **row,
             })
 
@@ -495,6 +520,7 @@ def write_fast_candidates_to_csv(candidates: list[dict], timestamp: datetime) ->
 
     fieldnames = [
         "timestamp_utc",
+        "experiment_id",
         "symbol",
         "instrument_class",
         "long_exchange",
@@ -509,6 +535,12 @@ def write_fast_candidates_to_csv(candidates: list[dict], timestamp: datetime) ->
     ]
 
     file_exists = output_file.exists()
+    if file_exists:
+        with output_file.open("r", newline="", encoding="utf-8") as f:
+            existing_header = next(csv.reader(f), [])
+        if existing_header != fieldnames:
+            output_file = FAST_OUTPUT_DIR / f"fast_futures_futures_{timestamp.strftime('%Y%m%d_%H%M%S')}.csv"
+            file_exists = output_file.exists()
 
     with output_file.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -519,6 +551,7 @@ def write_fast_candidates_to_csv(candidates: list[dict], timestamp: datetime) ->
         for row in candidates:
             output_row = {
                 "timestamp_utc": timestamp.isoformat(),
+                "experiment_id": EXPERIMENT_ID,
                 **row,
             }
             writer.writerow({field: output_row.get(field) for field in fieldnames})
@@ -860,6 +893,7 @@ def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> 
 
     fieldnames = [
         "timestamp_utc",
+        "experiment_id",
         "symbol",
         "instrument_class",
         "notional_usdt",
@@ -920,7 +954,9 @@ def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> 
         if not file_exists:
             writer.writeheader()
 
-        writer.writerows(results)
+        for row in results:
+            output_row = {"experiment_id": EXPERIMENT_ID, **row}
+            writer.writerow(output_row)
 
     return output_file
 
