@@ -26,6 +26,9 @@ from Hyperliquid.hyperliquid_market_adapter import HyperliquidMarketAdapter
 
 from core.orderbook import estimate_execution_from_orderbook
 from core.scoring import calculate_net_edge_pct, classify_opportunity
+from market_data.cache import MarketDataCache
+from market_data.scanner_integration import get_cached_orderbook
+from market_data.ws_service import WebsocketMarketDataService, WebsocketRuntimeConfig
 
 
 # -----------------------------
@@ -566,6 +569,8 @@ def deep_validate_candidate(
     candidate: dict,
     adapters: dict,
     timestamp: datetime,
+    market_data_cache: MarketDataCache | None = None,
+    ws_orderbook_max_age_seconds: float = 5.0,
 ) -> list[dict]:
     """
     Deep-validate one fast candidate using real order books and funding.
@@ -586,8 +591,18 @@ def deep_validate_candidate(
 
     results = []
 
-    long_orderbook = long_adapter.get_futures_orderbook(symbol, limit=100)
-    short_orderbook = short_adapter.get_futures_orderbook(symbol, limit=100)
+    long_orderbook = get_cached_orderbook(
+        cache=market_data_cache,
+        exchange=long_exchange,
+        symbol=symbol,
+        max_age_seconds=ws_orderbook_max_age_seconds,
+    ) or long_adapter.get_futures_orderbook(symbol, limit=100)
+    short_orderbook = get_cached_orderbook(
+        cache=market_data_cache,
+        exchange=short_exchange,
+        symbol=symbol,
+        max_age_seconds=ws_orderbook_max_age_seconds,
+    ) or short_adapter.get_futures_orderbook(symbol, limit=100)
 
     long_funding = long_adapter.get_funding_info(symbol)
     short_funding = short_adapter.get_funding_info(symbol)
@@ -968,6 +983,14 @@ def run_scan_once(
     adapters: dict,
     persistence_history: dict[str, deque],
     route_spread_history: dict[str, deque],
+    market_data_cache: MarketDataCache | None = None,
+    websocket_service: WebsocketMarketDataService | None = None,
+    use_websocket_cache: bool = False,
+    ws_depth_cache: bool = False,
+    ws_ticker_max_age_seconds: float = 10.0,
+    ws_ticker_min_count: int = 25,
+    ws_orderbook_max_age_seconds: float = 5.0,
+    ws_depth_target_limit: int = DEEP_VALIDATE_TOP_N,
 ) -> tuple[list[dict], list[dict]]:
     timestamp = utc_now()
 
@@ -980,14 +1003,27 @@ def run_scan_once(
     print(f"Deep validate crypto only: {DEEP_VALIDATE_CRYPTO_ONLY}")
     print(f"ML observation logging enabled: {ML_OBSERVATION_LOGGING_ENABLED}")
     print(f"ML fast spread threshold: {ML_FAST_SPREAD_LOG_THRESHOLD_PCT:.4f}%")
+    print(f"Websocket ticker cache enabled: {use_websocket_cache}")
+    print(f"Websocket depth cache enabled: {ws_depth_cache}")
 
     ticker_data = {}
 
     for name, adapter in adapters.items():
         try:
-            tickers = adapter.get_fast_futures_tickers()
+            source = "rest"
+            tickers = {}
+            if use_websocket_cache and market_data_cache is not None:
+                tickers = market_data_cache.get_fast_tickers(
+                    name,
+                    max_age_seconds=ws_ticker_max_age_seconds,
+                    min_count=ws_ticker_min_count,
+                )
+                if tickers:
+                    source = "websocket"
+            if not tickers:
+                tickers = adapter.get_fast_futures_tickers()
             ticker_data[name] = tickers
-            print(f"{name:<8} tickers: {len(tickers)}")
+            print(f"{name:<12} tickers: {len(tickers)} source={source}")
         except Exception as exc:
             print(f"Error fetching fast tickers for {name}: {exc}")
 
@@ -1053,6 +1089,14 @@ def run_scan_once(
         )
 
     deep_candidates = deep_candidate_pool[:DEEP_VALIDATE_TOP_N]
+    if ws_depth_cache and websocket_service is not None:
+        websocket_service.set_depth_targets(
+            deep_candidates,
+            max_candidates=ws_depth_target_limit,
+        )
+        if market_data_cache is not None:
+            stats = market_data_cache.stats()
+            print(f"Websocket depth targets: {stats.active_depth_targets}")
 
     print(
         f"\nDeep-validating {len(deep_candidates)} candidates "
@@ -1072,6 +1116,8 @@ def run_scan_once(
                 candidate=candidate,
                 adapters=adapters,
                 timestamp=timestamp,
+                market_data_cache=market_data_cache if ws_depth_cache else None,
+                ws_orderbook_max_age_seconds=ws_orderbook_max_age_seconds,
             )
             validated_results.extend(rows)
 
@@ -1191,6 +1237,57 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help="Seconds between loop scans",
     )
+    parser.add_argument(
+        "--use-websocket-cache",
+        action="store_true",
+        help="Prefer fresh websocket ticker cache data, with REST fallback",
+    )
+    parser.add_argument(
+        "--ws-depth-cache",
+        action="store_true",
+        help="Subscribe to candidate order books and prefer fresh websocket depth cache, with REST fallback",
+    )
+    parser.add_argument(
+        "--ws-warmup-seconds",
+        type=float,
+        default=15.0,
+        help="Seconds to let websocket cache warm before the first scan",
+    )
+    parser.add_argument(
+        "--ws-ticker-max-age-seconds",
+        type=float,
+        default=10.0,
+        help="Maximum websocket ticker age before falling back to REST",
+    )
+    parser.add_argument(
+        "--ws-orderbook-max-age-seconds",
+        type=float,
+        default=5.0,
+        help="Maximum websocket order book age before falling back to REST",
+    )
+    parser.add_argument(
+        "--ws-ticker-min-count",
+        type=int,
+        default=25,
+        help="Minimum fresh cached tickers needed per exchange before using websocket ticker data",
+    )
+    parser.add_argument(
+        "--ws-depth-target-limit",
+        type=int,
+        default=DEEP_VALIDATE_TOP_N,
+        help="Number of deep candidates used to drive websocket depth subscriptions",
+    )
+    parser.add_argument(
+        "--ws-ticker-symbol-limit",
+        type=int,
+        default=0,
+        help="Optional per-exchange symbol subscription cap for symbol-specific websocket tickers; 0 means no cap",
+    )
+    parser.add_argument(
+        "--ws-exchanges",
+        default="binance,bitget,mexc,hyperliquid",
+        help="Comma-separated websocket exchanges to enable",
+    )
     return parser.parse_args()
 
 
@@ -1212,30 +1309,75 @@ def main():
         f"{len(route_spread_history)} routes from ML observations."
     )
 
-    if not args.loop:
-        run_scan_once(
+    market_data_cache = None
+    websocket_service = None
+    use_websocket_features = args.use_websocket_cache or args.ws_depth_cache
+
+    if use_websocket_features:
+        market_data_cache = MarketDataCache()
+        enabled_exchanges = {
+            item.strip()
+            for item in args.ws_exchanges.split(",")
+            if item.strip()
+        }
+        websocket_service = WebsocketMarketDataService(
             adapters=adapters,
-            persistence_history=persistence_history,
-            route_spread_history=route_spread_history,
+            cache=market_data_cache,
+            config=WebsocketRuntimeConfig(
+                enabled_exchanges=enabled_exchanges,
+                ticker_symbol_limit=args.ws_ticker_symbol_limit or None,
+            ),
         )
-        return
+        print(f"Starting websocket market data service for: {sorted(enabled_exchanges)}")
+        websocket_service.start()
+        if args.ws_warmup_seconds > 0:
+            print(f"Warming websocket cache for {args.ws_warmup_seconds:g} seconds...")
+            time.sleep(args.ws_warmup_seconds)
 
-    print(f"Running in loop mode every {args.interval} seconds. Press Ctrl+C to stop.")
-
-    while True:
-        try:
+    try:
+        if not args.loop:
             run_scan_once(
                 adapters=adapters,
                 persistence_history=persistence_history,
                 route_spread_history=route_spread_history,
+                market_data_cache=market_data_cache,
+                websocket_service=websocket_service,
+                use_websocket_cache=args.use_websocket_cache,
+                ws_depth_cache=args.ws_depth_cache,
+                ws_ticker_max_age_seconds=args.ws_ticker_max_age_seconds,
+                ws_ticker_min_count=args.ws_ticker_min_count,
+                ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,
+                ws_depth_target_limit=args.ws_depth_target_limit,
             )
-            time.sleep(args.interval)
-        except KeyboardInterrupt:
-            print("\nStopped by user.")
-            break
-        except Exception as exc:
-            print(f"\nLoop error: {exc}")
-            time.sleep(args.interval)
+            return
+
+        print(f"Running in loop mode every {args.interval} seconds. Press Ctrl+C to stop.")
+
+        while True:
+            try:
+                run_scan_once(
+                    adapters=adapters,
+                    persistence_history=persistence_history,
+                    route_spread_history=route_spread_history,
+                    market_data_cache=market_data_cache,
+                    websocket_service=websocket_service,
+                    use_websocket_cache=args.use_websocket_cache,
+                    ws_depth_cache=args.ws_depth_cache,
+                    ws_ticker_max_age_seconds=args.ws_ticker_max_age_seconds,
+                    ws_ticker_min_count=args.ws_ticker_min_count,
+                    ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,
+                    ws_depth_target_limit=args.ws_depth_target_limit,
+                )
+                time.sleep(args.interval)
+            except KeyboardInterrupt:
+                print("\nStopped by user.")
+                break
+            except Exception as exc:
+                print(f"\nLoop error: {exc}")
+                time.sleep(args.interval)
+    finally:
+        if websocket_service is not None:
+            websocket_service.stop()
 
 
 if __name__ == "__main__":

@@ -136,6 +136,22 @@ source .venv/bin/activate
 python scanners/fast_futures_futures_scanner.py --loop --interval 30
 ```
 
+Optional websocket-assisted scanner mode:
+
+```bash
+python scanners/fast_futures_futures_scanner.py \
+  --loop \
+  --interval 30 \
+  --use-websocket-cache \
+  --ws-depth-cache \
+  --ws-warmup-seconds 20
+```
+
+Websocket mode is hybrid and paper/data only. The scanner prefers fresh streamed
+top-of-book and candidate depth data, then falls back to REST whenever a stream
+is cold, stale, or missing. KuCoin remains REST-backed until its futures
+websocket token/channel path is live-tested.
+
 ### Pane 2: Strategy Loop
 
 ```bash
