@@ -73,8 +73,22 @@ def choose_best_entry_rows(
         if not notional_rows:
             notional_rows = position_rows
 
+        preferred_rows = notional_rows
+        if config.require_paper_ready:
+            paper_ready_rows = [row for row in preferred_rows if row.paper_ready]
+            if paper_ready_rows:
+                preferred_rows = paper_ready_rows
+
+        fillable_rows = [
+            row
+            for row in preferred_rows
+            if row.long_fillable and row.short_fillable
+        ]
+        if fillable_rows:
+            preferred_rows = fillable_rows
+
         best = max(
-            notional_rows,
+            preferred_rows,
             key=lambda item: (
                 item.net_edge_ex_funding_pct if item.net_edge_ex_funding_pct is not None else -999,
                 item.validated_spread_pct if item.validated_spread_pct is not None else -999,

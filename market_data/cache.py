@@ -46,6 +46,7 @@ class CachedTicker:
             "bid": self.bid,
             "ask": self.ask,
             "volume_usdt": self.volume_usdt,
+            "price_source": self.source,
         }
 
 
@@ -107,6 +108,16 @@ class MarketDataCache:
                     source=ticker.source,
                 )
             self._tickers[(ticker.exchange, ticker.symbol)] = ticker
+            if ticker.funding_rate is not None or ticker.next_funding_time_utc is not None:
+                self._funding[(ticker.exchange, ticker.symbol)] = FundingInfo(
+                    exchange=ticker.exchange,
+                    standard_symbol=ticker.symbol,
+                    exchange_symbol=ticker.symbol,
+                    funding_rate=ticker.funding_rate,
+                    next_funding_time_utc=ticker.next_funding_time_utc,
+                    funding_interval_hours=None,
+                    observed_at_utc=ticker.observed_at_utc,
+                )
 
     def update_funding(
         self,
@@ -248,6 +259,21 @@ class MarketDataCache:
                 if target.is_active(now) and (exchange is None or target.exchange == exchange)
             ]
         return sorted(targets, key=lambda item: (item.exchange, item.symbol))
+
+    def get_ticker_symbols(
+        self,
+        exchange: str,
+        *,
+        max_age_seconds: float,
+    ) -> list[str]:
+        now = utc_now()
+        with self._lock:
+            symbols = [
+                symbol
+                for (ticker_exchange, symbol), ticker in self._tickers.items()
+                if ticker_exchange == exchange and ticker.is_usable(max_age_seconds, now=now)
+            ]
+        return sorted(symbols)
 
     def stats(self) -> CacheStats:
         with self._lock:

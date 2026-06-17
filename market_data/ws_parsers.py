@@ -218,6 +218,72 @@ def _normalise_mexc_depth_levels(levels: list) -> list:
     return normalised
 
 
+def parse_kucoin_ticker(payload: dict) -> CachedTicker | None:
+    topic = str(payload.get("topic") or "")
+    if not topic.startswith("/contractMarket/ticker"):
+        return None
+
+    item = payload.get("data") or {}
+    if not isinstance(item, dict):
+        return None
+
+    symbol = item.get("symbol")
+    if not symbol and ":" in topic:
+        symbol = topic.rsplit(":", 1)[-1]
+
+    bid = parse_float(item.get("bestBidPrice") or item.get("bidPrice") or item.get("bestBid"))
+    ask = parse_float(item.get("bestAskPrice") or item.get("askPrice") or item.get("bestAsk"))
+    if not symbol or bid is None or ask is None or bid <= 0 or ask <= 0:
+        return None
+
+    return CachedTicker(
+        exchange="kucoin",
+        symbol=normalise_symbol(str(symbol)),
+        bid=bid,
+        ask=ask,
+        volume_usdt=parse_float(
+            item.get("turnoverOf24h")
+            or item.get("turnover24h")
+            or item.get("quoteVolume")
+            or item.get("volValue"),
+            0.0,
+        )
+        or 0.0,
+        bid_qty=parse_float(item.get("bestBidSize") or item.get("bidSize")),
+        ask_qty=parse_float(item.get("bestAskSize") or item.get("askSize")),
+        funding_rate=parse_float(item.get("fundingRate")),
+        next_funding_time_utc=millis_to_datetime(item.get("nextFundingTime")),
+        observed_at_utc=observed_time_from_millis(item.get("ts") or item.get("timestamp") or payload.get("ts")),
+    )
+
+
+def parse_kucoin_depth(payload: dict) -> OrderBook | None:
+    topic = str(payload.get("topic") or "")
+    if not topic.startswith("/contractMarket/level2Depth"):
+        return None
+
+    item = payload.get("data") or {}
+    if not isinstance(item, dict):
+        return None
+
+    symbol = item.get("symbol")
+    if not symbol and ":" in topic:
+        symbol = topic.rsplit(":", 1)[-1]
+
+    if not symbol:
+        return None
+
+    return OrderBook(
+        exchange="kucoin",
+        market_type="futures",
+        standard_symbol=normalise_symbol(str(symbol)),
+        exchange_symbol=str(symbol),
+        bids=parse_orderbook_levels(item.get("bids") or [], max_levels=100),
+        asks=parse_orderbook_levels(item.get("asks") or [], max_levels=100),
+        observed_at_utc=observed_time_from_millis(item.get("timestamp") or item.get("ts") or payload.get("ts")),
+    )
+
+
 def parse_hyperliquid_all_mids(payload: dict) -> list[CachedTicker]:
     if payload.get("channel") != "allMids":
         return []
@@ -238,6 +304,7 @@ def parse_hyperliquid_all_mids(payload: dict) -> list[CachedTicker]:
                 ask=mid,
                 volume_usdt=0.0,
                 observed_at_utc=observed_at,
+                source="websocket_mid",
             )
         )
     return tickers
@@ -266,6 +333,7 @@ def parse_hyperliquid_bbo(payload: dict) -> CachedTicker | None:
         bid_qty=parse_float(bbo[0].get("sz")),
         ask_qty=parse_float(bbo[1].get("sz")),
         observed_at_utc=observed_time_from_millis(data.get("time")),
+        source="websocket_bbo",
     )
 
 

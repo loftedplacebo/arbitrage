@@ -4,7 +4,10 @@ import asyncio
 import json
 import threading
 from dataclasses import dataclass, field
+from uuid import uuid4
 from typing import Awaitable, Callable, Iterable
+
+import requests
 
 from core.symbols import standard_to_exchange_symbol
 from market_data.cache import MarketDataCache
@@ -15,9 +18,10 @@ from market_data.ws_parsers import (
     parse_bitget_depth,
     parse_bitget_tickers,
     parse_hyperliquid_active_asset_ctx,
-    parse_hyperliquid_all_mids,
     parse_hyperliquid_bbo,
     parse_hyperliquid_l2_book,
+    parse_kucoin_depth,
+    parse_kucoin_ticker,
     parse_mexc_depth,
     parse_mexc_funding,
     parse_mexc_tickers,
@@ -35,12 +39,13 @@ BINANCE_PUBLIC_COMBINED_BASE_URL = "wss://fstream.binance.com/public/stream?stre
 BITGET_PUBLIC_URL = "wss://ws.bitget.com/v2/ws/public"
 MEXC_PUBLIC_URL = "wss://contract.mexc.com/edge"
 HYPERLIQUID_PUBLIC_URL = "wss://api.hyperliquid.xyz/ws"
+KUCOIN_FUTURES_BULLET_URL = "https://api-futures.kucoin.com/api/v1/bullet-public"
 
 
 @dataclass(frozen=True)
 class WebsocketRuntimeConfig:
     enabled_exchanges: set[str] = field(
-        default_factory=lambda: {"binance", "bitget", "mexc", "hyperliquid"}
+        default_factory=lambda: {"binance", "bitget", "mexc", "kucoin", "hyperliquid"}
     )
     ticker_symbol_limit: int | None = None
     ticker_batch_size: int = 100
@@ -49,6 +54,10 @@ class WebsocketRuntimeConfig:
     depth_reconnect_seconds: float = 10.0
     reconnect_delay_seconds: float = 5.0
     ping_interval_seconds: float = 15.0
+    funding_reconcile_enabled: bool = True
+    funding_reconcile_seconds: float = 180.0
+    funding_reconcile_symbol_limit: int = 80
+    funding_reconcile_request_sleep_seconds: float = 0.05
 
 
 class WebsocketMarketDataService:
@@ -131,11 +140,20 @@ class WebsocketMarketDataService:
                 asyncio.create_task(self._mexc_ticker_loop(symbols)),
                 asyncio.create_task(self._mexc_depth_loop()),
             ])
-        if "hyperliquid" in enabled:
+        if "kucoin" in enabled and "kucoin" in self.adapters:
+            symbols = self._limited_symbols("kucoin")
             tasks.extend([
-                asyncio.create_task(self._hyperliquid_ticker_loop()),
+                asyncio.create_task(self._kucoin_ticker_loop(symbols)),
+                asyncio.create_task(self._kucoin_depth_loop()),
+            ])
+        if "hyperliquid" in enabled and "hyperliquid" in self.adapters:
+            symbols = self._limited_symbols("hyperliquid")
+            tasks.extend([
+                asyncio.create_task(self._hyperliquid_ticker_loop(symbols)),
                 asyncio.create_task(self._hyperliquid_depth_loop()),
             ])
+        if self.config.funding_reconcile_enabled:
+            tasks.append(asyncio.create_task(self._funding_reconciliation_loop()))
 
         await self._stop_event.wait()
         for task in tasks:
@@ -144,7 +162,11 @@ class WebsocketMarketDataService:
 
     def _limited_symbols(self, exchange: str) -> list[str]:
         adapter = self.adapters[exchange]
-        symbols = sorted(adapter.get_futures_usdt_symbols())
+        try:
+            symbols = sorted(adapter.get_futures_usdt_symbols())
+        except Exception as exc:
+            print(f"[ws:{exchange}_symbols] unavailable: {exc}")
+            return []
         if self.config.ticker_symbol_limit is not None:
             symbols = symbols[: self.config.ticker_symbol_limit]
         return symbols
@@ -153,7 +175,7 @@ class WebsocketMarketDataService:
         self,
         *,
         name: str,
-        url: str,
+        url: str | Callable[[], str | Awaitable[str]],
         on_message: Callable[[dict], None],
         subscribe_messages: list[dict] | None = None,
         ping_message: dict | None = None,
@@ -161,7 +183,8 @@ class WebsocketMarketDataService:
         assert self._stop_event is not None
         while not self._stop_event.is_set():
             try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                stream_url = await self._resolve_stream_url(url)
+                async with websockets.connect(stream_url, ping_interval=None) as ws:
                     for message in subscribe_messages or []:
                         await ws.send(json.dumps(message))
 
@@ -184,6 +207,14 @@ class WebsocketMarketDataService:
             except Exception as exc:
                 print(f"[ws:{name}] disconnected: {exc}")
                 await asyncio.sleep(self.config.reconnect_delay_seconds)
+
+    async def _resolve_stream_url(self, url: str | Callable[[], str | Awaitable[str]]) -> str:
+        if not callable(url):
+            return url
+        resolved = url()
+        if asyncio.iscoroutine(resolved):
+            return await resolved
+        return resolved
 
     async def _binance_book_ticker_loop(self) -> None:
         def on_message(payload: dict) -> None:
@@ -359,12 +390,134 @@ class WebsocketMarketDataService:
                 on_message=on_message,
             )
 
-    async def _hyperliquid_ticker_loop(self) -> None:
-        subscribe_messages = [{"method": "subscribe", "subscription": {"type": "allMids"}}]
+    async def _kucoin_public_ws_url(self) -> str:
+        return await asyncio.to_thread(self._kucoin_public_ws_url_sync)
+
+    def _kucoin_public_ws_url_sync(self) -> str:
+        response = requests.post(KUCOIN_FUTURES_BULLET_URL, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code") != "200000":
+            raise RuntimeError(f"KuCoin websocket token error: {payload}")
+
+        data = payload.get("data") or {}
+        token = data.get("token")
+        servers = data.get("instanceServers") or []
+        if not token or not servers:
+            raise RuntimeError(f"KuCoin websocket token response missing server data: {payload}")
+
+        endpoint = servers[0].get("endpoint")
+        if not endpoint:
+            raise RuntimeError(f"KuCoin websocket token response missing endpoint: {payload}")
+
+        return f"{endpoint}?token={token}&connectId={uuid4().hex}"
+
+    def _kucoin_subscribe_message(self, topic: str) -> dict:
+        return {
+            "id": uuid4().hex,
+            "type": "subscribe",
+            "topic": topic,
+            "privateChannel": False,
+            "response": True,
+        }
+
+    async def _kucoin_ticker_loop(self, symbols: list[str]) -> None:
+        assert self._stop_event is not None
+        if not symbols:
+            await self._stop_event.wait()
+            return
+
+        tasks = [
+            asyncio.create_task(self._kucoin_ticker_batch_loop(batch, batch_number=index))
+            for index, batch in enumerate(_chunks(symbols, self.config.ticker_batch_size), start=1)
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _kucoin_ticker_batch_loop(self, symbols: list[str], *, batch_number: int) -> None:
+        subscribe_messages = [
+            self._kucoin_subscribe_message(
+                f"/contractMarket/tickerV2:{standard_to_exchange_symbol(symbol, 'kucoin', 'futures')}"
+            )
+            for symbol in symbols
+        ]
 
         def on_message(payload: dict) -> None:
-            for ticker in parse_hyperliquid_all_mids(payload):
+            ticker = parse_kucoin_ticker(payload)
+            if ticker:
                 self.cache.update_ticker(ticker)
+
+        await self._json_stream_loop(
+            name=f"kucoin_ticker_{batch_number}",
+            url=self._kucoin_public_ws_url,
+            subscribe_messages=subscribe_messages,
+            ping_message={"id": "ping", "type": "ping"},
+            on_message=on_message,
+        )
+
+    async def _kucoin_depth_loop(self) -> None:
+        while True:
+            symbols = [
+                target.symbol
+                for target in self.cache.get_depth_targets("kucoin")
+            ][: self.config.depth_batch_size]
+            if not symbols:
+                await asyncio.sleep(1)
+                continue
+
+            subscribe_messages = [
+                self._kucoin_subscribe_message(
+                    f"/contractMarket/level2Depth50:{standard_to_exchange_symbol(symbol, 'kucoin', 'futures')}"
+                )
+                for symbol in symbols
+            ]
+
+            def on_message(payload: dict) -> None:
+                orderbook = parse_kucoin_depth(payload)
+                if orderbook:
+                    self.cache.update_orderbook(orderbook)
+
+            await self._run_depth_connection(
+                name="kucoin_depth",
+                url=self._kucoin_public_ws_url,
+                subscribe_messages=subscribe_messages,
+                ping_message={"id": "ping", "type": "ping"},
+                on_message=on_message,
+            )
+
+    async def _hyperliquid_ticker_loop(self, symbols: list[str]) -> None:
+        assert self._stop_event is not None
+        if not symbols:
+            await self._stop_event.wait()
+            return
+
+        tasks = [
+            asyncio.create_task(self._hyperliquid_ticker_batch_loop(batch, batch_number=index))
+            for index, batch in enumerate(
+                _chunks(symbols, min(self.config.ticker_batch_size, 50)),
+                start=1,
+            )
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _hyperliquid_ticker_batch_loop(self, symbols: list[str], *, batch_number: int) -> None:
+        subscribe_messages = []
+        for symbol in symbols:
+            coin = standard_to_exchange_symbol(symbol, "hyperliquid", "futures")
+            subscribe_messages.append(
+                {"method": "subscribe", "subscription": {"type": "bbo", "coin": coin}}
+            )
+
+        def on_message(payload: dict) -> None:
             ticker = parse_hyperliquid_bbo(payload)
             if ticker:
                 self.cache.update_ticker(ticker)
@@ -380,7 +533,7 @@ class WebsocketMarketDataService:
                 )
 
         await self._json_stream_loop(
-            name="hyperliquid_ticker",
+            name=f"hyperliquid_ticker_{batch_number}",
             url=HYPERLIQUID_PUBLIC_URL,
             subscribe_messages=subscribe_messages,
             on_message=on_message,
@@ -430,11 +583,71 @@ class WebsocketMarketDataService:
                 on_message=on_message,
             )
 
+    async def _funding_reconciliation_loop(self) -> None:
+        assert self._stop_event is not None
+        while not self._stop_event.is_set():
+            try:
+                await self._reconcile_funding_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[ws:funding_reconcile] error: {exc}")
+
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=self.config.funding_reconcile_seconds,
+                )
+            except asyncio.TimeoutError:
+                continue
+
+    async def _reconcile_funding_once(self) -> None:
+        for exchange, adapter in sorted(self.adapters.items()):
+            if exchange not in self.config.enabled_exchanges:
+                continue
+            if not hasattr(adapter, "get_funding_info"):
+                continue
+
+            symbols = self._funding_reconcile_symbols(exchange)
+            if not symbols:
+                continue
+
+            failures = 0
+            for symbol in symbols:
+                try:
+                    funding_info = await asyncio.to_thread(adapter.get_funding_info, symbol)
+                    self.cache.update_funding_info(funding_info)
+                except Exception:
+                    failures += 1
+
+                if self.config.funding_reconcile_request_sleep_seconds > 0:
+                    await asyncio.sleep(self.config.funding_reconcile_request_sleep_seconds)
+
+            if failures:
+                print(
+                    f"[ws:funding_reconcile] {exchange} funding failures: "
+                    f"{failures}/{len(symbols)}"
+                )
+
+    def _funding_reconcile_symbols(self, exchange: str) -> list[str]:
+        depth_symbols = [target.symbol for target in self.cache.get_depth_targets(exchange)]
+        ticker_symbols = self.cache.get_ticker_symbols(exchange, max_age_seconds=300)
+
+        seen = set()
+        symbols = []
+        for symbol in depth_symbols + ticker_symbols:
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            symbols.append(symbol)
+
+        return symbols[: self.config.funding_reconcile_symbol_limit]
+
     async def _run_depth_connection(
         self,
         *,
         name: str,
-        url: str,
+        url: str | Callable[[], str | Awaitable[str]],
         on_message: Callable[[dict], None],
         subscribe_messages: list[dict] | None = None,
         ping_message: dict | None = None,

@@ -119,6 +119,32 @@ def test_one_entry_row_per_position_per_scan():
     assert next(row for row in selected if row.symbol == "IDUSDT").notional_usdt == 100.0
 
 
+def test_best_entry_row_prefers_paper_ready_slice():
+    config = StrategyConfig(max_slice_notional_usd=5_000.0)
+    rows = [
+        make_opportunity(
+            notional_usdt=2_500.0,
+            validated_spread_pct=3.0,
+            net_edge_ex_funding_pct=2.0,
+            net_edge_inc_funding_pct=1.9,
+            paper_ready=False,
+        ),
+        make_opportunity(
+            notional_usdt=100.0,
+            validated_spread_pct=2.5,
+            net_edge_ex_funding_pct=1.5,
+            net_edge_inc_funding_pct=1.4,
+            paper_ready=True,
+        ),
+    ]
+
+    selected = choose_best_entry_rows(rows, config)
+
+    assert len(selected) == 1
+    assert selected[0].notional_usdt == 100.0
+    assert selected[0].paper_ready is True
+
+
 def test_missing_opportunity_waits_until_threshold():
     config = StrategyConfig(max_missing_scans_before_exit=3)
     position = make_position(missing_scan_count=2)
@@ -777,6 +803,7 @@ def test_strategy_loop_increments_and_resets_close_liquidity_warning_count():
 if __name__ == "__main__":
     test_pnl_uses_close_side_prices()
     test_one_entry_row_per_position_per_scan()
+    test_best_entry_row_prefers_paper_ready_slice()
     test_missing_opportunity_waits_until_threshold()
     test_daily_risk_state_from_fills()
     test_funding_capture_ready_window()

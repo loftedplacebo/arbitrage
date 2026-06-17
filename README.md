@@ -146,13 +146,20 @@ python scanners/fast_futures_futures_scanner.py \
   --ws-depth-cache \
   --ws-warmup-seconds 20 \
   --ws-depth-wait-seconds 2 \
-  --funding-cache-seconds 60
+  --funding-cache-seconds 240 \
+  --ws-funding-reconcile-seconds 180 \
+  --ws-funding-reconcile-symbol-limit 80
 ```
 
 Websocket mode is hybrid and paper/data only. The scanner prefers fresh streamed
 top-of-book and candidate depth data, then falls back to REST whenever a stream
-is cold, stale, or missing. KuCoin remains REST-backed until its futures
-websocket token/channel path is live-tested.
+is cold, stale, or missing. Binance, Bitget, MEXC, KuCoin, and Hyperliquid are
+enabled by default when websocket mode is switched on. KuCoin futures websockets
+use the public token/server flow internally, so no API keys are required.
+
+Funding is also hybrid. Streamed funding fields are used when a venue provides
+them reliably, and the websocket service reconciles funding from public REST
+endpoints every few minutes for active/candidate symbols.
 
 ### Pane 2: Strategy Loop
 

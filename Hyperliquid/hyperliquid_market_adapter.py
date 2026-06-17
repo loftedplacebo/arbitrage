@@ -145,8 +145,8 @@ class HyperliquidMarketAdapter:
     def get_fast_futures_tickers(self) -> dict[str, dict]:
         """
         Hyperliquid's public all-mids endpoint is broad and cheap, but does not
-        expose bid/ask. We use mids only for fast candidate discovery; deep
-        validation always re-prices with the L2 order book before paper entry.
+        expose bid/ask. These rows are retained for compatibility, but the fast
+        scanner filters them out of tradeable candidate discovery.
         """
         meta, contexts = self.get_meta_and_asset_contexts()
         universe = meta.get("universe") or []
@@ -181,6 +181,7 @@ class HyperliquidMarketAdapter:
                 "bid": mid,
                 "ask": mid,
                 "volume_usdt": volume_usdt,
+                "price_source": "rest_mid",
             }
 
         return output

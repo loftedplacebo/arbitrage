@@ -276,6 +276,24 @@ def bootstrap_route_spread_history() -> dict[str, deque]:
 # -----------------------------
 # Fast scan
 # -----------------------------
+def is_executable_fast_ticker(exchange: str, ticker: dict) -> bool:
+    """
+    Return whether a fast ticker has executable bid/ask prices.
+
+    Hyperliquid midpoint rows are useful context, but they are not executable
+    top-of-book prices and should not create spread candidates or ML labels.
+    """
+    bid = ticker.get("bid")
+    ask = ticker.get("ask")
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return False
+
+    if exchange != "hyperliquid":
+        return True
+
+    return ticker.get("price_source") in {"websocket_bbo", "rest_bbo", "websocket_depth"}
+
+
 def build_fast_candidates(ticker_data: dict[str, dict[str, dict]]) -> list[dict]:
     """
     Build fast cross-exchange futures candidates using ticker bid/ask only.
@@ -300,6 +318,11 @@ def build_fast_candidates(ticker_data: dict[str, dict[str, dict]]) -> list[dict]
         for symbol in common_symbols:
             a = tickers_a[symbol]
             b = tickers_b[symbol]
+
+            if not is_executable_fast_ticker(exchange_a, a):
+                continue
+            if not is_executable_fast_ticker(exchange_b, b):
+                continue
 
             combined_volume = (a.get("volume_usdt") or 0) + (b.get("volume_usdt") or 0)
             if combined_volume < MIN_COMBINED_VOLUME_USDT:
@@ -329,6 +352,8 @@ def build_fast_candidates(ticker_data: dict[str, dict[str, dict]]) -> list[dict]
                     "long_volume_usdt": a.get("volume_usdt"),
                     "short_volume_usdt": b.get("volume_usdt"),
                     "combined_volume_usdt": combined_volume,
+                    "long_price_source": a.get("price_source"),
+                    "short_price_source": b.get("price_source"),
                 })
 
             # Direction B:
@@ -351,6 +376,8 @@ def build_fast_candidates(ticker_data: dict[str, dict[str, dict]]) -> list[dict]
                     "long_volume_usdt": b.get("volume_usdt"),
                     "short_volume_usdt": a.get("volume_usdt"),
                     "combined_volume_usdt": combined_volume,
+                    "long_price_source": b.get("price_source"),
+                    "short_price_source": a.get("price_source"),
                 })
 
     candidates = sorted(
@@ -384,6 +411,11 @@ def build_fast_observations(ticker_data: dict[str, dict[str, dict]]) -> list[dic
             a = tickers_a[symbol]
             b = tickers_b[symbol]
 
+            if not is_executable_fast_ticker(exchange_a, a):
+                continue
+            if not is_executable_fast_ticker(exchange_b, b):
+                continue
+
             combined_volume = (a.get("volume_usdt") or 0) + (b.get("volume_usdt") or 0)
             if combined_volume < MIN_COMBINED_VOLUME_USDT:
                 continue
@@ -411,6 +443,8 @@ def build_fast_observations(ticker_data: dict[str, dict[str, dict]]) -> list[dic
                     "long_volume_usdt": a.get("volume_usdt"),
                     "short_volume_usdt": b.get("volume_usdt"),
                     "combined_volume_usdt": combined_volume,
+                    "long_price_source": a.get("price_source"),
+                    "short_price_source": b.get("price_source"),
                 })
 
             spread_ba = pct_diff(
@@ -432,6 +466,8 @@ def build_fast_observations(ticker_data: dict[str, dict[str, dict]]) -> list[dic
                     "long_volume_usdt": b.get("volume_usdt"),
                     "short_volume_usdt": a.get("volume_usdt"),
                     "combined_volume_usdt": combined_volume,
+                    "long_price_source": b.get("price_source"),
+                    "short_price_source": a.get("price_source"),
                 })
 
     observations = sorted(
@@ -476,6 +512,8 @@ def write_fast_observations_to_csv(observations: list[dict], timestamp: datetime
         "long_volume_usdt",
         "short_volume_usdt",
         "combined_volume_usdt",
+        "long_price_source",
+        "short_price_source",
         "config_fast_spread_threshold_pct",
         "config_ml_fast_spread_log_threshold_pct",
         "config_min_combined_volume_usdt",
@@ -539,6 +577,8 @@ def write_fast_candidates_to_csv(candidates: list[dict], timestamp: datetime) ->
         "long_volume_usdt",
         "short_volume_usdt",
         "combined_volume_usdt",
+        "long_price_source",
+        "short_price_source",
     ]
 
     file_exists = output_file.exists()
@@ -1320,6 +1360,18 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to reuse cached funding info during deep validation",
     )
     parser.add_argument(
+        "--ws-funding-reconcile-seconds",
+        type=float,
+        default=180.0,
+        help="Seconds between websocket-service REST funding reconciliation passes; 0 disables it",
+    )
+    parser.add_argument(
+        "--ws-funding-reconcile-symbol-limit",
+        type=int,
+        default=80,
+        help="Maximum symbols per exchange to refresh during each funding reconciliation pass",
+    )
+    parser.add_argument(
         "--ws-ticker-symbol-limit",
         type=int,
         default=0,
@@ -1327,7 +1379,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ws-exchanges",
-        default="binance,bitget,mexc,hyperliquid",
+        default="binance,bitget,mexc,kucoin,hyperliquid",
         help="Comma-separated websocket exchanges to enable",
     )
     return parser.parse_args()
@@ -1368,9 +1420,18 @@ def main():
             config=WebsocketRuntimeConfig(
                 enabled_exchanges=enabled_exchanges,
                 ticker_symbol_limit=args.ws_ticker_symbol_limit or None,
+                funding_reconcile_enabled=args.ws_funding_reconcile_seconds > 0,
+                funding_reconcile_seconds=args.ws_funding_reconcile_seconds,
+                funding_reconcile_symbol_limit=args.ws_funding_reconcile_symbol_limit,
             ),
         )
         print(f"Starting websocket market data service for: {sorted(enabled_exchanges)}")
+        print(
+            "Websocket funding reconciliation: "
+            f"{args.ws_funding_reconcile_seconds > 0} "
+            f"interval={args.ws_funding_reconcile_seconds:g}s "
+            f"symbol_limit={args.ws_funding_reconcile_symbol_limit}"
+        )
         websocket_service.start()
         if args.ws_warmup_seconds > 0:
             print(f"Warming websocket cache for {args.ws_warmup_seconds:g} seconds...")

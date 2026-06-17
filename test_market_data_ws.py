@@ -11,7 +11,7 @@ from market_data.scanner_integration import (
     get_ticker_data_with_cache,
     wait_for_candidate_orderbooks,
 )
-from scanners.fast_futures_futures_scanner import deep_validate_candidate
+from scanners.fast_futures_futures_scanner import build_fast_candidates, deep_validate_candidate
 from market_data.ws_parsers import (
     parse_binance_book_ticker,
     parse_binance_depth,
@@ -22,6 +22,8 @@ from market_data.ws_parsers import (
     parse_hyperliquid_all_mids,
     parse_hyperliquid_bbo,
     parse_hyperliquid_l2_book,
+    parse_kucoin_depth,
+    parse_kucoin_ticker,
     parse_mexc_depth,
     parse_mexc_funding,
     parse_mexc_tickers,
@@ -155,6 +157,88 @@ def test_funding_info_cache_avoids_repeated_adapter_calls():
     assert first.funding_rate == second.funding_rate
     assert adapter.calls == 1
     assert cache.stats().funding_counts == {"binance": 1}
+
+
+def test_ticker_funding_fields_update_funding_cache():
+    now = datetime.now(timezone.utc)
+    next_funding = now + timedelta(hours=1)
+    cache = MarketDataCache()
+
+    cache.update_ticker(
+        CachedTicker(
+            exchange="bitget",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            volume_usdt=1_000_000.0,
+            funding_rate=0.00012,
+            next_funding_time_utc=next_funding,
+            observed_at_utc=now,
+        )
+    )
+
+    funding = cache.get_funding_info("bitget", "BTCUSDT", max_age_seconds=10)
+
+    assert funding is not None
+    assert funding.funding_rate == 0.00012
+    assert funding.next_funding_time_utc == next_funding
+    assert cache.stats().funding_counts == {"bitget": 1}
+
+
+def test_hyperliquid_midpoint_rows_do_not_create_fast_candidates():
+    ticker_data = {
+        "binance": {
+            "BTCUSDT": {
+                "exchange": "binance",
+                "symbol": "BTCUSDT",
+                "bid": 100.0,
+                "ask": 100.1,
+                "volume_usdt": 1_000_000.0,
+            }
+        },
+        "hyperliquid": {
+            "BTCUSDT": {
+                "exchange": "hyperliquid",
+                "symbol": "BTCUSDT",
+                "bid": 101.0,
+                "ask": 101.0,
+                "volume_usdt": 1_000_000.0,
+                "price_source": "rest_mid",
+            }
+        },
+    }
+
+    assert build_fast_candidates(ticker_data) == []
+
+
+def test_hyperliquid_bbo_rows_can_create_fast_candidates():
+    ticker_data = {
+        "binance": {
+            "BTCUSDT": {
+                "exchange": "binance",
+                "symbol": "BTCUSDT",
+                "bid": 100.0,
+                "ask": 100.1,
+                "volume_usdt": 1_000_000.0,
+            }
+        },
+        "hyperliquid": {
+            "BTCUSDT": {
+                "exchange": "hyperliquid",
+                "symbol": "BTCUSDT",
+                "bid": 101.0,
+                "ask": 101.1,
+                "volume_usdt": 1_000_000.0,
+                "price_source": "websocket_bbo",
+            }
+        },
+    }
+
+    candidates = build_fast_candidates(ticker_data)
+
+    assert len(candidates) == 1
+    assert candidates[0]["short_exchange"] == "hyperliquid"
+    assert candidates[0]["short_price_source"] == "websocket_bbo"
 
 
 def test_wait_for_candidate_orderbooks_reports_ready_routes():
@@ -421,6 +505,47 @@ def test_parse_mexc_ticker_funding_and_depth():
     assert book.asks[0].quantity == 1
 
 
+def test_parse_kucoin_ticker_and_depth():
+    ticker = parse_kucoin_ticker(
+        {
+            "type": "message",
+            "topic": "/contractMarket/tickerV2:XBTUSDTM",
+            "subject": "tickerV2",
+            "data": {
+                "symbol": "XBTUSDTM",
+                "bestBidPrice": "65000.1",
+                "bestAskPrice": "65000.2",
+                "bestBidSize": "2.1",
+                "bestAskSize": "1.9",
+                "turnoverOf24h": "1000000",
+                "ts": 1710000000000,
+            },
+        }
+    )
+    assert ticker is not None
+    assert ticker.exchange == "kucoin"
+    assert ticker.symbol == "BTCUSDT"
+    assert ticker.bid == 65000.1
+    assert ticker.ask_qty == 1.9
+
+    book = parse_kucoin_depth(
+        {
+            "type": "message",
+            "topic": "/contractMarket/level2Depth50:XBTUSDTM",
+            "subject": "level2",
+            "data": {
+                "bids": [["64999.0", "1.2"]],
+                "asks": [["65001.0", "1.1"]],
+                "timestamp": 1710000000000,
+            },
+        }
+    )
+    assert book is not None
+    assert book.exchange == "kucoin"
+    assert book.standard_symbol == "BTCUSDT"
+    assert book.bids[0].quantity == 1.2
+
+
 def test_parse_hyperliquid_messages():
     mids = parse_hyperliquid_all_mids(
         {"channel": "allMids", "data": {"mids": {"BTC": "65000.0", "#1040": "0.1"}}}
@@ -429,6 +554,7 @@ def test_parse_hyperliquid_messages():
     assert mids[0].exchange == "hyperliquid"
     assert mids[0].symbol == "BTCUSDT"
     assert mids[0].bid == 65000.0
+    assert mids[0].source == "websocket_mid"
 
     bbo = parse_hyperliquid_bbo(
         {
@@ -442,6 +568,7 @@ def test_parse_hyperliquid_messages():
     )
     assert bbo is not None
     assert bbo.ask == 65001.0
+    assert bbo.source == "websocket_bbo"
 
     funding = parse_hyperliquid_active_asset_ctx(
         {"channel": "activeAssetCtx", "data": {"coin": "BTC", "ctx": {"funding": "0.0001"}}}
@@ -471,11 +598,15 @@ if __name__ == "__main__":
     test_build_depth_targets_from_candidates_limits_and_dedupes()
     test_ticker_data_uses_cache_when_fresh_and_rest_when_cold()
     test_funding_info_cache_avoids_repeated_adapter_calls()
+    test_ticker_funding_fields_update_funding_cache()
+    test_hyperliquid_midpoint_rows_do_not_create_fast_candidates()
+    test_hyperliquid_bbo_rows_can_create_fast_candidates()
     test_wait_for_candidate_orderbooks_reports_ready_routes()
     test_deep_validation_uses_cached_books_and_funding()
     test_parse_binance_book_ticker_and_mark_price()
     test_parse_binance_depth()
     test_parse_bitget_ticker_and_depth()
     test_parse_mexc_ticker_funding_and_depth()
+    test_parse_kucoin_ticker_and_depth()
     test_parse_hyperliquid_messages()
     print("market data websocket tests passed")
