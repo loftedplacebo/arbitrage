@@ -249,6 +249,23 @@ class MarketDataCache:
                 )
             self._prune_depth_targets_locked()
 
+    def replace_depth_targets(
+        self,
+        targets: Iterable[tuple[str, str]],
+        *,
+        ttl_seconds: float,
+    ) -> None:
+        expires_at = utc_now() + timedelta(seconds=ttl_seconds)
+        with self._lock:
+            self._depth_targets = {
+                (exchange, symbol): DepthTarget(
+                    exchange=exchange,
+                    symbol=symbol,
+                    expires_at_utc=expires_at,
+                )
+                for exchange, symbol in targets
+            }
+
     def get_depth_targets(self, exchange: str | None = None) -> list[DepthTarget]:
         now = utc_now()
         with self._lock:

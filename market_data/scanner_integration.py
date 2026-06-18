@@ -1,9 +1,177 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Iterable
 
 from market_data.cache import MarketDataCache
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def candidate_route_key(row: dict) -> str:
+    return "|".join([
+        str(row.get("symbol", "")),
+        str(row.get("long_exchange", "")),
+        str(row.get("short_exchange", "")),
+        str(row.get("direction", "")),
+    ])
+
+
+@dataclass
+class WatchlistItem:
+    key: str
+    candidate: dict
+    first_seen_utc: datetime
+    last_seen_utc: datetime
+    best_spread_pct: float
+    seen_count: int = 1
+    reason: str = "fast_candidate"
+    priority_bonus: float = 0.0
+
+    def age_seconds(self, now: datetime) -> float:
+        return max(0.0, (now - self.last_seen_utc).total_seconds())
+
+
+class CandidateWatchlist:
+    """
+    Short-lived route memory for websocket depth warming.
+
+    The scanner still validates fresh candidates conservatively, but routes
+    that were recently interesting stay subscribed for depth so later scans
+    are less likely to fall back to REST or wait on cold order books.
+    """
+
+    def __init__(self, *, ttl_seconds: float, max_routes: int):
+        self.ttl_seconds = ttl_seconds
+        self.max_routes = max_routes
+        self._items: dict[str, WatchlistItem] = {}
+
+    def __len__(self) -> int:
+        self.prune()
+        return len(self._items)
+
+    def add_candidate(
+        self,
+        candidate: dict,
+        *,
+        observed_at_utc: datetime | None = None,
+        reason: str = "fast_candidate",
+        priority_bonus: float = 0.0,
+    ) -> None:
+        key = candidate_route_key(candidate)
+        if key.count("|") != 3 or not candidate.get("symbol"):
+            return
+
+        observed_at_utc = observed_at_utc or utc_now()
+        spread = candidate.get("fast_spread_pct")
+        try:
+            spread_value = float(spread) if spread is not None else 0.0
+        except (TypeError, ValueError):
+            spread_value = 0.0
+
+        existing = self._items.get(key)
+        if existing is None:
+            self._items[key] = WatchlistItem(
+                key=key,
+                candidate=dict(candidate),
+                first_seen_utc=observed_at_utc,
+                last_seen_utc=observed_at_utc,
+                best_spread_pct=spread_value,
+                seen_count=1,
+                reason=reason,
+                priority_bonus=priority_bonus,
+            )
+        else:
+            existing.candidate = {**existing.candidate, **candidate}
+            existing.last_seen_utc = observed_at_utc
+            existing.best_spread_pct = max(existing.best_spread_pct, spread_value)
+            existing.seen_count += 1
+            if priority_bonus >= existing.priority_bonus:
+                existing.reason = reason
+                existing.priority_bonus = priority_bonus
+
+        self.prune(now=observed_at_utc)
+
+    def add_candidates(
+        self,
+        candidates: Iterable[dict],
+        *,
+        observed_at_utc: datetime | None = None,
+        reason: str = "fast_candidate",
+        priority_bonus: float = 0.0,
+        max_candidates: int | None = None,
+    ) -> None:
+        rows = list(candidates)
+        if max_candidates is not None:
+            rows = rows[:max_candidates]
+        for candidate in rows:
+            self.add_candidate(
+                candidate,
+                observed_at_utc=observed_at_utc,
+                reason=reason,
+                priority_bonus=priority_bonus,
+            )
+
+    def metadata_for(self, candidate: dict, now: datetime | None = None) -> dict:
+        now = now or utc_now()
+        item = self._items.get(candidate_route_key(candidate))
+        if item is None or item.age_seconds(now) > self.ttl_seconds:
+            return {}
+        return {
+            "watchlist_reason": item.reason,
+            "watchlist_seen_count": item.seen_count,
+            "watchlist_age_seconds": item.age_seconds(now),
+            "watchlist_best_spread_pct": item.best_spread_pct,
+            "watchlist_priority_bonus": item.priority_bonus,
+        }
+
+    def candidates(self, *, now: datetime | None = None) -> list[dict]:
+        now = now or utc_now()
+        self.prune(now=now)
+        rows = []
+        for item in self._items.values():
+            row = dict(item.candidate)
+            row.update(self.metadata_for(row, now=now))
+            rows.append(row)
+        rows.sort(
+            key=lambda row: (
+                row.get("watchlist_priority_bonus") or 0.0,
+                row.get("watchlist_best_spread_pct") or 0.0,
+                row.get("watchlist_seen_count") or 0,
+                -(row.get("watchlist_age_seconds") or 0.0),
+            ),
+            reverse=True,
+        )
+        return rows
+
+    def prune(self, *, now: datetime | None = None) -> None:
+        now = now or utc_now()
+        expired = [
+            key
+            for key, item in self._items.items()
+            if item.age_seconds(now) > self.ttl_seconds
+        ]
+        for key in expired:
+            self._items.pop(key, None)
+
+        if len(self._items) <= self.max_routes:
+            return
+
+        ranked = sorted(
+            self._items.items(),
+            key=lambda pair: (
+                pair[1].priority_bonus,
+                pair[1].best_spread_pct,
+                pair[1].seen_count,
+                pair[1].last_seen_utc,
+            ),
+            reverse=True,
+        )
+        self._items = dict(ranked[: self.max_routes])
 
 
 def build_depth_targets_from_candidates(

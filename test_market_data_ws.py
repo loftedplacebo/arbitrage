@@ -5,13 +5,20 @@ from datetime import datetime, timedelta, timezone
 from core.models import FundingInfo, OrderBook, OrderBookLevel
 from market_data.cache import CachedTicker, MarketDataCache
 from market_data.scanner_integration import (
+    CandidateWatchlist,
     build_depth_targets_from_candidates,
+    candidate_route_key,
     count_candidate_orderbook_coverage,
     get_funding_info_with_cache,
     get_ticker_data_with_cache,
     wait_for_candidate_orderbooks,
 )
-from scanners.fast_futures_futures_scanner import build_fast_candidates, deep_validate_candidate
+from scanners.fast_futures_futures_scanner import (
+    build_depth_warm_candidates,
+    build_fast_candidates,
+    deep_validate_candidate,
+    select_deep_candidates,
+)
 from market_data.ws_parsers import (
     parse_binance_book_ticker,
     parse_binance_depth,
@@ -71,6 +78,22 @@ def test_depth_targets_expire():
     assert len(cache.get_depth_targets()) == 2
 
 
+def test_replace_depth_targets_removes_stale_targets():
+    cache = MarketDataCache()
+    cache.set_depth_targets(
+        [("binance", "BTCUSDT"), ("bitget", "BTCUSDT")],
+        ttl_seconds=60,
+    )
+    cache.replace_depth_targets(
+        [("mexc", "ETHUSDT")],
+        ttl_seconds=60,
+    )
+
+    targets = cache.get_depth_targets()
+
+    assert [(target.exchange, target.symbol) for target in targets] == [("mexc", "ETHUSDT")]
+
+
 def test_build_depth_targets_from_candidates_limits_and_dedupes():
     candidates = [
         {"symbol": "BTCUSDT", "long_exchange": "binance", "short_exchange": "bitget"},
@@ -81,6 +104,93 @@ def test_build_depth_targets_from_candidates_limits_and_dedupes():
     targets = build_depth_targets_from_candidates(candidates, max_candidates=2)
 
     assert targets == [("binance", "BTCUSDT"), ("bitget", "BTCUSDT")]
+
+
+def test_candidate_watchlist_tracks_and_expires_routes():
+    now = datetime.now(timezone.utc)
+    watchlist = CandidateWatchlist(ttl_seconds=10, max_routes=10)
+    candidate = {
+        "symbol": "BTCUSDT",
+        "long_exchange": "binance",
+        "short_exchange": "bitget",
+        "direction": "long_binance_short_bitget",
+        "fast_spread_pct": 0.5,
+    }
+
+    watchlist.add_candidate(
+        candidate,
+        observed_at_utc=now,
+        reason="paper_ready",
+        priority_bonus=4.0,
+    )
+
+    metadata = watchlist.metadata_for(candidate, now=now + timedelta(seconds=5))
+
+    assert len(watchlist) == 1
+    assert candidate_route_key(candidate) == "BTCUSDT|binance|bitget|long_binance_short_bitget"
+    assert metadata["watchlist_reason"] == "paper_ready"
+    assert metadata["watchlist_priority_bonus"] == 4.0
+    assert metadata["watchlist_best_spread_pct"] == 0.5
+    assert watchlist.candidates(now=now + timedelta(seconds=11)) == []
+
+
+def test_watchlist_depth_warm_candidates_include_recent_routes():
+    watchlist = CandidateWatchlist(ttl_seconds=60, max_routes=10)
+    current = [
+        {
+            "symbol": "BTCUSDT",
+            "long_exchange": "binance",
+            "short_exchange": "bitget",
+            "direction": "long_binance_short_bitget",
+            "fast_spread_pct": 0.5,
+        }
+    ]
+    watched = {
+        "symbol": "ETHUSDT",
+        "long_exchange": "mexc",
+        "short_exchange": "kucoin",
+        "direction": "long_mexc_short_kucoin",
+        "fast_spread_pct": 0.4,
+    }
+    watchlist.add_candidate(watched, reason="spread_ready", priority_bonus=2.0)
+
+    warm_candidates = build_depth_warm_candidates(
+        current,
+        watchlist=watchlist,
+        max_candidates=5,
+    )
+
+    assert {candidate_route_key(row) for row in warm_candidates} == {
+        "BTCUSDT|binance|bitget|long_binance_short_bitget",
+        "ETHUSDT|mexc|kucoin|long_mexc_short_kucoin",
+    }
+
+
+def test_deep_candidate_selection_prioritises_watchlisted_ready_route():
+    watchlist = CandidateWatchlist(ttl_seconds=60, max_routes=10)
+    ordinary = {
+        "symbol": "BTCUSDT",
+        "long_exchange": "binance",
+        "short_exchange": "bitget",
+        "direction": "long_binance_short_bitget",
+        "fast_spread_pct": 0.8,
+    }
+    ready = {
+        "symbol": "ETHUSDT",
+        "long_exchange": "mexc",
+        "short_exchange": "kucoin",
+        "direction": "long_mexc_short_kucoin",
+        "fast_spread_pct": 0.6,
+    }
+    watchlist.add_candidate(ready, reason="paper_ready", priority_bonus=4.0)
+
+    selected = select_deep_candidates(
+        [ordinary, ready],
+        watchlist=watchlist,
+        max_candidates=1,
+    )
+
+    assert selected == [ready]
 
 
 def test_ticker_data_uses_cache_when_fresh_and_rest_when_cold():

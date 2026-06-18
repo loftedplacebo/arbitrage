@@ -28,17 +28,20 @@ from core.orderbook import estimate_execution_from_orderbook
 from core.scoring import calculate_net_edge_pct, classify_opportunity
 from market_data.cache import MarketDataCache
 from market_data.scanner_integration import (
+    CandidateWatchlist,
+    candidate_route_key,
     get_cached_orderbook,
     get_funding_info_with_cache,
     wait_for_candidate_orderbooks,
 )
 from market_data.ws_service import WebsocketMarketDataService, WebsocketRuntimeConfig
+from strategy.config import DEFAULT_CONFIG
 
 
 # -----------------------------
 # Fast scan config
 # -----------------------------
-EXPERIMENT_ID = "spread_ladder_20260616_v1"
+EXPERIMENT_ID = DEFAULT_CONFIG.experiment_id
 FAST_SPREAD_THRESHOLD_PCT = 0.08
 MIN_COMBINED_VOLUME_USDT = 1_000_000
 MAX_FAST_CANDIDATES = 500
@@ -56,6 +59,10 @@ ROUTE_STATS_BOOTSTRAP_MAX_ROWS = 200_000
 DEEP_VALIDATE_TOP_N = 150
 DEEP_VALIDATE_CRYPTO_ONLY = True
 NOTIONALS_USDT = [100, 200, 300, 400, 500, 1_000, 2_500]
+CANDIDATE_WATCHLIST_ENABLED = True
+CANDIDATE_WATCHLIST_TTL_SECONDS = 900
+CANDIDATE_WATCHLIST_MAX_ROUTES = 750
+CANDIDATE_WATCHLIST_DEPTH_TARGET_LIMIT = 150
 
 # Rough taker/taker assumption for opening both futures legs only.
 # Later we should model entry + exit and exchange-specific maker/taker fees.
@@ -243,6 +250,89 @@ def update_route_spread_history(rows: list[dict], route_spread_history: dict[str
             route_key(row),
             deque(maxlen=ROUTE_STATS_HISTORY_SCANS),
         ).append(float(spread))
+
+
+def deep_candidate_sort_key(candidate: dict, watchlist: CandidateWatchlist | None = None) -> tuple:
+    metadata = watchlist.metadata_for(candidate) if watchlist is not None else {}
+    return (
+        metadata.get("watchlist_priority_bonus") or 0.0,
+        metadata.get("watchlist_seen_count") or 0,
+        candidate.get("fast_spread_pct") if candidate.get("fast_spread_pct") is not None else -999,
+        candidate.get("route_spread_percentile") if candidate.get("route_spread_percentile") is not None else -999,
+        candidate.get("route_spread_zscore") if candidate.get("route_spread_zscore") is not None else -999,
+        candidate.get("net_edge_ex_funding_pct") if candidate.get("net_edge_ex_funding_pct") is not None else -999,
+        -(metadata.get("watchlist_age_seconds") or 0.0),
+    )
+
+
+def select_deep_candidates(
+    candidates: list[dict],
+    *,
+    watchlist: CandidateWatchlist | None,
+    max_candidates: int,
+) -> list[dict]:
+    if watchlist is None:
+        return candidates[:max_candidates]
+
+    ranked = sorted(
+        candidates,
+        key=lambda row: deep_candidate_sort_key(row, watchlist),
+        reverse=True,
+    )
+    return ranked[:max_candidates]
+
+
+def build_depth_warm_candidates(
+    deep_candidate_pool: list[dict],
+    *,
+    watchlist: CandidateWatchlist | None,
+    max_candidates: int,
+) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for row in deep_candidate_pool:
+        merged.setdefault(candidate_route_key(row), row)
+        if len(merged) >= max_candidates:
+            break
+
+    if watchlist is not None and len(merged) < max_candidates:
+        for row in watchlist.candidates():
+            merged.setdefault(candidate_route_key(row), row)
+            if len(merged) >= max_candidates:
+                break
+
+    return list(merged.values())
+
+
+def update_watchlist_from_validated(
+    watchlist: CandidateWatchlist | None,
+    validated_results: list[dict],
+    timestamp: datetime,
+) -> None:
+    if watchlist is None:
+        return
+
+    for row in validated_results:
+        if row.get("paper_ready"):
+            watchlist.add_candidate(
+                row,
+                observed_at_utc=timestamp,
+                reason="paper_ready",
+                priority_bonus=4.0,
+            )
+        elif row.get("funding_adjusted_ready"):
+            watchlist.add_candidate(
+                row,
+                observed_at_utc=timestamp,
+                reason="funding_adjusted_ready",
+                priority_bonus=3.0,
+            )
+        elif row.get("spread_ready"):
+            watchlist.add_candidate(
+                row,
+                observed_at_utc=timestamp,
+                reason="spread_ready",
+                priority_bonus=2.0,
+            )
 
 
 def bootstrap_route_spread_history() -> dict[str, deque]:
@@ -1040,6 +1130,7 @@ def run_scan_once(
     adapters: dict,
     persistence_history: dict[str, deque],
     route_spread_history: dict[str, deque],
+    candidate_watchlist: CandidateWatchlist | None = None,
     market_data_cache: MarketDataCache | None = None,
     websocket_service: WebsocketMarketDataService | None = None,
     use_websocket_cache: bool = False,
@@ -1051,6 +1142,7 @@ def run_scan_once(
     ws_depth_wait_seconds: float = 2.0,
     funding_cache_seconds: float = 60.0,
 ) -> tuple[list[dict], list[dict]]:
+    scan_started_monotonic = time.monotonic()
     timestamp = utc_now()
 
     print(f"\n[{timestamp.isoformat()}] Fast futures-futures spread scan")
@@ -1066,6 +1158,7 @@ def run_scan_once(
     print(f"Websocket depth cache enabled: {ws_depth_cache}")
     print(f"Websocket depth wait seconds: {ws_depth_wait_seconds:g}")
     print(f"Funding cache seconds: {funding_cache_seconds:g}")
+    print(f"Candidate watchlist enabled: {candidate_watchlist is not None}")
 
     ticker_data = {}
 
@@ -1149,11 +1242,31 @@ def run_scan_once(
             "from deep validation."
         )
 
-    deep_candidates = deep_candidate_pool[:DEEP_VALIDATE_TOP_N]
+    if candidate_watchlist is not None:
+        candidate_watchlist.add_candidates(
+            deep_candidate_pool,
+            observed_at_utc=timestamp,
+            reason="fast_candidate",
+            priority_bonus=1.0,
+            max_candidates=MAX_FAST_CANDIDATES,
+        )
+        print(f"Candidate watchlist routes: {len(candidate_watchlist)}")
+
+    deep_candidates = select_deep_candidates(
+        deep_candidate_pool,
+        watchlist=candidate_watchlist,
+        max_candidates=DEEP_VALIDATE_TOP_N,
+    )
     if ws_depth_cache and websocket_service is not None:
+        depth_warm_candidates = build_depth_warm_candidates(
+            deep_candidate_pool,
+            watchlist=candidate_watchlist,
+            max_candidates=max(ws_depth_target_limit, CANDIDATE_WATCHLIST_DEPTH_TARGET_LIMIT),
+        )
         websocket_service.set_depth_targets(
-            deep_candidates,
-            max_candidates=ws_depth_target_limit,
+            depth_warm_candidates,
+            max_candidates=max(ws_depth_target_limit, CANDIDATE_WATCHLIST_DEPTH_TARGET_LIMIT),
+            replace=True,
         )
         ready, total = wait_for_candidate_orderbooks(
             candidates=deep_candidates[:ws_depth_target_limit],
@@ -1166,10 +1279,12 @@ def run_scan_once(
             stats = market_data_cache.stats()
             print(f"Websocket depth targets: {stats.active_depth_targets}")
             print(f"Websocket candidate books ready: {ready}/{total}")
+            print(f"Websocket depth warm candidates: {len(depth_warm_candidates)}")
 
     print(
         f"\nDeep-validating {len(deep_candidates)} candidates "
         f"from {len(candidates)} fast candidates "
+        f"and {len(deep_candidate_pool)} crypto candidate-pool rows "
         f"(crypto_only={DEEP_VALIDATE_CRYPTO_ONLY})..."
     )
 
@@ -1214,6 +1329,7 @@ def run_scan_once(
         validated_results,
         persistence_history,
     )
+    update_watchlist_from_validated(candidate_watchlist, validated_results, timestamp)
 
     capacity_summary = build_capacity_summary(validated_results)
 
@@ -1291,6 +1407,8 @@ def run_scan_once(
     else:
         print("\nNo validated rows written.")
 
+    print(f"Scan duration seconds: {time.monotonic() - scan_started_monotonic:.2f}")
+
     return candidates, validated_results
 
 
@@ -1354,6 +1472,12 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait for both candidate leg order books before REST fallback",
     )
     parser.add_argument(
+        "--ws-depth-reconnect-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds between websocket depth subscription rebuilds for changing target sets",
+    )
+    parser.add_argument(
         "--funding-cache-seconds",
         type=float,
         default=60.0,
@@ -1382,6 +1506,29 @@ def parse_args() -> argparse.Namespace:
         default="binance,bitget,mexc,kucoin,hyperliquid",
         help="Comma-separated websocket exchanges to enable",
     )
+    parser.add_argument(
+        "--disable-candidate-watchlist",
+        action="store_true",
+        help="Disable route watchlist depth warming and deep-candidate priority boosts",
+    )
+    parser.add_argument(
+        "--watchlist-ttl-seconds",
+        type=float,
+        default=CANDIDATE_WATCHLIST_TTL_SECONDS,
+        help="Seconds to keep recently interesting routes warm for websocket depth",
+    )
+    parser.add_argument(
+        "--watchlist-max-routes",
+        type=int,
+        default=CANDIDATE_WATCHLIST_MAX_ROUTES,
+        help="Maximum routes retained by the scanner watchlist",
+    )
+    parser.add_argument(
+        "--watchlist-depth-target-limit",
+        type=int,
+        default=CANDIDATE_WATCHLIST_DEPTH_TARGET_LIMIT,
+        help="Maximum watchlist/current candidates used to drive websocket depth targets",
+    )
     return parser.parse_args()
 
 
@@ -1398,6 +1545,12 @@ def main():
 
     persistence_history: dict[str, deque] = {}
     route_spread_history = bootstrap_route_spread_history()
+    candidate_watchlist = None
+    if CANDIDATE_WATCHLIST_ENABLED and not args.disable_candidate_watchlist:
+        candidate_watchlist = CandidateWatchlist(
+            ttl_seconds=args.watchlist_ttl_seconds,
+            max_routes=args.watchlist_max_routes,
+        )
     print(
         "Loaded route spread history for "
         f"{len(route_spread_history)} routes from ML observations."
@@ -1420,6 +1573,7 @@ def main():
             config=WebsocketRuntimeConfig(
                 enabled_exchanges=enabled_exchanges,
                 ticker_symbol_limit=args.ws_ticker_symbol_limit or None,
+                depth_reconnect_seconds=args.ws_depth_reconnect_seconds,
                 funding_reconcile_enabled=args.ws_funding_reconcile_seconds > 0,
                 funding_reconcile_seconds=args.ws_funding_reconcile_seconds,
                 funding_reconcile_symbol_limit=args.ws_funding_reconcile_symbol_limit,
@@ -1443,6 +1597,7 @@ def main():
                 adapters=adapters,
                 persistence_history=persistence_history,
                 route_spread_history=route_spread_history,
+                candidate_watchlist=candidate_watchlist,
                 market_data_cache=market_data_cache,
                 websocket_service=websocket_service,
                 use_websocket_cache=args.use_websocket_cache,
@@ -1450,7 +1605,7 @@ def main():
                 ws_ticker_max_age_seconds=args.ws_ticker_max_age_seconds,
                 ws_ticker_min_count=args.ws_ticker_min_count,
                 ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,
-                ws_depth_target_limit=args.ws_depth_target_limit,
+                ws_depth_target_limit=max(args.ws_depth_target_limit, args.watchlist_depth_target_limit),
                 ws_depth_wait_seconds=args.ws_depth_wait_seconds,
                 funding_cache_seconds=args.funding_cache_seconds,
             )
@@ -1464,6 +1619,7 @@ def main():
                     adapters=adapters,
                     persistence_history=persistence_history,
                     route_spread_history=route_spread_history,
+                    candidate_watchlist=candidate_watchlist,
                     market_data_cache=market_data_cache,
                     websocket_service=websocket_service,
                     use_websocket_cache=args.use_websocket_cache,
@@ -1471,7 +1627,7 @@ def main():
                     ws_ticker_max_age_seconds=args.ws_ticker_max_age_seconds,
                     ws_ticker_min_count=args.ws_ticker_min_count,
                     ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,
-                    ws_depth_target_limit=args.ws_depth_target_limit,
+                    ws_depth_target_limit=max(args.ws_depth_target_limit, args.watchlist_depth_target_limit),
                     ws_depth_wait_seconds=args.ws_depth_wait_seconds,
                     funding_cache_seconds=args.funding_cache_seconds,
                 )

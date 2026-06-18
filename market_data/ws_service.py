@@ -51,7 +51,7 @@ class WebsocketRuntimeConfig:
     ticker_batch_size: int = 100
     depth_batch_size: int = 80
     depth_target_ttl_seconds: float = 120.0
-    depth_reconnect_seconds: float = 10.0
+    depth_reconnect_seconds: float = 5.0
     reconnect_delay_seconds: float = 5.0
     ping_interval_seconds: float = 15.0
     funding_reconcile_enabled: bool = True
@@ -98,17 +98,29 @@ class WebsocketMarketDataService:
         if self._thread:
             self._thread.join(timeout=10)
 
-    def set_depth_targets(self, candidates: Iterable[dict], *, max_candidates: int) -> None:
+    def set_depth_targets(
+        self,
+        candidates: Iterable[dict],
+        *,
+        max_candidates: int,
+        replace: bool = False,
+    ) -> None:
         from market_data.scanner_integration import build_depth_targets_from_candidates
 
         targets = build_depth_targets_from_candidates(
             candidates,
             max_candidates=max_candidates,
         )
-        self.cache.set_depth_targets(
-            targets,
-            ttl_seconds=self.config.depth_target_ttl_seconds,
-        )
+        if replace:
+            self.cache.replace_depth_targets(
+                targets,
+                ttl_seconds=self.config.depth_target_ttl_seconds,
+            )
+        else:
+            self.cache.set_depth_targets(
+                targets,
+                ttl_seconds=self.config.depth_target_ttl_seconds,
+            )
 
     def _run_thread(self) -> None:
         self._loop = asyncio.new_event_loop()
