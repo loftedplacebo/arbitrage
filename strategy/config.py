@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    experiment_id: str = "spread_ladder_20260616_v1"
+    experiment_id: str = "spread_ladder_route_loosen_20260618_v1"
     data_dir: Path = REPO_ROOT / "data" / "strategy"
     validated_input_dir: Path = REPO_ROOT / "data" / "validated_futures_futures_snapshots"
 
@@ -55,8 +55,8 @@ class StrategyConfig:
     min_validated_spread_pct: float = 0.75
     require_route_stats_for_entry: bool = True
     min_route_observations_for_entry: int = 30
-    min_route_spread_percentile: float = 0.75
-    min_route_spread_zscore: float = 1.00
+    min_route_spread_percentile: float = 0.65
+    min_route_spread_zscore: float = 0.75
     max_route_spread_trend_pct: float = 0.20
     max_adverse_funding_for_spread_entry_pct: float = -0.03
     normal_entry_min_minutes_to_funding: float = 60.0
