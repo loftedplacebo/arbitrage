@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import statistics
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from pathlib import Path
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from Hyperliquid.hyperliquid_market_adapter import HyperliquidMarketAdapter
 from core.orderbook import estimate_execution_from_orderbook
 from core.scoring import calculate_net_edge_pct, classify_opportunity
 from market_data.cache import MarketDataCache
+from market_data.event_stream import LocalEventPublisher, orderbook_to_payload
 from market_data.scanner_integration import (
     CandidateWatchlist,
     candidate_route_key,
@@ -58,6 +60,8 @@ ROUTE_STATS_BOOTSTRAP_MAX_ROWS = 200_000
 # -----------------------------
 DEEP_VALIDATE_TOP_N = 150
 DEEP_VALIDATE_CRYPTO_ONLY = True
+DEEP_VALIDATE_WORKERS = 8
+MAX_CROSS_VENUE_BOOK_SKEW_SECONDS = 0.50
 NOTIONALS_USDT = [100, 200, 300, 400, 500, 1_000, 2_500]
 CANDIDATE_WATCHLIST_ENABLED = True
 CANDIDATE_WATCHLIST_TTL_SECONDS = 900
@@ -131,6 +135,8 @@ DEEP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 ML_OUTPUT_DIR = REPO_ROOT / "data" / "ml" / "fast_spread_observations"
 ML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+TELEMETRY_OUTPUT_DIR = REPO_ROOT / "data" / "scanner_telemetry"
+TELEMETRY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # -----------------------------
@@ -706,6 +712,7 @@ def deep_validate_candidate(
     market_data_cache: MarketDataCache | None = None,
     ws_orderbook_max_age_seconds: float = 5.0,
     funding_cache_seconds: float = 60.0,
+    max_cross_venue_book_skew_seconds: float = MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
 ) -> list[dict]:
     """
     Deep-validate one fast candidate using real order books and funding.
@@ -726,18 +733,32 @@ def deep_validate_candidate(
 
     results = []
 
+    validation_started = time.monotonic()
     long_orderbook = get_cached_orderbook(
         cache=market_data_cache,
         exchange=long_exchange,
         symbol=symbol,
         max_age_seconds=ws_orderbook_max_age_seconds,
-    ) or long_adapter.get_futures_orderbook(symbol, limit=100)
+    )
+    long_book_source = "websocket" if long_orderbook is not None else "rest"
+    long_orderbook = long_orderbook or long_adapter.get_futures_orderbook(symbol, limit=100)
     short_orderbook = get_cached_orderbook(
         cache=market_data_cache,
         exchange=short_exchange,
         symbol=symbol,
         max_age_seconds=ws_orderbook_max_age_seconds,
-    ) or short_adapter.get_futures_orderbook(symbol, limit=100)
+    )
+    short_book_source = "websocket" if short_orderbook is not None else "rest"
+    short_orderbook = short_orderbook or short_adapter.get_futures_orderbook(symbol, limit=100)
+
+    book_skew_seconds = abs(
+        (long_orderbook.observed_at_utc - short_orderbook.observed_at_utc).total_seconds()
+    )
+    if book_skew_seconds > max_cross_venue_book_skew_seconds:
+        raise ValueError(
+            f"cross_venue_book_skew={book_skew_seconds:.3f}s "
+            f"limit={max_cross_venue_book_skew_seconds:.3f}s"
+        )
 
     long_funding = get_funding_info_with_cache(
         cache=market_data_cache,
@@ -809,6 +830,10 @@ def deep_validate_candidate(
                 if long_close_sell.is_fillable and short_close_buy.is_fillable
                 else None
             ),
+            "long_orderbook_source": long_book_source,
+            "short_orderbook_source": short_book_source,
+            "cross_venue_book_skew_ms": book_skew_seconds * 1000,
+            "deep_validation_latency_ms": (time.monotonic() - validation_started) * 1000,
             "route_observation_count": candidate.get("route_observation_count"),
             "route_spread_mean_pct": candidate.get("route_spread_mean_pct"),
             "route_spread_median_pct": candidate.get("route_spread_median_pct"),
@@ -1075,6 +1100,10 @@ def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> 
         "funding_benefit_pct",
         "slippage_pct",
         "close_slippage_pct",
+        "long_orderbook_source",
+        "short_orderbook_source",
+        "cross_venue_book_skew_ms",
+        "deep_validation_latency_ms",
         "route_observation_count",
         "route_spread_mean_pct",
         "route_spread_median_pct",
@@ -1123,6 +1152,24 @@ def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> 
     return output_file
 
 
+def write_scan_telemetry_to_csv(row: dict, timestamp: datetime) -> Path:
+    output_file = TELEMETRY_OUTPUT_DIR / f"futures_futures_scan_telemetry_{timestamp.strftime('%Y%m%d')}.csv"
+    fieldnames = [
+        "timestamp_utc", "experiment_id", "fast_candidates", "deep_candidates",
+        "validated_rows", "candidate_books_ready", "candidate_books_total",
+        "websocket_deep_validations", "rest_fallback_deep_validations",
+        "skew_rejections", "deep_validation_errors", "deep_validation_seconds",
+        "scan_duration_seconds", "deep_validate_workers", "max_book_skew_ms",
+    ]
+    exists = output_file.exists()
+    with output_file.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow({"timestamp_utc": timestamp.isoformat(), "experiment_id": EXPERIMENT_ID, **row})
+    return output_file
+
+
 # -----------------------------
 # Main scan cycle
 # -----------------------------
@@ -1141,6 +1188,9 @@ def run_scan_once(
     ws_depth_target_limit: int = DEEP_VALIDATE_TOP_N,
     ws_depth_wait_seconds: float = 2.0,
     funding_cache_seconds: float = 60.0,
+    event_publisher: LocalEventPublisher | None = None,
+    deep_validate_workers: int = DEEP_VALIDATE_WORKERS,
+    max_cross_venue_book_skew_seconds: float = MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
 ) -> tuple[list[dict], list[dict]]:
     scan_started_monotonic = time.monotonic()
     timestamp = utc_now()
@@ -1158,6 +1208,8 @@ def run_scan_once(
     print(f"Websocket depth cache enabled: {ws_depth_cache}")
     print(f"Websocket depth wait seconds: {ws_depth_wait_seconds:g}")
     print(f"Funding cache seconds: {funding_cache_seconds:g}")
+    print(f"Deep validation workers: {deep_validate_workers}")
+    print(f"Max cross-venue book skew ms: {max_cross_venue_book_skew_seconds * 1000:g}")
     print(f"Candidate watchlist enabled: {candidate_watchlist is not None}")
 
     ticker_data = {}
@@ -1257,6 +1309,7 @@ def run_scan_once(
         watchlist=candidate_watchlist,
         max_candidates=DEEP_VALIDATE_TOP_N,
     )
+    ready = total = 0
     if ws_depth_cache and websocket_service is not None:
         depth_warm_candidates = build_depth_warm_candidates(
             deep_candidate_pool,
@@ -1288,29 +1341,30 @@ def run_scan_once(
         f"(crypto_only={DEEP_VALIDATE_CRYPTO_ONLY})..."
     )
 
-    for i, candidate in enumerate(deep_candidates, start=1):
-        try:
-            print(
-                f"  Deep {i}/{len(deep_candidates)}: "
-                f"{candidate['symbol']} {candidate['direction']} "
-                f"fast_spread={candidate['fast_spread_pct']:.4f}%"
-            )
-
-            rows = deep_validate_candidate(
-                candidate=candidate,
-                adapters=adapters,
-                timestamp=timestamp,
-                market_data_cache=market_data_cache if ws_depth_cache else None,
-                ws_orderbook_max_age_seconds=ws_orderbook_max_age_seconds,
-                funding_cache_seconds=funding_cache_seconds,
-            )
-            validated_results.extend(rows)
-
-        except Exception as exc:
-            print(
-                f"  Error deep-validating {candidate['symbol']} "
-                f"{candidate['direction']}: {exc}"
-            )
+    deep_started = time.monotonic()
+    deep_errors = skew_rejections = 0
+    with ThreadPoolExecutor(max_workers=max(1, deep_validate_workers)) as executor:
+        futures = {
+            executor.submit(
+                deep_validate_candidate,
+                candidate,
+                adapters,
+                timestamp,
+                market_data_cache if ws_depth_cache else None,
+                ws_orderbook_max_age_seconds,
+                funding_cache_seconds,
+                max_cross_venue_book_skew_seconds,
+            ): candidate
+            for candidate in deep_candidates
+        }
+        for future in as_completed(futures):
+            candidate = futures[future]
+            try:
+                validated_results.extend(future.result())
+            except Exception as exc:
+                deep_errors += 1
+                skew_rejections += int("cross_venue_book_skew" in str(exc))
+                print(f"  Error deep-validating {candidate['symbol']} {candidate['direction']}: {exc}")
 
     validated_results = sorted(
         validated_results,
@@ -1406,6 +1460,41 @@ def run_scan_once(
         print(f"\nWrote {len(validated_results)} validated rows to {validated_output_file}")
     else:
         print("\nNo validated rows written.")
+
+    if event_publisher is not None:
+        event_publisher.publish(
+            "validated_scan",
+            {
+                "timestamp_utc": timestamp.isoformat(),
+                "rows": validated_results,
+            },
+        )
+
+    websocket_validations = sum(
+        1 for row in validated_results
+        if row.get("long_orderbook_source") == "websocket"
+        and row.get("short_orderbook_source") == "websocket"
+    )
+    rest_validations = len(validated_results) - websocket_validations
+    telemetry_path = write_scan_telemetry_to_csv(
+        {
+            "fast_candidates": len(candidates),
+            "deep_candidates": len(deep_candidates),
+            "validated_rows": len(validated_results),
+            "candidate_books_ready": ready,
+            "candidate_books_total": total,
+            "websocket_deep_validations": websocket_validations,
+            "rest_fallback_deep_validations": rest_validations,
+            "skew_rejections": skew_rejections,
+            "deep_validation_errors": deep_errors,
+            "deep_validation_seconds": f"{time.monotonic() - deep_started:.4f}",
+            "scan_duration_seconds": f"{time.monotonic() - scan_started_monotonic:.4f}",
+            "deep_validate_workers": deep_validate_workers,
+            "max_book_skew_ms": max_cross_venue_book_skew_seconds * 1000,
+        },
+        timestamp,
+    )
+    print(f"Scanner telemetry: {telemetry_path}")
 
     print(f"Scan duration seconds: {time.monotonic() - scan_started_monotonic:.2f}")
 
@@ -1529,6 +1618,19 @@ def parse_args() -> argparse.Namespace:
         default=CANDIDATE_WATCHLIST_DEPTH_TARGET_LIMIT,
         help="Maximum watchlist/current candidates used to drive websocket depth targets",
     )
+    parser.add_argument(
+        "--event-stream",
+        action="store_true",
+        help="Publish validated scans and pinned-position orderbook updates over localhost JSON-lines",
+    )
+    parser.add_argument("--event-host", default="127.0.0.1")
+    parser.add_argument("--event-port", type=int, default=8765)
+    parser.add_argument("--deep-validate-workers", type=int, default=DEEP_VALIDATE_WORKERS)
+    parser.add_argument(
+        "--max-cross-venue-book-skew-seconds",
+        type=float,
+        default=MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
+    )
     return parser.parse_args()
 
 
@@ -1558,6 +1660,7 @@ def main():
 
     market_data_cache = None
     websocket_service = None
+    event_publisher = None
     use_websocket_features = args.use_websocket_cache or args.ws_depth_cache
 
     if use_websocket_features:
@@ -1591,6 +1694,45 @@ def main():
             print(f"Warming websocket cache for {args.ws_warmup_seconds:g} seconds...")
             time.sleep(args.ws_warmup_seconds)
 
+    if args.event_stream:
+        def handle_event_control(message: dict) -> None:
+            if message.get("type") != "depth_targets" or market_data_cache is None:
+                return
+            targets = []
+            for row in message.get("targets", []):
+                exchange = str(row.get("exchange", "")).strip()
+                symbol = str(row.get("symbol", "")).strip()
+                if exchange and symbol:
+                    targets.append((exchange, symbol))
+            market_data_cache.replace_depth_targets(
+                targets,
+                ttl_seconds=float(message.get("ttl_seconds", 30.0)),
+                source="strategy_positions",
+                priority=100,
+            )
+
+        event_publisher = LocalEventPublisher(
+            host=args.event_host,
+            port=args.event_port,
+            on_control=handle_event_control,
+        )
+        event_publisher.start()
+        print(f"Local event stream listening on {args.event_host}:{event_publisher.port}")
+
+        if market_data_cache is not None:
+            def publish_position_orderbook(event_type: str, value: object) -> None:
+                if event_type != "orderbook":
+                    return
+                orderbook = value
+                if market_data_cache.has_depth_target(
+                    orderbook.exchange,
+                    orderbook.standard_symbol,
+                    source="strategy_positions",
+                ):
+                    event_publisher.publish("position_orderbook", orderbook_to_payload(orderbook))
+
+            market_data_cache.add_listener(publish_position_orderbook)
+
     try:
         if not args.loop:
             run_scan_once(
@@ -1608,6 +1750,9 @@ def main():
                 ws_depth_target_limit=max(args.ws_depth_target_limit, args.watchlist_depth_target_limit),
                 ws_depth_wait_seconds=args.ws_depth_wait_seconds,
                 funding_cache_seconds=args.funding_cache_seconds,
+                event_publisher=event_publisher,
+                deep_validate_workers=args.deep_validate_workers,
+                max_cross_venue_book_skew_seconds=args.max_cross_venue_book_skew_seconds,
             )
             return
 
@@ -1630,6 +1775,9 @@ def main():
                     ws_depth_target_limit=max(args.ws_depth_target_limit, args.watchlist_depth_target_limit),
                     ws_depth_wait_seconds=args.ws_depth_wait_seconds,
                     funding_cache_seconds=args.funding_cache_seconds,
+                    event_publisher=event_publisher,
+                    deep_validate_workers=args.deep_validate_workers,
+                    max_cross_venue_book_skew_seconds=args.max_cross_venue_book_skew_seconds,
                 )
                 time.sleep(args.interval)
             except KeyboardInterrupt:
@@ -1641,6 +1789,8 @@ def main():
     finally:
         if websocket_service is not None:
             websocket_service.stop()
+        if event_publisher is not None:
+            event_publisher.stop()
 
 
 if __name__ == "__main__":

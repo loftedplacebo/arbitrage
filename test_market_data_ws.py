@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from core.models import FundingInfo, OrderBook, OrderBookLevel
 from market_data.cache import CachedTicker, MarketDataCache
+from market_data.event_stream import LocalEventClient, LocalEventPublisher
 from market_data.scanner_integration import (
     CandidateWatchlist,
     build_depth_targets_from_candidates,
@@ -76,6 +77,46 @@ def test_depth_targets_expire():
 
     assert [target.symbol for target in cache.get_depth_targets("binance")] == ["BTCUSDT"]
     assert len(cache.get_depth_targets()) == 2
+
+
+def test_position_depth_targets_outrank_scanner_targets():
+    cache = MarketDataCache()
+    cache.replace_depth_targets(
+        [("binance", "BTCUSDT"), ("binance", "ETHUSDT")],
+        ttl_seconds=60,
+        source="scanner",
+        priority=10,
+    )
+    cache.replace_depth_targets(
+        [("binance", "ETHUSDT")],
+        ttl_seconds=60,
+        source="strategy_positions",
+        priority=100,
+    )
+
+    targets = cache.get_depth_targets("binance")
+    assert [target.symbol for target in targets] == ["ETHUSDT", "BTCUSDT"]
+    assert targets[0].priority == 100
+    assert cache.has_depth_target("binance", "ETHUSDT", source="strategy_positions")
+
+
+def test_local_event_stream_publishes_and_accepts_controls():
+    controls = []
+    publisher = LocalEventPublisher(port=0, on_control=controls.append)
+    publisher.start()
+    client = LocalEventClient(port=publisher.port)
+    try:
+        client.connect()
+        client.send({"type": "depth_targets", "targets": [{"exchange": "binance", "symbol": "BTCUSDT"}]})
+        import time
+        time.sleep(0.05)
+        publisher.publish("validated_scan", {"timestamp_utc": "2026-01-01T00:00:00+00:00", "rows": []})
+        events = client.receive(1.0)
+        assert events[0]["channel"] == "validated_scan"
+        assert controls[0]["type"] == "depth_targets"
+    finally:
+        client.close()
+        publisher.stop()
 
 
 def test_replace_depth_targets_removes_stale_targets():
@@ -489,6 +530,45 @@ def test_deep_validation_uses_cached_books_and_funding():
     assert adapters["bitget"].funding_calls == 0
 
 
+def test_deep_validation_rejects_excessive_cross_venue_book_skew():
+    class DummyAdapter:
+        def get_futures_orderbook(self, symbol, limit=100):
+            raise AssertionError("fresh cache should be used")
+
+        def get_funding_info(self, symbol):
+            return FundingInfo("binance", symbol, symbol, 0.0, None, 8, datetime.now(timezone.utc))
+
+    now = datetime.now(timezone.utc)
+    cache = MarketDataCache()
+    for exchange, observed_at in [
+        ("binance", now),
+        ("bitget", now - timedelta(seconds=2)),
+    ]:
+        cache.update_orderbook(OrderBook(
+            exchange=exchange,
+            market_type="futures",
+            standard_symbol="BTCUSDT",
+            exchange_symbol="BTCUSDT",
+            bids=[OrderBookLevel(price=100.0, quantity=100.0)],
+            asks=[OrderBookLevel(price=101.0, quantity=100.0)],
+            observed_at_utc=observed_at,
+        ))
+
+    try:
+        deep_validate_candidate(
+            candidate={"symbol": "BTCUSDT", "instrument_class": "crypto", "long_exchange": "binance", "short_exchange": "bitget", "direction": "long_binance_short_bitget", "fast_spread_pct": 1.0, "long_ask": 100.0, "short_bid": 101.0, "combined_volume_usdt": 1_000_000.0},
+            adapters={"binance": DummyAdapter(), "bitget": DummyAdapter()},
+            timestamp=now,
+            market_data_cache=cache,
+            ws_orderbook_max_age_seconds=10,
+            max_cross_venue_book_skew_seconds=0.5,
+        )
+    except ValueError as exc:
+        assert "cross_venue_book_skew" in str(exc)
+    else:
+        raise AssertionError("expected cross-venue skew rejection")
+
+
 def test_parse_binance_book_ticker_and_mark_price():
     ticker = parse_binance_book_ticker(
         {
@@ -705,6 +785,8 @@ def test_parse_hyperliquid_messages():
 if __name__ == "__main__":
     test_cache_returns_only_fresh_usable_tickers()
     test_depth_targets_expire()
+    test_position_depth_targets_outrank_scanner_targets()
+    test_local_event_stream_publishes_and_accepts_controls()
     test_build_depth_targets_from_candidates_limits_and_dedupes()
     test_ticker_data_uses_cache_when_fresh_and_rest_when_cold()
     test_funding_info_cache_avoids_repeated_adapter_calls()
@@ -713,6 +795,7 @@ if __name__ == "__main__":
     test_hyperliquid_bbo_rows_can_create_fast_candidates()
     test_wait_for_candidate_orderbooks_reports_ready_routes()
     test_deep_validation_uses_cached_books_and_funding()
+    test_deep_validation_rejects_excessive_cross_venue_book_skew()
     test_parse_binance_book_ticker_and_mark_price()
     test_parse_binance_depth()
     test_parse_bitget_ticker_and_depth()

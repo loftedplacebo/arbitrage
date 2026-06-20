@@ -10,6 +10,7 @@ from strategy.paper_execution import PaperExecutionEngine
 from strategy.position_store import CsvPositionStore
 from strategy.risk_rules import evaluate_entry_risk
 from strategy.run_strategy_loop import choose_best_entry_rows, process_scan
+from strategy.live_exit_watcher import LiveOrderBookCache, process_live_exit_updates
 from core.symbols import standard_to_exchange_symbol
 
 
@@ -971,6 +972,50 @@ def test_adaptive_partial_exit_falls_back_to_smaller_profitable_chunk():
         assert float(store.load_fills()[-1]["notional_usd"]) == 100.0
 
 
+def test_live_exit_watcher_unwinds_exit_only_position_from_book_events():
+    with TemporaryDirectory() as tmp:
+        config = StrategyConfig(
+            data_dir=tmp,
+            estimated_exit_fee_pct=0.0,
+            partial_exit_chunk_ladder_usd=(500.0, 100.0),
+        )
+        store = CsvPositionStore(config)
+        engine = PaperExecutionEngine(config, store)
+        position = make_position(total_notional_usd=500.0, exit_only=True)
+        positions = {position.position_id: position}
+        cache = LiveOrderBookCache()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        cache.update_payload({
+            "exchange": "binance",
+            "symbol": "IDUSDT",
+            "market_type": "futures",
+            "observed_at_utc": timestamp,
+            "bids": [[100.5, 10.0]],
+            "asks": [[100.6, 10.0]],
+        })
+        cache.update_payload({
+            "exchange": "kucoin",
+            "symbol": "IDUSDT",
+            "market_type": "futures",
+            "observed_at_utc": timestamp,
+            "bids": [[100.4, 10.0]],
+            "asks": [[100.5, 10.0]],
+        })
+
+        executed = process_live_exit_updates(
+            positions=positions,
+            cache=cache,
+            store=store,
+            engine=engine,
+            config=config,
+            changed_exchange="kucoin",
+            changed_symbol="IDUSDT",
+        )
+        assert executed == 1
+        assert position.position_id not in positions
+        assert store.load_fills()[-1]["event_type"] == "CLOSE_POSITION"
+
+
 def test_persistent_liquidity_warning_does_not_create_full_close():
     with TemporaryDirectory() as tmp:
         config = StrategyConfig(data_dir=tmp, max_daily_entries=0)
@@ -1088,6 +1133,7 @@ if __name__ == "__main__":
     test_strategy_loop_unwinds_exit_only_position_in_profitable_chunk()
     test_adaptive_partial_exit_uses_largest_profitable_available_chunk()
     test_adaptive_partial_exit_falls_back_to_smaller_profitable_chunk()
+    test_live_exit_watcher_unwinds_exit_only_position_from_book_events()
     test_persistent_liquidity_warning_does_not_create_full_close()
     test_strategy_loop_increments_and_resets_close_liquidity_warning_count()
     print("strategy engine tests passed")

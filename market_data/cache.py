@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import RLock
-from typing import Iterable
+from typing import Callable, Iterable
 
 from core.models import FundingInfo, OrderBook
 
@@ -55,6 +55,8 @@ class DepthTarget:
     exchange: str
     symbol: str
     expires_at_utc: datetime
+    source: str = "scanner"
+    priority: int = 0
 
     def is_active(self, now: datetime | None = None) -> bool:
         return self.expires_at_utc > (now or utc_now())
@@ -82,7 +84,22 @@ class MarketDataCache:
         self._tickers: dict[tuple[str, str], CachedTicker] = {}
         self._orderbooks: dict[tuple[str, str], OrderBook] = {}
         self._funding: dict[tuple[str, str], FundingInfo] = {}
-        self._depth_targets: dict[tuple[str, str], DepthTarget] = {}
+        self._depth_targets: dict[tuple[str, str, str], DepthTarget] = {}
+        self._listeners: list[Callable[[str, object], None]] = []
+
+    def add_listener(self, listener: Callable[[str, object], None]) -> None:
+        with self._lock:
+            self._listeners.append(listener)
+
+    def _notify_listeners(self, event_type: str, value: object) -> None:
+        with self._lock:
+            listeners = list(self._listeners)
+        for listener in listeners:
+            try:
+                listener(event_type, value)
+            except Exception:
+                # Cache consumers must never interrupt websocket collection.
+                continue
 
     def update_ticker(self, ticker: CachedTicker) -> None:
         with self._lock:
@@ -156,6 +173,7 @@ class MarketDataCache:
                 next_funding_time_utc=next_funding_time_utc or existing.next_funding_time_utc,
                 source=existing.source,
             )
+        self._notify_listeners("funding", funding_info)
 
     def update_funding_info(self, funding_info: FundingInfo) -> None:
         with self._lock:
@@ -176,10 +194,12 @@ class MarketDataCache:
                 next_funding_time_utc=funding_info.next_funding_time_utc,
                 source=existing.source,
             )
+        self._notify_listeners("funding", funding_info)
 
     def update_orderbook(self, orderbook: OrderBook) -> None:
         with self._lock:
             self._orderbooks[(orderbook.exchange, orderbook.standard_symbol)] = orderbook
+        self._notify_listeners("orderbook", orderbook)
 
     def get_fast_tickers(
         self,
@@ -238,14 +258,18 @@ class MarketDataCache:
         targets: Iterable[tuple[str, str]],
         *,
         ttl_seconds: float,
+        source: str = "scanner",
+        priority: int = 0,
     ) -> None:
         expires_at = utc_now() + timedelta(seconds=ttl_seconds)
         with self._lock:
             for exchange, symbol in targets:
-                self._depth_targets[(exchange, symbol)] = DepthTarget(
+                self._depth_targets[(source, exchange, symbol)] = DepthTarget(
                     exchange=exchange,
                     symbol=symbol,
                     expires_at_utc=expires_at,
+                    source=source,
+                    priority=priority,
                 )
             self._prune_depth_targets_locked()
 
@@ -254,28 +278,67 @@ class MarketDataCache:
         targets: Iterable[tuple[str, str]],
         *,
         ttl_seconds: float,
+        source: str = "scanner",
+        priority: int = 0,
     ) -> None:
         expires_at = utc_now() + timedelta(seconds=ttl_seconds)
         with self._lock:
             self._depth_targets = {
-                (exchange, symbol): DepthTarget(
+                key: target
+                for key, target in self._depth_targets.items()
+                if target.source != source
+            }
+            self._depth_targets.update({
+                (source, exchange, symbol): DepthTarget(
                     exchange=exchange,
                     symbol=symbol,
                     expires_at_utc=expires_at,
+                    source=source,
+                    priority=priority,
                 )
                 for exchange, symbol in targets
-            }
+            })
 
     def get_depth_targets(self, exchange: str | None = None) -> list[DepthTarget]:
         now = utc_now()
         with self._lock:
             self._prune_depth_targets_locked(now=now)
-            targets = [
+            raw_targets = [
                 target
                 for target in self._depth_targets.values()
                 if target.is_active(now) and (exchange is None or target.exchange == exchange)
             ]
-        return sorted(targets, key=lambda item: (item.exchange, item.symbol))
+        merged: dict[tuple[str, str], DepthTarget] = {}
+        for target in raw_targets:
+            key = (target.exchange, target.symbol)
+            existing = merged.get(key)
+            if existing is None or (target.priority, target.expires_at_utc) > (
+                existing.priority,
+                existing.expires_at_utc,
+            ):
+                merged[key] = target
+        return sorted(
+            merged.values(),
+            key=lambda item: (-item.priority, item.exchange, item.symbol),
+        )
+
+    def has_depth_target(
+        self,
+        exchange: str,
+        symbol: str,
+        *,
+        source: str | None = None,
+    ) -> bool:
+        now = utc_now()
+        with self._lock:
+            self._prune_depth_targets_locked(now=now)
+            return any(
+                target.exchange == exchange
+                and target.symbol == symbol
+                and (source is None or target.source == source)
+                and target.is_active(now)
+                for target in self._depth_targets.values()
+            )
 
     def get_ticker_symbols(
         self,
@@ -308,8 +371,8 @@ class MarketDataCache:
 
             self._prune_depth_targets_locked()
             target_counts: dict[str, int] = {}
-            for exchange, _symbol in self._depth_targets:
-                target_counts[exchange] = target_counts.get(exchange, 0) + 1
+            for target in self.get_depth_targets():
+                target_counts[target.exchange] = target_counts.get(target.exchange, 0) + 1
 
         return CacheStats(
             ticker_counts=ticker_counts,

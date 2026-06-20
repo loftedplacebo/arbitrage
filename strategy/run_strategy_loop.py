@@ -21,6 +21,8 @@ from strategy.exit_rules import (
     evaluate_exit,
 )
 from strategy.models import ValidatedOpportunity, format_datetime
+from strategy.live_exit_watcher import LiveOrderBookCache, process_live_exit_updates
+from market_data.event_stream import LocalEventClient
 from strategy.paper_execution import PaperExecutionEngine
 from strategy.position_store import CsvPositionStore
 
@@ -526,6 +528,10 @@ def run(args: argparse.Namespace) -> None:
         print_summary(summary, config)
         return
 
+    if args.event_stream:
+        run_event_strategy_loop(args, config)
+        return
+
     print(f"Strategy loop running every {args.interval} seconds. Press Ctrl+C to stop.")
     try:
         while True:
@@ -535,6 +541,103 @@ def run(args: argparse.Namespace) -> None:
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nStrategy loop stopped.")
+
+
+def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) -> None:
+    """Use scanner events for immediate scans and exit-only book-driven unwinds."""
+    store = CsvPositionStore(config)
+    engine = PaperExecutionEngine(config, store)
+    live_books = LiveOrderBookCache()
+    client = LocalEventClient(host=args.event_host, port=args.event_port)
+    next_csv_fallback = 0.0
+    next_target_refresh = 0.0
+    print(
+        f"Strategy event loop connecting to {args.event_host}:{args.event_port}. "
+        "Press Ctrl+C to stop."
+    )
+
+    try:
+        while True:
+            now_monotonic = time.monotonic()
+            if now_monotonic >= next_csv_fallback:
+                summary = process_available_scans(args, config)
+                if summary["scans_processed"] or not args.quiet_idle:
+                    print_summary(summary, config)
+                next_csv_fallback = now_monotonic + args.event_csv_fallback_seconds
+
+            try:
+                if client._socket is None:
+                    client.connect()
+                    print("Connected to scanner event stream.")
+                    next_target_refresh = 0.0
+
+                if now_monotonic >= next_target_refresh:
+                    positions = store.load_open_positions()
+                    targets = []
+                    for position in positions.values():
+                        targets.extend([
+                            {"exchange": position.long_exchange, "symbol": position.symbol},
+                            {"exchange": position.short_exchange, "symbol": position.symbol},
+                        ])
+                    client.send({"type": "depth_targets", "targets": targets, "ttl_seconds": 30.0})
+                    next_target_refresh = now_monotonic + 10.0
+
+                for event in client.receive(args.event_poll_seconds):
+                    if event.get("type") != "event":
+                        continue
+                    channel = event.get("channel")
+                    payload = event.get("payload") or {}
+                    if channel == "validated_scan":
+                        rows = []
+                        for row in payload.get("rows", []):
+                            try:
+                                rows.append(ValidatedOpportunity.from_csv_row(row))
+                            except ValueError:
+                                continue
+                        if not rows:
+                            continue
+                        scan_time = format_datetime(rows[0].timestamp_utc)
+                        if scan_time in store.load_processed_scans():
+                            continue
+                        positions = store.load_open_positions()
+                        process_scan(
+                            scan_time=scan_time,
+                            scan_rows=rows,
+                            source_file=Path("event_stream"),
+                            store=store,
+                            engine=engine,
+                            config=config,
+                            positions=positions,
+                        )
+                        print(f"Processed event scan {scan_time} ({len(rows)} validated rows).")
+                    elif channel == "position_orderbook":
+                        orderbook = live_books.update_payload(payload)
+                        if orderbook is None:
+                            continue
+                        positions = store.load_open_positions()
+                        executed = process_live_exit_updates(
+                            positions=positions,
+                            cache=live_books,
+                            store=store,
+                            engine=engine,
+                            config=config,
+                            changed_exchange=orderbook.exchange,
+                            changed_symbol=orderbook.standard_symbol,
+                        )
+                        if executed:
+                            print(
+                                f"Live exit watcher executed {executed} chunk(s) for "
+                                f"{orderbook.standard_symbol}."
+                            )
+            except (ConnectionError, OSError) as exc:
+                client.close()
+                if not args.quiet_idle:
+                    print(f"Event stream unavailable: {exc}")
+                time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nStrategy event loop stopped.")
+    finally:
+        client.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -555,6 +658,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-slice-notional-usd", type=float, default=DEFAULT_CONFIG.max_slice_notional_usd)
     parser.add_argument("--min-validated-notional-usd", type=float, default=DEFAULT_CONFIG.min_validated_notional_usd)
     parser.add_argument("--min-validated-spread-pct", type=float, default=DEFAULT_CONFIG.min_validated_spread_pct)
+    parser.add_argument("--event-stream", action="store_true", help="Consume scanner localhost events for immediate strategy processing.")
+    parser.add_argument("--event-host", default="127.0.0.1")
+    parser.add_argument("--event-port", type=int, default=8765)
+    parser.add_argument("--event-poll-seconds", type=float, default=0.5)
+    parser.add_argument(
+        "--event-csv-fallback-seconds",
+        type=float,
+        default=300.0,
+        help="Periodic CSV reconciliation interval while event mode is active.",
+    )
     return parser.parse_args()
 
 
