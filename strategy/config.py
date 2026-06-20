@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    experiment_id: str = "spread_ladder_route_loosen_20260618_v1"
+    experiment_id: str = "spread_roundtrip_loose_20260620_v1"
     data_dir: Path = REPO_ROOT / "data" / "strategy"
     validated_input_dir: Path = REPO_ROOT / "data" / "validated_futures_futures_snapshots"
 
@@ -40,6 +40,11 @@ class StrategyConfig:
     max_daily_loss_usd: float = 250.0
     max_daily_entries: int = 500
     max_consecutive_losses: int = 10
+    # Open new routes in small, independently validated slices. Scaling remains
+    # subject to the same entry and risk rules on later scans.
+    initial_entry_slice_notional_usd: float = 100.0
+    require_entry_round_trip_fillable: bool = True
+    entry_round_trip_notional_usd: float = 100.0
 
     # Spread arbitrage is the primary strategy. Funding is a modifier: it can
     # improve priority or block a hostile setup, but it must not rescue a weak
@@ -50,16 +55,16 @@ class StrategyConfig:
     # Normal spread trades should have a high spread and high net edge.
     # These thresholds are intentionally conservative because the entry signal
     # must survive close-side fees, close slippage, and spread movement.
-    min_net_spread_ex_funding_pct: float = 0.50
-    min_net_edge_inc_funding_pct: float = 0.50
-    min_validated_spread_pct: float = 0.75
+    min_net_spread_ex_funding_pct: float = 0.25
+    min_net_edge_inc_funding_pct: float = 0.25
+    min_validated_spread_pct: float = 0.40
     require_route_stats_for_entry: bool = True
-    min_route_observations_for_entry: int = 30
-    min_route_spread_percentile: float = 0.65
-    min_route_spread_zscore: float = 0.75
-    max_route_spread_trend_pct: float = 0.20
-    max_adverse_funding_for_spread_entry_pct: float = -0.03
-    normal_entry_min_minutes_to_funding: float = 60.0
+    min_route_observations_for_entry: int = 15
+    min_route_spread_percentile: float = 0.50
+    min_route_spread_zscore: float = 0.25
+    max_route_spread_trend_pct: float = 0.40
+    max_adverse_funding_for_spread_entry_pct: float = -0.05
+    normal_entry_min_minutes_to_funding: float = 30.0
     normal_entry_allow_near_funding_if_benefit_pct: float = 0.05
     min_persistence_count: int = 2
     require_paper_ready: bool = True
@@ -114,6 +119,23 @@ class StrategyConfig:
     max_projected_negative_funding_cost_pct: float = -0.05
     close_liquidity_exit_requires_hard_risk: bool = True
     close_liquidity_max_warning_scans: int = 3
+    # Paper-only phased exits. A route that cannot be closed at its current
+    # full size becomes exit-only, then unwinds matched hedged chunks when the
+    # scanner can price both reverse legs profitably.
+    partial_exit_enabled: bool = True
+    # The scanner validates these depth tiers. The engine selects the largest
+    # tier that is both hedgeable and profitable on each exit scan.
+    partial_exit_chunk_ladder_usd: tuple[float, ...] = (
+        2_500.0,
+        1_000.0,
+        500.0,
+        400.0,
+        300.0,
+        200.0,
+        100.0,
+    )
+    partial_exit_min_profit_pct: float = 0.00
+    partial_exit_allow_loss_on_hard_risk: bool = False
 
 
 DEFAULT_CONFIG = StrategyConfig()

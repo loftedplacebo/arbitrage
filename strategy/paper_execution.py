@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 from strategy.config import StrategyConfig
-from strategy.exit_rules import estimate_position_pnl
+from strategy.exit_rules import estimate_close_pnl_for_notional, estimate_position_pnl
 from strategy.models import Position, PositionSlice, ValidatedOpportunity, format_datetime, utc_now
 from strategy.position_store import CsvPositionStore
 
@@ -126,6 +126,8 @@ class PaperExecutionEngine:
                 "fees_usd": f"{entry_fee:.8f}",
                 "slippage_pct": f"{entry_slippage:.8f}",
                 "realised_pnl_usd": "0.00000000",
+                "remaining_notional_usd": f"{position.total_notional_usd:.8f}",
+                "position_realised_pnl_usd": f"{position.realised_spread_pnl:.8f}",
                 "reason": reason,
             }
         )
@@ -189,6 +191,68 @@ class PaperExecutionEngine:
                 "fees_usd": f"{close_fee:.8f}",
                 "slippage_pct": f"{self.config.estimated_close_slippage_pct:.8f}",
                 "realised_pnl_usd": f"{realised_pnl:.8f}",
+                "remaining_notional_usd": "0.00000000",
+                "position_realised_pnl_usd": f"{realised_pnl:.8f}",
                 "reason": reason,
             }
         )
+
+    def close_position_chunk(
+        self,
+        position: Position,
+        opportunity: ValidatedOpportunity,
+        notional_usd: float,
+        reason: str,
+    ) -> tuple[bool, float]:
+        """Paper-close one matched hedged chunk and return (position_closed, chunk_pnl)."""
+        if not (opportunity.long_close_fillable and opportunity.short_close_fillable):
+            raise ValueError("Cannot paper-close a chunk without both executable close legs")
+        if notional_usd <= 0 or notional_usd > position.total_notional_usd + 1e-8:
+            raise ValueError("Partial close notional must be within the open position")
+
+        spread_pnl, close_cost = estimate_close_pnl_for_notional(
+            position=position,
+            opportunity=opportunity,
+            config=self.config,
+            notional_usd=notional_usd,
+        )
+        chunk_pnl = spread_pnl - close_cost
+        position.realised_spread_pnl += chunk_pnl
+        position.total_notional_usd = max(0.0, position.total_notional_usd - notional_usd)
+        position.partial_close_count += 1
+        position.exit_only = True
+        position.updated_at = opportunity.timestamp_utc
+
+        position_closed = position.total_notional_usd <= 1e-8
+        event_type = "CLOSE_POSITION" if position_closed else "PARTIAL_CLOSE"
+        event_reason = reason if position_closed else f"partial_exit_{reason}"
+        if position_closed:
+            position.status = "CLOSED"
+            position.unrealised_spread_pnl = 0.0
+            position.estimated_close_cost = 0.0
+            position.estimated_net_pnl = position.realised_spread_pnl + position.realised_funding_pnl
+            self.store.upsert_position(position)
+        else:
+            self.refresh_position_marks(position, opportunity)
+
+        self.store.append_fill(
+            {
+                "timestamp_utc": format_datetime(opportunity.timestamp_utc),
+                "event_type": event_type,
+                "position_id": position.position_id,
+                "slice_id": "",
+                "symbol": position.symbol,
+                "long_exchange": position.long_exchange,
+                "short_exchange": position.short_exchange,
+                "notional_usd": f"{notional_usd:.8f}",
+                "long_price": f"{(opportunity.long_close_avg_price or 0.0):.12g}",
+                "short_price": f"{(opportunity.short_close_avg_price or 0.0):.12g}",
+                "fees_usd": f"{close_cost:.8f}",
+                "slippage_pct": f"{(opportunity.close_slippage_pct or self.config.estimated_close_slippage_pct):.8f}",
+                "realised_pnl_usd": f"{chunk_pnl:.8f}",
+                "remaining_notional_usd": f"{position.total_notional_usd:.8f}",
+                "position_realised_pnl_usd": f"{position.realised_spread_pnl:.8f}",
+                "reason": event_reason,
+            }
+        )
+        return position_closed, chunk_pnl

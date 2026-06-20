@@ -228,6 +228,9 @@ class Position:
     updated_at: datetime
     missing_scan_count: int = 0
     close_liquidity_warning_count: int = 0
+    exit_only: bool = False
+    partial_close_count: int = 0
+    realised_spread_pnl: float = 0.0
     status: str = "OPEN"
 
     def to_csv_row(self) -> dict:
@@ -261,6 +264,9 @@ class Position:
             updated_at=updated_at,
             missing_scan_count=parse_int(row.get("missing_scan_count")),
             close_liquidity_warning_count=parse_int(row.get("close_liquidity_warning_count")),
+            exit_only=parse_bool(row.get("exit_only")),
+            partial_close_count=parse_int(row.get("partial_close_count")),
+            realised_spread_pnl=parse_float(row.get("realised_spread_pnl"), 0.0) or 0.0,
             status=str(row.get("status", "OPEN")),
         )
 

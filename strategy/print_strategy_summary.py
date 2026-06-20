@@ -52,6 +52,7 @@ def run(args: argparse.Namespace) -> None:
     latest_estimated_pnl = sum(position.estimated_net_pnl for position in open_positions)
     positive_open_positions = sum(1 for position in open_positions if position.estimated_net_pnl > 0)
     negative_open_positions = sum(1 for position in open_positions if position.estimated_net_pnl < 0)
+    exit_only_positions = sum(1 for position in open_positions if position.exit_only)
     open_liquidity_warnings = sum(
         1
         for position in open_positions
@@ -72,8 +73,20 @@ def run(args: argparse.Namespace) -> None:
         for row in fills
         if row.get("event_type") == "CLOSE_POSITION" and is_today(row, "timestamp_utc", now)
     ]
+    todays_partial_closes = [
+        row
+        for row in fills
+        if row.get("event_type") == "PARTIAL_CLOSE" and is_today(row, "timestamp_utc", now)
+    ]
     todays_realised_pnl = sum(
         parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
+        for row in todays_partial_closes + todays_closes
+    )
+    todays_closed_position_pnl = sum(
+        parse_float(
+            row.get("position_realised_pnl_usd", row.get("realised_pnl_usd")),
+            0.0,
+        ) or 0.0
         for row in todays_closes
     )
 
@@ -132,6 +145,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"Strategy data: {store.data_dir}")
     print(f"Open positions: {len(open_positions)}")
     print(f"Open positions with close-liquidity warnings: {open_liquidity_warnings}")
+    print(f"Open positions in exit-only unwind: {exit_only_positions}")
     print(f"Total open notional: ${total_open_notional:,.2f}")
     print(f"Latest estimated open PnL: ${latest_estimated_pnl:,.4f}")
     print(f"Open positions with positive estimated PnL: {positive_open_positions}")
@@ -143,6 +157,12 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Max daily entries: {config.max_daily_entries}")
     print(f"  Max open positions: {config.max_open_positions}")
     print(f"  Max slice notional: ${config.max_slice_notional_usd:,.2f}")
+    print(f"  Initial entry slice notional: ${config.initial_entry_slice_notional_usd:,.2f}")
+    print(
+        "  Require round-trip liquidity at: "
+        f"${config.entry_round_trip_notional_usd:,.2f} "
+        f"({config.require_entry_round_trip_fillable})"
+    )
     print(f"  Max slices per position: {config.max_slices_per_position}")
     print(f"  Max total open notional: ${config.max_total_open_notional_usd:,.2f}")
     print(f"  Max symbol notional: ${config.max_symbol_notional_usd:,.2f}")
@@ -188,6 +208,12 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Block adds when funding negative: {config.block_adds_when_funding_negative}")
     print(f"  Funding exit decision window minutes: {config.funding_exit_decision_window_minutes:g}")
     print(f"  Exit on negative funding: {config.exit_on_negative_funding}")
+    print(f"  Phased exits enabled: {config.partial_exit_enabled}")
+    print(
+        "  Partial-exit chunk ladder: $"
+        + ", $".join(f"{tier:,.0f}" for tier in config.partial_exit_chunk_ladder_usd)
+    )
+    print(f"  Partial-exit minimum profit %: {config.partial_exit_min_profit_pct:g}")
 
     print("\nOpen positions by symbol")
     if not by_symbol:
@@ -197,12 +223,18 @@ def run(args: argparse.Namespace) -> None:
             print(f"  {symbol}: ${notional:,.2f}")
 
     print(f"\nToday's opened slices: {len(todays_open_slices)}")
+    print(f"Today's partial closes: {len(todays_partial_closes)}")
     print(f"Today's closed positions: {len(todays_closes)}")
-    print(f"Today's realised PnL from closed positions: ${todays_realised_pnl:,.4f}")
-    if not todays_closes:
+    print(f"Today's realised PnL from all exit chunks: ${todays_realised_pnl:,.4f}")
+    print(f"Today's realised PnL for fully closed positions: ${todays_closed_position_pnl:,.4f}")
+    if not todays_closes and not todays_partial_closes:
         print(
             "No positions closed today, so realised PnL is still zero. "
             "Check latest estimated open PnL for current open trade performance."
+        )
+    elif not todays_closes:
+        print(
+            "No positions fully closed today; realised PnL above is from phased exit chunks."
         )
     print(f"Funding capture entries today: {len(todays_funding_capture_entries)}")
     print(f"Funding holds today: {len(todays_funding_holds)}")

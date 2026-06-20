@@ -87,6 +87,26 @@ def route_spread_quality_decision(
     return True, "route_spread_quality_ok"
 
 
+def round_trip_entry_liquidity_decision(
+    opportunity: ValidatedOpportunity,
+    config: StrategyConfig,
+) -> tuple[bool, str]:
+    """Require a small hedged entry and reverse-side close path before opening."""
+    if not config.require_entry_round_trip_fillable:
+        return True, "round_trip_entry_liquidity_ok"
+
+    if opportunity.notional_usdt + 1e-8 < config.entry_round_trip_notional_usd:
+        return False, "round_trip_notional_not_validated"
+
+    if opportunity.long_close_avg_price is None or opportunity.short_close_avg_price is None:
+        return False, "round_trip_close_prices_missing"
+
+    if not opportunity.long_close_fillable or not opportunity.short_close_fillable:
+        return False, "round_trip_close_not_fillable"
+
+    return True, "round_trip_entry_liquidity_ok"
+
+
 def evaluate_entry(
     opportunity: ValidatedOpportunity,
     open_positions: dict[str, Position],
@@ -115,6 +135,10 @@ def evaluate_entry(
 
     if opportunity.long_avg_price is None or opportunity.short_avg_price is None:
         return EntryDecision(False, "missing_executable_prices", opportunity.opportunity_key)
+
+    round_trip_ok, round_trip_reason = round_trip_entry_liquidity_decision(opportunity, config)
+    if not round_trip_ok:
+        return EntryDecision(False, round_trip_reason, opportunity.opportunity_key)
 
     if opportunity.validated_spread_pct is None:
         return EntryDecision(False, "missing_validated_spread", opportunity.opportunity_key)
@@ -194,7 +218,11 @@ def evaluate_entry(
             return EntryDecision(False, "net_edge_inc_funding_below_threshold", opportunity.opportunity_key)
         return EntryDecision(False, "edge_thresholds_not_met", opportunity.opportunity_key)
 
-    desired_notional = min(config.max_slice_notional_usd, opportunity.notional_usdt)
+    desired_notional = min(
+        config.initial_entry_slice_notional_usd,
+        config.max_slice_notional_usd,
+        opportunity.notional_usdt,
+    )
     risk = evaluate_entry_risk(
         opportunity=opportunity,
         open_positions=open_positions,

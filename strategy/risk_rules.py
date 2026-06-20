@@ -51,6 +51,9 @@ def evaluate_entry_risk(
         return RiskDecision(False, "max_exchange_notional_reached")
 
     existing = open_positions.get(opportunity.position_key)
+    if existing and existing.exit_only:
+        return RiskDecision(False, "existing_position_exit_only")
+
     if existing and existing.close_liquidity_warning_count > 0:
         return RiskDecision(False, "existing_position_close_liquidity_warning")
 

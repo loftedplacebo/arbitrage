@@ -15,7 +15,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from strategy.config import DEFAULT_CONFIG, StrategyConfig
 from strategy.entry_rules import evaluate_entry, evaluate_funding_capture_ready
-from strategy.exit_rules import calculate_take_profit_pct, evaluate_exit
+from strategy.exit_rules import (
+    calculate_take_profit_pct,
+    estimate_close_pnl_for_notional,
+    evaluate_exit,
+)
 from strategy.models import ValidatedOpportunity, format_datetime
 from strategy.paper_execution import PaperExecutionEngine
 from strategy.position_store import CsvPositionStore
@@ -87,6 +91,35 @@ def choose_best_entry_rows(
         if fillable_rows:
             preferred_rows = fillable_rows
 
+        if config.require_entry_round_trip_fillable:
+            round_trip_rows = [
+                row
+                for row in preferred_rows
+                if (
+                    row.notional_usdt + 1e-8 >= config.entry_round_trip_notional_usd
+                    and row.long_close_fillable
+                    and row.short_close_fillable
+                    and row.long_close_avg_price is not None
+                    and row.short_close_avg_price is not None
+                )
+            ]
+            if round_trip_rows:
+                preferred_rows = round_trip_rows
+
+        entry_notional_target = min(
+            config.initial_entry_slice_notional_usd,
+            config.max_slice_notional_usd,
+        )
+        closest_tier_distance = min(
+            abs(row.notional_usdt - entry_notional_target)
+            for row in preferred_rows
+        )
+        preferred_rows = [
+            row
+            for row in preferred_rows
+            if abs(row.notional_usdt - entry_notional_target) == closest_tier_distance
+        ]
+
         best = max(
             preferred_rows,
             key=lambda item: (
@@ -113,6 +146,83 @@ def choose_best_entry_rows(
         reverse=True,
     )
     return selected
+
+
+def choose_close_mark_row(
+    rows: list[ValidatedOpportunity],
+    position_notional_usd: float,
+) -> ValidatedOpportunity | None:
+    """Choose the closest validated depth tier for marking the whole position."""
+    priced = [
+        row
+        for row in rows
+        if row.long_close_avg_price is not None and row.short_close_avg_price is not None
+    ]
+    if not priced:
+        return None
+
+    return min(
+        priced,
+        key=lambda row: (
+            0 if row.notional_usdt >= position_notional_usd else 1,
+            abs(row.notional_usdt - position_notional_usd),
+            -row.notional_usdt,
+        ),
+    )
+
+
+def choose_partial_close_row(
+    rows: list[ValidatedOpportunity],
+    chunk_notional_usd: float,
+) -> ValidatedOpportunity | None:
+    """Return the smallest fully executable tier capable of closing one chunk."""
+    executable = [
+        row
+        for row in rows
+        if (
+            row.long_close_fillable
+            and row.short_close_fillable
+            and row.long_close_avg_price is not None
+            and row.short_close_avg_price is not None
+            and row.notional_usdt + 1e-8 >= chunk_notional_usd
+        )
+    ]
+    if not executable:
+        return None
+    return min(
+        executable,
+        key=lambda row: (
+            row.notional_usdt,
+            -row.net_edge_inc_funding_pct
+            if row.net_edge_inc_funding_pct is not None
+            else 999,
+        ),
+    )
+
+
+def choose_partial_close_candidates(
+    rows: list[ValidatedOpportunity],
+    position_notional_usd: float,
+    config: StrategyConfig,
+) -> list[tuple[float, ValidatedOpportunity]]:
+    """Return executable close candidates from the largest safe chunk down."""
+    if position_notional_usd <= 0:
+        return []
+
+    largest_ladder_tier = max(config.partial_exit_chunk_ladder_usd)
+    chunk_sizes = {min(position_notional_usd, largest_ladder_tier)}
+    chunk_sizes.update(
+        tier
+        for tier in config.partial_exit_chunk_ladder_usd
+        if tier <= position_notional_usd
+    )
+
+    candidates = []
+    for chunk_notional in sorted(chunk_sizes, reverse=True):
+        opportunity = choose_partial_close_row(rows, chunk_notional)
+        if opportunity is not None:
+            candidates.append((chunk_notional, opportunity))
+    return candidates
 
 
 def decision_funding_context(
@@ -196,10 +306,13 @@ def process_scan(
     positions,
 ) -> None:
     decision_now = datetime.now(timezone.utc)
-    current_by_position = {row.position_key: row for row in choose_best_rows(scan_rows)}
+    rows_by_position: dict[str, list[ValidatedOpportunity]] = defaultdict(list)
+    for row in scan_rows:
+        rows_by_position[row.position_key].append(row)
 
     for position_id, position in list(positions.items()):
-        opportunity = current_by_position.get(position_id)
+        route_rows = rows_by_position.get(position_id, [])
+        opportunity = choose_close_mark_row(route_rows, position.total_notional_usd)
         if opportunity is not None:
             position.missing_scan_count = 0
             if opportunity.long_close_fillable and opportunity.short_close_fillable:
@@ -216,6 +329,65 @@ def process_scan(
             config=config,
             now=scan_rows[0].timestamp_utc,
         )
+        if (
+            opportunity is not None
+            and position.close_liquidity_warning_count >= config.close_liquidity_max_warning_scans
+        ):
+            position.exit_only = True
+        if exit_decision.should_exit:
+            position.exit_only = True
+
+        execution_reason = exit_decision.reason
+        executed_notional = 0.0
+        partial_pnl = 0.0
+        position_closed = False
+        should_attempt_partial_exit = config.partial_exit_enabled and position.exit_only
+        if should_attempt_partial_exit:
+            hard_risk_reasons = {
+                "stop_loss_reached",
+                "close_liquidity_warning_stop_loss",
+                "current_edge_missing",
+                "opportunity_missing_too_long",
+                "max_hold_hours_reached",
+            }
+            partial_candidates = choose_partial_close_candidates(
+                rows=route_rows,
+                position_notional_usd=position.total_notional_usd,
+                config=config,
+            )
+            if not partial_candidates:
+                execution_reason = "exit_only_waiting_for_chunk_liquidity"
+            else:
+                allow_loss = (
+                    config.partial_exit_allow_loss_on_hard_risk
+                    and exit_decision.reason in hard_risk_reasons
+                )
+                for chunk_notional, chunk_opportunity in partial_candidates:
+                    chunk_spread_pnl, chunk_close_cost = estimate_close_pnl_for_notional(
+                        position=position,
+                        opportunity=chunk_opportunity,
+                        config=config,
+                        notional_usd=chunk_notional,
+                    )
+                    chunk_pnl = chunk_spread_pnl - chunk_close_cost
+                    chunk_pnl_pct = (chunk_pnl / chunk_notional) * 100
+                    if chunk_pnl_pct < config.partial_exit_min_profit_pct and not allow_loss:
+                        continue
+                    position_closed, partial_pnl = engine.close_position_chunk(
+                        position=position,
+                        opportunity=chunk_opportunity,
+                        notional_usd=chunk_notional,
+                        reason=exit_decision.reason,
+                    )
+                    executed_notional = chunk_notional
+                    execution_reason = (
+                        "partial_exit_completed" if position_closed else "partial_exit_executed"
+                    )
+                    break
+
+                if not executed_notional:
+                    execution_reason = "exit_only_waiting_for_profitable_chunk"
+
         funding_context = decision_funding_context(opportunity, config, decision_now)
         optimisation_context = decision_optimisation_context(opportunity, config)
         store.append_decision(
@@ -223,19 +395,21 @@ def process_scan(
             symbol=position.symbol,
             position_id=position.position_id,
             opportunity_key=opportunity.opportunity_key if opportunity else "",
-            allowed=exit_decision.should_exit,
-            reason=exit_decision.reason,
-            notional_usd=position.total_notional_usd,
+            allowed=executed_notional > 0,
+            reason=execution_reason,
+            notional_usd=executed_notional or position.total_notional_usd,
             estimated_net_pnl_usd=exit_decision.estimated_net_pnl_usd,
             estimated_net_pnl_pct=exit_decision.estimated_net_pnl_pct,
+            partial_exit_notional_usd=executed_notional or None,
+            partial_exit_pnl_usd=partial_pnl if executed_notional else None,
+            position_exit_only=position.exit_only,
             entry_net_edge_pct=position.entry_net_edge_pct,
             effective_take_profit_pct=calculate_take_profit_pct(position, config),
             use_dynamic_take_profit=config.use_dynamic_take_profit,
             **funding_context,
             **optimisation_context,
         )
-        if exit_decision.should_exit:
-            engine.close_position(position, opportunity, exit_decision.reason)
+        if position_closed:
             positions.pop(position_id, None)
 
     daily_risk_state = store.calculate_daily_risk_state(now=scan_rows[0].timestamp_utc)

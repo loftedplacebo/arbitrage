@@ -54,11 +54,44 @@ def estimate_position_pnl(
     opportunity: ValidatedOpportunity,
     config: StrategyConfig,
 ) -> tuple[float, float, float]:
+    if position.total_notional_usd <= 0:
+        estimated_net_pnl = position.realised_spread_pnl + position.realised_funding_pnl
+        return estimated_net_pnl, 0.0, 0.0
+
     if opportunity.long_close_avg_price is None or opportunity.short_close_avg_price is None:
         return position.estimated_net_pnl, position.unrealised_spread_pnl, position.estimated_close_cost
 
-    long_qty = position.total_notional_usd / position.average_long_entry_price
-    short_qty = position.total_notional_usd / position.average_short_entry_price
+    unrealised_spread_pnl, close_cost = estimate_close_pnl_for_notional(
+        position=position,
+        opportunity=opportunity,
+        config=config,
+        notional_usd=position.total_notional_usd,
+    )
+    estimated_net_pnl = (
+        position.realised_spread_pnl
+        + unrealised_spread_pnl
+        + position.realised_funding_pnl
+        - close_cost
+    )
+    return estimated_net_pnl, unrealised_spread_pnl, close_cost
+
+
+def estimate_close_pnl_for_notional(
+    position: Position,
+    opportunity: ValidatedOpportunity,
+    config: StrategyConfig,
+    notional_usd: float,
+) -> tuple[float, float]:
+    """Return spread PnL and close cost for an independently executable chunk."""
+    if (
+        notional_usd <= 0
+        or opportunity.long_close_avg_price is None
+        or opportunity.short_close_avg_price is None
+    ):
+        return 0.0, 0.0
+
+    long_qty = notional_usd / position.average_long_entry_price
+    short_qty = notional_usd / position.average_short_entry_price
 
     long_pnl = long_qty * (opportunity.long_close_avg_price - position.average_long_entry_price)
     short_pnl = short_qty * (position.average_short_entry_price - opportunity.short_close_avg_price)
@@ -70,9 +103,8 @@ def estimate_position_pnl(
         else config.estimated_close_slippage_pct
     )
     close_cost_pct = config.estimated_exit_fee_pct + close_slippage_pct
-    close_cost = position.total_notional_usd * (close_cost_pct / 100)
-    estimated_net_pnl = unrealised_spread_pnl + position.realised_funding_pnl - close_cost
-    return estimated_net_pnl, unrealised_spread_pnl, close_cost
+    close_cost = notional_usd * (close_cost_pct / 100)
+    return unrealised_spread_pnl, close_cost
 
 
 def evaluate_exit(
@@ -123,8 +155,8 @@ def evaluate_exit(
 
         if position.close_liquidity_warning_count >= config.close_liquidity_max_warning_scans:
             return ExitDecision(
-                True,
-                "close_liquidity_warning_persistent",
+                False,
+                "close_liquidity_exit_only",
                 estimated_net_pnl,
                 estimated_net_pnl_pct,
             )
@@ -132,6 +164,14 @@ def evaluate_exit(
         return ExitDecision(
             False,
             "close_liquidity_warning_hold",
+            estimated_net_pnl,
+            estimated_net_pnl_pct,
+        )
+
+    if position.exit_only:
+        return ExitDecision(
+            False,
+            "exit_only_waiting_for_profitable_chunk",
             estimated_net_pnl,
             estimated_net_pnl_pct,
         )

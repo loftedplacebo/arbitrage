@@ -29,6 +29,9 @@ POSITION_FIELDS = [
     "updated_at",
     "missing_scan_count",
     "close_liquidity_warning_count",
+    "exit_only",
+    "partial_close_count",
+    "realised_spread_pnl",
     "status",
 ]
 
@@ -59,6 +62,9 @@ DECISION_FIELDS = [
     "notional_usd",
     "estimated_net_pnl_usd",
     "estimated_net_pnl_pct",
+    "partial_exit_notional_usd",
+    "partial_exit_pnl_usd",
+    "position_exit_only",
     "funding_benefit_pct",
     "min_minutes_to_funding",
     "funding_capture_ready",
@@ -106,6 +112,8 @@ FILL_FIELDS = [
     "fees_usd",
     "slippage_pct",
     "realised_pnl_usd",
+    "remaining_notional_usd",
+    "position_realised_pnl_usd",
     "reason",
 ]
 
@@ -174,6 +182,9 @@ class CsvPositionStore:
         notional_usd: float = 0.0,
         estimated_net_pnl_usd: float = 0.0,
         estimated_net_pnl_pct: float = 0.0,
+        partial_exit_notional_usd: float | None = None,
+        partial_exit_pnl_usd: float | None = None,
+        position_exit_only: bool | None = None,
         funding_benefit_pct: float | None = None,
         min_minutes_to_funding: float | None = None,
         funding_capture_ready: bool | None = None,
@@ -226,6 +237,9 @@ class CsvPositionStore:
                 "notional_usd": f"{notional_usd:.8f}",
                 "estimated_net_pnl_usd": f"{estimated_net_pnl_usd:.8f}",
                 "estimated_net_pnl_pct": f"{estimated_net_pnl_pct:.8f}",
+                "partial_exit_notional_usd": optional_float(partial_exit_notional_usd),
+                "partial_exit_pnl_usd": optional_float(partial_exit_pnl_usd),
+                "position_exit_only": "" if position_exit_only is None else str(position_exit_only),
                 "funding_benefit_pct": optional_float(funding_benefit_pct),
                 "min_minutes_to_funding": optional_float(min_minutes_to_funding),
                 "funding_capture_ready": "" if funding_capture_ready is None else str(funding_capture_ready),
@@ -290,12 +304,16 @@ class CsvPositionStore:
         daily_realised_pnl_usd = sum(
             parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
             for row in todays_fills
-            if row.get("event_type") == "CLOSE_POSITION"
+            if row.get("event_type") in {"PARTIAL_CLOSE", "CLOSE_POSITION"}
         )
 
         consecutive_losses = 0
         for row in reversed(close_events):
-            pnl = parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
+            pnl = (
+                parse_float(row.get("position_realised_pnl_usd"))
+                if row.get("position_realised_pnl_usd") not in (None, "")
+                else parse_float(row.get("realised_pnl_usd"), 0.0)
+            ) or 0.0
             if pnl < 0:
                 consecutive_losses += 1
                 continue

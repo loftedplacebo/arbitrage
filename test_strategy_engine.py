@@ -242,6 +242,7 @@ def test_entry_normal_and_funding_capture_modes():
     normal_decision = evaluate_entry(normal, {}, StrategyConfig(), now=now)
     assert normal_decision.should_enter is True
     assert normal_decision.reason == "spread_entry_ok"
+    assert normal_decision.desired_notional_usd == 100.0
 
     disabled_normal_decision = evaluate_entry(normal, {}, StrategyConfig(normal_entries_enabled=False), now=now)
     assert disabled_normal_decision.should_enter is False
@@ -249,7 +250,7 @@ def test_entry_normal_and_funding_capture_modes():
 
     funding_capture = make_opportunity(
         timestamp_utc=now,
-        validated_spread_pct=0.60,
+        validated_spread_pct=0.35,
         net_edge_ex_funding_pct=0.25,
         net_edge_inc_funding_pct=0.40,
         funding_benefit_pct=0.05,
@@ -275,8 +276,8 @@ def test_normal_entry_too_close_to_funding_rejected_without_benefit():
         net_edge_ex_funding_pct=0.55,
         net_edge_inc_funding_pct=0.55,
         funding_benefit_pct=0.01,
-        long_next_funding_time_utc=now + timedelta(minutes=30),
-        short_next_funding_time_utc=now + timedelta(minutes=30),
+        long_next_funding_time_utc=now + timedelta(minutes=15),
+        short_next_funding_time_utc=now + timedelta(minutes=15),
     )
     decision = evaluate_entry(opportunity, {}, StrategyConfig(normal_entries_enabled=True), now=now)
     assert decision.should_enter is False
@@ -291,8 +292,8 @@ def test_normal_entry_near_funding_allowed_when_favourable():
         net_edge_ex_funding_pct=0.55,
         net_edge_inc_funding_pct=0.55,
         funding_benefit_pct=0.05,
-        long_next_funding_time_utc=now + timedelta(minutes=30),
-        short_next_funding_time_utc=now + timedelta(minutes=30),
+        long_next_funding_time_utc=now + timedelta(minutes=15),
+        short_next_funding_time_utc=now + timedelta(minutes=15),
     )
     decision = evaluate_entry(opportunity, {}, StrategyConfig(normal_entries_enabled=True), now=now)
     assert decision.should_enter is True
@@ -301,7 +302,7 @@ def test_normal_entry_near_funding_allowed_when_favourable():
 
 def test_route_spread_quality_required_for_default_entry():
     config = StrategyConfig()
-    weak_route = make_opportunity(route_spread_percentile=0.60, route_spread_zscore=2.0)
+    weak_route = make_opportunity(route_spread_percentile=0.49, route_spread_zscore=2.0)
     ok, reason = route_spread_quality_decision(weak_route, config)
     assert ok is False
     assert reason == "route_spread_percentile_below_threshold"
@@ -324,7 +325,7 @@ def test_funding_capture_does_not_rescue_weak_spread_by_default():
     now = datetime.now(timezone.utc)
     opportunity = make_opportunity(
         timestamp_utc=now,
-        validated_spread_pct=0.60,
+        validated_spread_pct=0.35,
         net_edge_ex_funding_pct=0.25,
         net_edge_inc_funding_pct=0.40,
         funding_benefit_pct=0.05,
@@ -334,6 +335,45 @@ def test_funding_capture_does_not_rescue_weak_spread_by_default():
     decision = evaluate_entry(opportunity, {}, StrategyConfig(), now=now)
     assert decision.should_enter is False
     assert decision.reason == "validated_spread_below_threshold"
+
+
+def test_round_trip_close_liquidity_is_required_for_entry():
+    now = datetime.now(timezone.utc)
+    not_fillable = make_opportunity(
+        timestamp_utc=now,
+        long_close_fillable=False,
+    )
+    decision = evaluate_entry(not_fillable, {}, StrategyConfig(), now=now)
+    assert decision.should_enter is False
+    assert decision.reason == "round_trip_close_not_fillable"
+
+    missing_prices = make_opportunity(
+        timestamp_utc=now,
+        long_close_avg_price=None,
+    )
+    decision = evaluate_entry(missing_prices, {}, StrategyConfig(), now=now)
+    assert decision.should_enter is False
+    assert decision.reason == "round_trip_close_prices_missing"
+
+
+def test_entry_selector_prefers_round_trip_100_dollar_tier():
+    config = StrategyConfig(initial_entry_slice_notional_usd=100.0)
+    rows = [
+        make_opportunity(
+            notional_usdt=100.0,
+            net_edge_inc_funding_pct=0.40,
+            long_close_fillable=True,
+            short_close_fillable=True,
+        ),
+        make_opportunity(
+            notional_usdt=500.0,
+            net_edge_inc_funding_pct=1.50,
+            long_close_fillable=False,
+        ),
+    ]
+    selected = choose_best_entry_rows(rows, config)
+    assert len(selected) == 1
+    assert selected[0].notional_usdt == 100.0
 
 
 def test_funding_capture_cannot_bypass_safety():
@@ -631,7 +671,7 @@ def test_close_liquidity_warning_holds_first_scan():
     assert decision.reason == "close_liquidity_warning_hold"
 
 
-def test_close_liquidity_warning_persistent_exits():
+def test_close_liquidity_warning_persistent_becomes_exit_only():
     position = make_position(close_liquidity_warning_count=3)
     opportunity = make_opportunity(
         long_close_fillable=False,
@@ -645,8 +685,8 @@ def test_close_liquidity_warning_persistent_exits():
         StrategyConfig(close_liquidity_max_warning_scans=3),
         now=datetime.now(timezone.utc),
     )
-    assert decision.should_exit is True
-    assert decision.reason == "close_liquidity_warning_persistent"
+    assert decision.should_exit is False
+    assert decision.reason == "close_liquidity_exit_only"
 
 
 def test_close_liquidity_warning_stop_loss_exits():
@@ -678,6 +718,30 @@ def test_existing_position_with_close_liquidity_warning_blocks_new_slice():
     )
     assert decision.allowed is False
     assert decision.reason == "existing_position_close_liquidity_warning"
+
+
+def test_exit_only_position_blocks_new_slice():
+    opportunity = make_opportunity()
+    existing = make_position(exit_only=True)
+    decision = evaluate_entry_risk(
+        opportunity=opportunity,
+        open_positions={opportunity.position_key: existing},
+        config=StrategyConfig(),
+        desired_notional_usd=100.0,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "existing_position_exit_only"
+
+
+def test_position_csv_without_partial_exit_fields_stays_compatible():
+    row = make_position().to_csv_row()
+    row.pop("exit_only", None)
+    row.pop("partial_close_count", None)
+    row.pop("realised_spread_pnl", None)
+    loaded = Position.from_csv_row(row)
+    assert loaded.exit_only is False
+    assert loaded.partial_close_count == 0
+    assert loaded.realised_spread_pnl == 0.0
 
 
 def test_existing_losing_position_blocks_new_slice():
@@ -757,6 +821,187 @@ def test_paper_execution_uses_opportunity_timestamp_for_fills():
         assert fills[0]["timestamp_utc"] == format_datetime(timestamp)
 
 
+def test_profitable_partial_close_reduces_position_and_tracks_realised_pnl():
+    with TemporaryDirectory() as tmp:
+        config = StrategyConfig(data_dir=tmp, estimated_exit_fee_pct=0.0)
+        store = CsvPositionStore(config)
+        engine = PaperExecutionEngine(config, store)
+        position = make_position(total_notional_usd=200.0)
+        opportunity = make_opportunity(
+            long_close_avg_price=100.5,
+            short_close_avg_price=100.5,
+            long_close_fillable=True,
+            short_close_fillable=True,
+        )
+
+        closed, chunk_pnl = engine.close_position_chunk(
+            position=position,
+            opportunity=opportunity,
+            notional_usd=100.0,
+            reason="take_profit_reached",
+        )
+        assert closed is False
+        assert chunk_pnl > 0
+        assert position.total_notional_usd == 100.0
+        assert position.exit_only is True
+        assert position.partial_close_count == 1
+        assert position.realised_spread_pnl == chunk_pnl
+        fills = store.load_fills()
+        assert fills[-1]["event_type"] == "PARTIAL_CLOSE"
+        assert float(fills[-1]["remaining_notional_usd"]) == 100.0
+
+        closed, final_chunk_pnl = engine.close_position_chunk(
+            position=position,
+            opportunity=opportunity,
+            notional_usd=100.0,
+            reason="take_profit_reached",
+        )
+        assert closed is True
+        assert final_chunk_pnl > 0
+        assert position.status == "CLOSED"
+        assert position.total_notional_usd == 0.0
+        fills = store.load_fills()
+        assert fills[-1]["event_type"] == "CLOSE_POSITION"
+        assert float(fills[-1]["position_realised_pnl_usd"]) > final_chunk_pnl
+
+
+def test_strategy_loop_unwinds_exit_only_position_in_profitable_chunk():
+    with TemporaryDirectory() as tmp:
+        config = StrategyConfig(
+            data_dir=tmp,
+            max_daily_entries=0,
+            estimated_exit_fee_pct=0.0,
+        )
+        store = CsvPositionStore(config)
+        engine = PaperExecutionEngine(config, store)
+        position = make_position(total_notional_usd=200.0, exit_only=True)
+        positions = {position.position_id: position}
+        opportunity = make_opportunity(
+            long_close_avg_price=100.5,
+            short_close_avg_price=100.5,
+            long_close_fillable=True,
+            short_close_fillable=True,
+        )
+
+        process_scan(
+            scan_time=format_datetime(opportunity.timestamp_utc),
+            scan_rows=[opportunity],
+            source_file=store.data_dir / "test.csv",
+            store=store,
+            engine=engine,
+            config=config,
+            positions=positions,
+        )
+        assert positions[position.position_id].total_notional_usd == 100.0
+        assert store.load_fills()[-1]["event_type"] == "PARTIAL_CLOSE"
+        decisions = [
+            row for row in store.decisions_path.read_text(encoding="utf-8").splitlines()
+            if "partial_exit_executed" in row
+        ]
+        assert len(decisions) == 1
+        assert "100.00000000" in decisions[0]
+
+
+def test_adaptive_partial_exit_uses_largest_profitable_available_chunk():
+    with TemporaryDirectory() as tmp:
+        config = StrategyConfig(
+            data_dir=tmp,
+            max_daily_entries=0,
+            estimated_exit_fee_pct=0.0,
+            partial_exit_chunk_ladder_usd=(500.0, 100.0),
+        )
+        store = CsvPositionStore(config)
+        engine = PaperExecutionEngine(config, store)
+        position = make_position(total_notional_usd=1_000.0, exit_only=True)
+        positions = {position.position_id: position}
+        opportunity = make_opportunity(
+            notional_usdt=500.0,
+            long_close_avg_price=100.5,
+            short_close_avg_price=100.5,
+            long_close_fillable=True,
+            short_close_fillable=True,
+        )
+
+        process_scan(
+            scan_time=format_datetime(opportunity.timestamp_utc),
+            scan_rows=[opportunity],
+            source_file=store.data_dir / "test.csv",
+            store=store,
+            engine=engine,
+            config=config,
+            positions=positions,
+        )
+        assert positions[position.position_id].total_notional_usd == 500.0
+        assert float(store.load_fills()[-1]["notional_usd"]) == 500.0
+
+
+def test_adaptive_partial_exit_falls_back_to_smaller_profitable_chunk():
+    with TemporaryDirectory() as tmp:
+        config = StrategyConfig(
+            data_dir=tmp,
+            max_daily_entries=0,
+            estimated_exit_fee_pct=0.0,
+            partial_exit_chunk_ladder_usd=(500.0, 100.0),
+        )
+        store = CsvPositionStore(config)
+        engine = PaperExecutionEngine(config, store)
+        position = make_position(total_notional_usd=500.0, exit_only=True)
+        positions = {position.position_id: position}
+        unprofitable_500 = make_opportunity(
+            notional_usdt=500.0,
+            long_close_avg_price=99.5,
+            short_close_avg_price=101.5,
+        )
+        profitable_100 = make_opportunity(
+            notional_usdt=100.0,
+            long_close_avg_price=100.5,
+            short_close_avg_price=100.5,
+        )
+
+        process_scan(
+            scan_time=format_datetime(profitable_100.timestamp_utc),
+            scan_rows=[unprofitable_500, profitable_100],
+            source_file=store.data_dir / "test.csv",
+            store=store,
+            engine=engine,
+            config=config,
+            positions=positions,
+        )
+        assert positions[position.position_id].total_notional_usd == 400.0
+        assert float(store.load_fills()[-1]["notional_usd"]) == 100.0
+
+
+def test_persistent_liquidity_warning_does_not_create_full_close():
+    with TemporaryDirectory() as tmp:
+        config = StrategyConfig(data_dir=tmp, max_daily_entries=0)
+        store = CsvPositionStore(config)
+        engine = PaperExecutionEngine(config, store)
+        position = make_position(total_notional_usd=200.0, close_liquidity_warning_count=2)
+        positions = {position.position_id: position}
+        bad_close = make_opportunity(
+            long_close_fillable=False,
+            short_close_fillable=True,
+            long_close_avg_price=100.0,
+            short_close_avg_price=101.0,
+        )
+
+        process_scan(
+            scan_time=format_datetime(bad_close.timestamp_utc),
+            scan_rows=[bad_close],
+            source_file=store.data_dir / "test.csv",
+            store=store,
+            engine=engine,
+            config=config,
+            positions=positions,
+        )
+        assert positions[position.position_id].exit_only is True
+        assert positions[position.position_id].total_notional_usd == 200.0
+        assert not any(
+            row.get("event_type") == "CLOSE_POSITION"
+            for row in store.load_fills()
+        )
+
+
 def test_strategy_loop_increments_and_resets_close_liquidity_warning_count():
     with TemporaryDirectory() as tmp:
         config = StrategyConfig(data_dir=tmp, max_daily_entries=0)
@@ -813,6 +1058,8 @@ if __name__ == "__main__":
     test_route_spread_quality_required_for_default_entry()
     test_route_stats_calculate_percentile_zscore_and_trend()
     test_funding_capture_does_not_rescue_weak_spread_by_default()
+    test_round_trip_close_liquidity_is_required_for_entry()
+    test_entry_selector_prefers_round_trip_100_dollar_tier()
     test_funding_capture_cannot_bypass_safety()
     test_exit_holds_for_favourable_funding_but_stop_loss_overrides()
     test_remaining_edge_low_requires_profitable_exit_buffer()
@@ -826,14 +1073,21 @@ if __name__ == "__main__":
     test_stop_loss_disabled_holds_spread_widening_loss()
     test_stop_loss_enabled_overrides_negative_funding_hold()
     test_close_liquidity_warning_holds_first_scan()
-    test_close_liquidity_warning_persistent_exits()
+    test_close_liquidity_warning_persistent_becomes_exit_only()
     test_close_liquidity_warning_stop_loss_exits()
     test_existing_position_with_close_liquidity_warning_blocks_new_slice()
+    test_exit_only_position_blocks_new_slice()
+    test_position_csv_without_partial_exit_fields_stays_compatible()
     test_existing_losing_position_blocks_new_slice()
     test_existing_position_negative_funding_blocks_new_slice()
     test_stock_like_symbols_are_not_crypto()
     test_hyperliquid_symbol_mapping()
     test_default_strategy_blocks_known_synthetic_symbols()
     test_paper_execution_uses_opportunity_timestamp_for_fills()
+    test_profitable_partial_close_reduces_position_and_tracks_realised_pnl()
+    test_strategy_loop_unwinds_exit_only_position_in_profitable_chunk()
+    test_adaptive_partial_exit_uses_largest_profitable_available_chunk()
+    test_adaptive_partial_exit_falls_back_to_smaller_profitable_chunk()
+    test_persistent_liquidity_warning_does_not_create_full_close()
     test_strategy_loop_increments_and_resets_close_liquidity_warning_count()
     print("strategy engine tests passed")
