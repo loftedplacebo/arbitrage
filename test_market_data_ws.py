@@ -68,6 +68,23 @@ def test_cache_returns_only_fresh_usable_tickers():
     assert rows["BTCUSDT"]["bid"] == 100.0
 
 
+def test_cache_emits_ticker_updates_and_returns_symbol_snapshot():
+    cache = MarketDataCache()
+    events = []
+    cache.add_listener(lambda event_type, value: events.append((event_type, value.symbol)))
+    cache.update_ticker(CachedTicker(
+        exchange="binance",
+        symbol="BTCUSDT",
+        bid=100.0,
+        ask=101.0,
+        volume_usdt=1_000_000.0,
+        observed_at_utc=datetime.now(timezone.utc),
+    ))
+    snapshot = cache.get_symbol_tickers("BTCUSDT", max_age_seconds=10)
+    assert snapshot["binance"]["bid"] == 100.0
+    assert events == [("ticker", "BTCUSDT")]
+
+
 def test_depth_targets_expire():
     cache = MarketDataCache()
     cache.set_depth_targets(
@@ -390,6 +407,14 @@ def test_hyperliquid_bbo_rows_can_create_fast_candidates():
     assert len(candidates) == 1
     assert candidates[0]["short_exchange"] == "hyperliquid"
     assert candidates[0]["short_price_source"] == "websocket_bbo"
+
+
+def test_generic_websocket_bid_ask_rows_can_create_fast_candidates():
+    ticker_data = {
+        "binance": {"BTCUSDT": {"exchange": "binance", "symbol": "BTCUSDT", "bid": 100.0, "ask": 100.1, "volume_usdt": 1_000_000.0, "price_source": "websocket"}},
+        "bitget": {"BTCUSDT": {"exchange": "bitget", "symbol": "BTCUSDT", "bid": 101.0, "ask": 101.1, "volume_usdt": 1_000_000.0, "price_source": "websocket"}},
+    }
+    assert build_fast_candidates(ticker_data)
 
 
 def test_wait_for_candidate_orderbooks_reports_ready_routes():
@@ -784,6 +809,7 @@ def test_parse_hyperliquid_messages():
 
 if __name__ == "__main__":
     test_cache_returns_only_fresh_usable_tickers()
+    test_cache_emits_ticker_updates_and_returns_symbol_snapshot()
     test_depth_targets_expire()
     test_position_depth_targets_outrank_scanner_targets()
     test_local_event_stream_publishes_and_accepts_controls()
@@ -793,6 +819,7 @@ if __name__ == "__main__":
     test_ticker_funding_fields_update_funding_cache()
     test_hyperliquid_midpoint_rows_do_not_create_fast_candidates()
     test_hyperliquid_bbo_rows_can_create_fast_candidates()
+    test_generic_websocket_bid_ask_rows_can_create_fast_candidates()
     test_wait_for_candidate_orderbooks_reports_ready_routes()
     test_deep_validation_uses_cached_books_and_funding()
     test_deep_validation_rejects_excessive_cross_venue_book_skew()

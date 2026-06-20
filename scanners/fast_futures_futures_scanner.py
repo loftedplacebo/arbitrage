@@ -7,6 +7,8 @@ import re
 import sys
 import time
 import statistics
+import threading
+from queue import PriorityQueue, Empty
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from pathlib import Path
@@ -62,6 +64,9 @@ DEEP_VALIDATE_TOP_N = 150
 DEEP_VALIDATE_CRYPTO_ONLY = True
 DEEP_VALIDATE_WORKERS = 8
 MAX_CROSS_VENUE_BOOK_SKEW_SECONDS = 0.50
+EVENT_DRIVEN_CANDIDATE_WORKERS = 2
+EVENT_DRIVEN_SYMBOL_DEBOUNCE_SECONDS = 0.25
+EVENT_DRIVEN_DEPTH_WAIT_SECONDS = 0.75
 NOTIONALS_USDT = [100, 200, 300, 400, 500, 1_000, 2_500]
 CANDIDATE_WATCHLIST_ENABLED = True
 CANDIDATE_WATCHLIST_TTL_SECONDS = 900
@@ -137,6 +142,7 @@ ML_OUTPUT_DIR = REPO_ROOT / "data" / "ml" / "fast_spread_observations"
 ML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TELEMETRY_OUTPUT_DIR = REPO_ROOT / "data" / "scanner_telemetry"
 TELEMETRY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+VALIDATED_WRITE_LOCK = threading.Lock()
 
 
 # -----------------------------
@@ -387,7 +393,10 @@ def is_executable_fast_ticker(exchange: str, ticker: dict) -> bool:
     if exchange != "hyperliquid":
         return True
 
-    return ticker.get("price_source") in {"websocket_bbo", "rest_bbo", "websocket_depth"}
+    # A generic websocket ticker still carries a real bid/ask on Binance,
+    # Bitget, MEXC and KuCoin. Only midpoint-derived prices are unsuitable for
+    # executable cross-venue spread discovery.
+    return ticker.get("price_source") not in {"websocket_mid", "rest_mid"}
 
 
 def build_fast_candidates(ticker_data: dict[str, dict[str, dict]]) -> list[dict]:
@@ -713,6 +722,7 @@ def deep_validate_candidate(
     ws_orderbook_max_age_seconds: float = 5.0,
     funding_cache_seconds: float = 60.0,
     max_cross_venue_book_skew_seconds: float = MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
+    require_cached_orderbooks: bool = False,
 ) -> list[dict]:
     """
     Deep-validate one fast candidate using real order books and funding.
@@ -741,6 +751,8 @@ def deep_validate_candidate(
         max_age_seconds=ws_orderbook_max_age_seconds,
     )
     long_book_source = "websocket" if long_orderbook is not None else "rest"
+    if require_cached_orderbooks and long_orderbook is None:
+        raise ValueError("cached_long_orderbook_unavailable")
     long_orderbook = long_orderbook or long_adapter.get_futures_orderbook(symbol, limit=100)
     short_orderbook = get_cached_orderbook(
         cache=market_data_cache,
@@ -749,6 +761,8 @@ def deep_validate_candidate(
         max_age_seconds=ws_orderbook_max_age_seconds,
     )
     short_book_source = "websocket" if short_orderbook is not None else "rest"
+    if require_cached_orderbooks and short_orderbook is None:
+        raise ValueError("cached_short_orderbook_unavailable")
     short_orderbook = short_orderbook or short_adapter.get_futures_orderbook(symbol, limit=100)
 
     book_skew_seconds = abs(
@@ -1072,7 +1086,7 @@ def build_capacity_summary(validated_results: list[dict]) -> list[dict]:
     return summaries
 
 
-def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> Path | None:
+def _write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> Path | None:
     if not results:
         return None
 
@@ -1150,6 +1164,130 @@ def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> 
             writer.writerow(output_row)
 
     return output_file
+
+
+def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> Path | None:
+    with VALIDATED_WRITE_LOCK:
+        return _write_validated_results_to_csv(results, timestamp)
+
+
+class EventDrivenCandidatePipeline:
+    """Turn fresh websocket ticker updates into cache-only validated route events."""
+
+    def __init__(
+        self,
+        *,
+        cache: MarketDataCache,
+        adapters: dict,
+        event_publisher: LocalEventPublisher | None,
+        worker_count: int,
+        symbol_debounce_seconds: float,
+        depth_wait_seconds: float,
+        ws_orderbook_max_age_seconds: float,
+        funding_cache_seconds: float,
+        max_book_skew_seconds: float,
+    ):
+        self.cache = cache
+        self.adapters = adapters
+        self.event_publisher = event_publisher
+        self.symbol_debounce_seconds = symbol_debounce_seconds
+        self.depth_wait_seconds = depth_wait_seconds
+        self.ws_orderbook_max_age_seconds = ws_orderbook_max_age_seconds
+        self.funding_cache_seconds = funding_cache_seconds
+        self.max_book_skew_seconds = max_book_skew_seconds
+        self._queue: PriorityQueue = PriorityQueue(maxsize=2_000)
+        self._stop = threading.Event()
+        self._last_symbol_at: dict[str, float] = {}
+        self._last_route_at: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._persistence_history: dict[str, deque] = {}
+        self._threads = [
+            threading.Thread(target=self._worker, name=f"event-candidate-{index}", daemon=True)
+            for index in range(max(1, worker_count))
+        ]
+
+    def start(self) -> None:
+        self.cache.add_listener(self._on_cache_update)
+        for thread in self._threads:
+            thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        for thread in self._threads:
+            thread.join(timeout=2)
+
+    def _on_cache_update(self, event_type: str, value: object) -> None:
+        if event_type != "ticker":
+            return
+        symbol = value.symbol
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_symbol_at.get(symbol, 0.0) < self.symbol_debounce_seconds:
+                return
+            self._last_symbol_at[symbol] = now
+        ticker_data = {
+            exchange: {symbol: row}
+            for exchange, row in self.cache.get_symbol_tickers(symbol, max_age_seconds=10).items()
+        }
+        for candidate in build_fast_candidates(ticker_data):
+            route = candidate_key(candidate)
+            with self._lock:
+                if now - self._last_route_at.get(route, 0.0) < self.symbol_debounce_seconds:
+                    continue
+                self._last_route_at[route] = now
+            try:
+                self._queue.put_nowait((-candidate["fast_spread_pct"], time.monotonic(), candidate))
+            except Exception:
+                return
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                _priority, _queued_at, candidate = self._queue.get(timeout=0.2)
+            except Empty:
+                continue
+            try:
+                self.cache.set_depth_targets(
+                    [
+                        (candidate["long_exchange"], candidate["symbol"]),
+                        (candidate["short_exchange"], candidate["symbol"]),
+                    ],
+                    ttl_seconds=30,
+                    source="event_candidates",
+                    priority=50,
+                )
+                ready, _ = wait_for_candidate_orderbooks(
+                    candidates=[candidate],
+                    cache=self.cache,
+                    timeout_seconds=self.depth_wait_seconds,
+                    poll_seconds=0.05,
+                    max_age_seconds=self.ws_orderbook_max_age_seconds,
+                )
+                if not ready:
+                    continue
+                timestamp = utc_now()
+                rows = deep_validate_candidate(
+                    candidate=candidate,
+                    adapters=self.adapters,
+                    timestamp=timestamp,
+                    market_data_cache=self.cache,
+                    ws_orderbook_max_age_seconds=self.ws_orderbook_max_age_seconds,
+                    funding_cache_seconds=self.funding_cache_seconds,
+                    max_cross_venue_book_skew_seconds=self.max_book_skew_seconds,
+                    require_cached_orderbooks=True,
+                )
+                with self._lock:
+                    rows = apply_persistence_and_readiness(rows, self._persistence_history)
+                write_validated_results_to_csv(rows, timestamp)
+                if self.event_publisher is not None:
+                    self.event_publisher.publish(
+                        "validated_scan",
+                        {"timestamp_utc": timestamp.isoformat(), "rows": rows, "source": "ticker_event"},
+                    )
+            except Exception as exc:
+                print(f"[event-candidate] {candidate.get('symbol')} skipped: {exc}")
+            finally:
+                self._queue.task_done()
 
 
 def write_scan_telemetry_to_csv(row: dict, timestamp: datetime) -> Path:
@@ -1631,6 +1769,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
     )
+    parser.add_argument(
+        "--event-driven-candidates",
+        action="store_true",
+        help="Validate fresh websocket ticker candidates from cache without waiting for the scan cycle",
+    )
+    parser.add_argument("--event-driven-candidate-workers", type=int, default=EVENT_DRIVEN_CANDIDATE_WORKERS)
+    parser.add_argument("--event-driven-symbol-debounce-seconds", type=float, default=EVENT_DRIVEN_SYMBOL_DEBOUNCE_SECONDS)
+    parser.add_argument("--event-driven-depth-wait-seconds", type=float, default=EVENT_DRIVEN_DEPTH_WAIT_SECONDS)
     return parser.parse_args()
 
 
@@ -1661,6 +1807,7 @@ def main():
     market_data_cache = None
     websocket_service = None
     event_publisher = None
+    event_candidate_pipeline = None
     use_websocket_features = args.use_websocket_cache or args.ws_depth_cache
 
     if use_websocket_features:
@@ -1733,6 +1880,28 @@ def main():
 
             market_data_cache.add_listener(publish_position_orderbook)
 
+    if args.event_driven_candidates:
+        if market_data_cache is None:
+            print("Event-driven candidates require websocket cache; feature disabled.")
+        else:
+            event_candidate_pipeline = EventDrivenCandidatePipeline(
+                cache=market_data_cache,
+                adapters=adapters,
+                event_publisher=event_publisher,
+                worker_count=args.event_driven_candidate_workers,
+                symbol_debounce_seconds=args.event_driven_symbol_debounce_seconds,
+                depth_wait_seconds=args.event_driven_depth_wait_seconds,
+                ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,
+                funding_cache_seconds=args.funding_cache_seconds,
+                max_book_skew_seconds=args.max_cross_venue_book_skew_seconds,
+            )
+            event_candidate_pipeline.start()
+            print(
+                "Event-driven candidate pipeline enabled: "
+                f"workers={args.event_driven_candidate_workers} "
+                f"debounce={args.event_driven_symbol_debounce_seconds:g}s"
+            )
+
     try:
         if not args.loop:
             run_scan_once(
@@ -1789,6 +1958,8 @@ def main():
     finally:
         if websocket_service is not None:
             websocket_service.stop()
+        if event_candidate_pipeline is not None:
+            event_candidate_pipeline.stop()
         if event_publisher is not None:
             event_publisher.stop()
 

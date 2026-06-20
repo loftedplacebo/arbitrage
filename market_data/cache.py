@@ -135,6 +135,7 @@ class MarketDataCache:
                     funding_interval_hours=None,
                     observed_at_utc=ticker.observed_at_utc,
                 )
+        self._notify_listeners("ticker", ticker)
 
     def update_funding(
         self,
@@ -218,6 +219,20 @@ class MarketDataCache:
         if len(rows) < min_count:
             return {}
         return rows
+
+    def get_symbol_tickers(
+        self,
+        symbol: str,
+        *,
+        max_age_seconds: float,
+    ) -> dict[str, dict]:
+        now = utc_now()
+        with self._lock:
+            return {
+                exchange: ticker.to_fast_ticker_row()
+                for (exchange, ticker_symbol), ticker in self._tickers.items()
+                if ticker_symbol == symbol and ticker.is_usable(max_age_seconds, now=now)
+            }
 
     def get_orderbook(
         self,
