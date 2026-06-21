@@ -30,7 +30,10 @@ class _EventRequestHandler(socketserver.StreamRequestHandler):
 
     def handle(self) -> None:
         while not self.server.hub.stopped:  # type: ignore[attr-defined]
-            raw = self.rfile.readline()
+            try:
+                raw = self.rfile.readline()
+            except TimeoutError:
+                continue
             if not raw:
                 break
             try:
@@ -111,7 +114,9 @@ class LocalEventPublisher:
                     self._clients.discard(client)
 
     def _register(self, client: socket.socket) -> None:
-        client.settimeout(1.0)
+        # Keep idle strategy subscribers connected. A read timeout here would
+        # make the server drop healthy consumers between depth updates.
+        client.settimeout(None)
         with self._clients_lock:
             self._clients.add(client)
 

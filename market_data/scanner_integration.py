@@ -297,6 +297,33 @@ def count_candidate_orderbook_coverage(
     return ready, len(rows)
 
 
+def candidates_with_fresh_orderbooks(
+    *,
+    candidates: Iterable[dict],
+    cache: MarketDataCache | None,
+    max_age_seconds: float,
+) -> list[dict]:
+    """Return only routes with fresh executable depth on both exchanges."""
+    if cache is None:
+        return []
+
+    ready_candidates = []
+    for candidate in candidates:
+        symbol = candidate.get("symbol")
+        long_exchange = candidate.get("long_exchange")
+        short_exchange = candidate.get("short_exchange")
+        if not symbol or not long_exchange or not short_exchange:
+            continue
+        if (
+            cache.get_orderbook(str(long_exchange), str(symbol), max_age_seconds=max_age_seconds)
+            is not None
+            and cache.get_orderbook(str(short_exchange), str(symbol), max_age_seconds=max_age_seconds)
+            is not None
+        ):
+            ready_candidates.append(candidate)
+    return ready_candidates
+
+
 def wait_for_candidate_orderbooks(
     *,
     candidates: Iterable[dict],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from core.models import FundingInfo, OrderBook, OrderBookLevel
 from market_data.cache import CachedTicker, MarketDataCache
@@ -9,12 +10,14 @@ from market_data.scanner_integration import (
     CandidateWatchlist,
     build_depth_targets_from_candidates,
     candidate_route_key,
+    candidates_with_fresh_orderbooks,
     count_candidate_orderbook_coverage,
     get_funding_info_with_cache,
     get_ticker_data_with_cache,
     wait_for_candidate_orderbooks,
 )
 from scanners.fast_futures_futures_scanner import (
+    EventDrivenCandidatePipeline,
     build_depth_warm_candidates,
     build_fast_candidates,
     deep_validate_candidate,
@@ -126,7 +129,7 @@ def test_local_event_stream_publishes_and_accepts_controls():
         client.connect()
         client.send({"type": "depth_targets", "targets": [{"exchange": "binance", "symbol": "BTCUSDT"}]})
         import time
-        time.sleep(0.05)
+        time.sleep(1.1)
         publisher.publish("validated_scan", {"timestamp_utc": "2026-01-01T00:00:00+00:00", "rows": []})
         events = client.receive(1.0)
         assert events[0]["channel"] == "validated_scan"
@@ -134,6 +137,44 @@ def test_local_event_stream_publishes_and_accepts_controls():
     finally:
         client.close()
         publisher.stop()
+
+
+def test_event_candidate_queue_uses_sequence_tie_breaker():
+    cache = MarketDataCache()
+    now = datetime.now(timezone.utc)
+    for exchange, bid, ask in [
+        ("binance", 99.0, 100.0),
+        ("bitget", 101.0, 102.0),
+        ("mexc", 101.0, 102.0),
+    ]:
+        cache.update_ticker(CachedTicker(
+            exchange=exchange,
+            symbol="BTCUSDT",
+            bid=bid,
+            ask=ask,
+            volume_usdt=1_000_000.0,
+            observed_at_utc=now,
+            source="websocket",
+        ))
+
+    pipeline = EventDrivenCandidatePipeline(
+        cache=cache,
+        adapters={},
+        event_publisher=None,
+        worker_count=1,
+        symbol_debounce_seconds=0,
+        depth_wait_seconds=0,
+        ws_orderbook_max_age_seconds=10,
+        funding_cache_seconds=60,
+        max_book_skew_seconds=0.5,
+    )
+
+    pipeline._on_cache_update("ticker", SimpleNamespace(symbol="BTCUSDT"))
+
+    first = pipeline._queue.get_nowait()
+    second = pipeline._queue.get_nowait()
+    assert first[0] == second[0]
+    assert first[1] != second[1]
 
 
 def test_replace_depth_targets_removes_stale_targets():
@@ -459,6 +500,11 @@ def test_wait_for_candidate_orderbooks_reports_ready_routes():
         poll_seconds=0.05,
         max_age_seconds=10,
     ) == (1, 2)
+    assert candidates_with_fresh_orderbooks(
+        candidates=candidates,
+        cache=cache,
+        max_age_seconds=10,
+    ) == [candidates[0]]
 
 
 def test_deep_validation_uses_cached_books_and_funding():
@@ -813,6 +859,7 @@ if __name__ == "__main__":
     test_depth_targets_expire()
     test_position_depth_targets_outrank_scanner_targets()
     test_local_event_stream_publishes_and_accepts_controls()
+    test_event_candidate_queue_uses_sequence_tie_breaker()
     test_build_depth_targets_from_candidates_limits_and_dedupes()
     test_ticker_data_uses_cache_when_fresh_and_rest_when_cold()
     test_funding_info_cache_avoids_repeated_adapter_calls()

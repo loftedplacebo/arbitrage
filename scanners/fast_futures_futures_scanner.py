@@ -8,7 +8,7 @@ import sys
 import time
 import statistics
 import threading
-from queue import PriorityQueue, Empty
+from queue import PriorityQueue, Empty, Full
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from pathlib import Path
@@ -33,6 +33,7 @@ from market_data.cache import MarketDataCache
 from market_data.event_stream import LocalEventPublisher, orderbook_to_payload
 from market_data.scanner_integration import (
     CandidateWatchlist,
+    candidates_with_fresh_orderbooks,
     candidate_route_key,
     get_cached_orderbook,
     get_funding_info_with_cache,
@@ -103,6 +104,9 @@ TOKENISED_STOCK_KEYWORDS = [
     "AMD",
     "SOXL",
     "ARM",
+    "SKHYNIX",
+    "SAMSUNG",
+    "MSTR",
     "AAOI",
     "SPCX",
     "XOM",
@@ -1196,6 +1200,7 @@ class EventDrivenCandidatePipeline:
         self.funding_cache_seconds = funding_cache_seconds
         self.max_book_skew_seconds = max_book_skew_seconds
         self._queue: PriorityQueue = PriorityQueue(maxsize=2_000)
+        self._queue_sequence = itertools.count()
         self._stop = threading.Event()
         self._last_symbol_at: dict[str, float] = {}
         self._last_route_at: dict[str, float] = {}
@@ -1236,14 +1241,16 @@ class EventDrivenCandidatePipeline:
                     continue
                 self._last_route_at[route] = now
             try:
-                self._queue.put_nowait((-candidate["fast_spread_pct"], time.monotonic(), candidate))
-            except Exception:
+                self._queue.put_nowait(
+                    (-candidate["fast_spread_pct"], next(self._queue_sequence), candidate)
+                )
+            except Full:
                 return
 
     def _worker(self) -> None:
         while not self._stop.is_set():
             try:
-                _priority, _queued_at, candidate = self._queue.get(timeout=0.2)
+                _priority, _sequence, candidate = self._queue.get(timeout=0.2)
             except Empty:
                 continue
             try:
@@ -1466,6 +1473,20 @@ def run_scan_once(
             poll_seconds=0.10,
             max_age_seconds=ws_orderbook_max_age_seconds,
         )
+        # In websocket-depth mode, validate only fresh two-sided cached books.
+        # Falling back to REST here defeats the realtime path and can rate-limit
+        # an exchange when the candidate set changes quickly.
+        deep_candidates = candidates_with_fresh_orderbooks(
+            candidates=deep_candidates,
+            cache=market_data_cache,
+            max_age_seconds=ws_orderbook_max_age_seconds,
+        )
+        skipped_without_cached_depth = total - len(deep_candidates)
+        if skipped_without_cached_depth:
+            print(
+                "Skipped "
+                f"{skipped_without_cached_depth} deep candidates without fresh websocket depth."
+            )
         if market_data_cache is not None:
             stats = market_data_cache.stats()
             print(f"Websocket depth targets: {stats.active_depth_targets}")
@@ -1492,6 +1513,7 @@ def run_scan_once(
                 ws_orderbook_max_age_seconds,
                 funding_cache_seconds,
                 max_cross_venue_book_skew_seconds,
+                ws_depth_cache,
             ): candidate
             for candidate in deep_candidates
         }
@@ -1660,7 +1682,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ws-depth-cache",
         action="store_true",
-        help="Subscribe to candidate order books and prefer fresh websocket depth cache, with REST fallback",
+        help="Subscribe to candidate order books and validate only fresh websocket depth",
     )
     parser.add_argument(
         "--ws-warmup-seconds",

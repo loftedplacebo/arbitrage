@@ -23,8 +23,6 @@ Notes:
     - Bitget public market endpoint limit is currently 20 requests/sec/IP.
     - Symbols use Bitget format, e.g. BTCUSDT, not BTC_USDT.
 """
-print("BITGET FILE LOADED")
-
 from __future__ import annotations
 
 import argparse
