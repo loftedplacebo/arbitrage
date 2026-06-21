@@ -150,6 +150,28 @@ def choose_best_entry_rows(
     return selected
 
 
+def choose_event_entry_rows(
+    rows: list[ValidatedOpportunity],
+    config: StrategyConfig,
+    *,
+    last_evaluated_at: dict[str, float],
+    now_monotonic: float,
+    cooldown_seconds: float,
+    max_candidates: int,
+) -> list[ValidatedOpportunity]:
+    """Select a bounded, non-repetitive entry set from a realtime event batch."""
+    selected = []
+    for opportunity in choose_best_entry_rows(rows, config):
+        last_seen = last_evaluated_at.get(opportunity.position_key, float("-inf"))
+        if now_monotonic - last_seen < cooldown_seconds:
+            continue
+        last_evaluated_at[opportunity.position_key] = now_monotonic
+        selected.append(opportunity)
+        if len(selected) >= max(1, max_candidates):
+            break
+    return selected
+
+
 def choose_close_mark_row(
     rows: list[ValidatedOpportunity],
     position_notional_usd: float,
@@ -306,6 +328,7 @@ def process_scan(
     engine: PaperExecutionEngine,
     config: StrategyConfig,
     positions,
+    entry_candidates: list[ValidatedOpportunity] | None = None,
 ) -> None:
     decision_now = datetime.now(timezone.utc)
     rows_by_position: dict[str, list[ValidatedOpportunity]] = defaultdict(list)
@@ -415,7 +438,7 @@ def process_scan(
             positions.pop(position_id, None)
 
     daily_risk_state = store.calculate_daily_risk_state(now=scan_rows[0].timestamp_utc)
-    candidates = choose_best_entry_rows(scan_rows, config)
+    candidates = entry_candidates if entry_candidates is not None else choose_best_entry_rows(scan_rows, config)
 
     for opportunity in candidates:
         funding_context = decision_funding_context(opportunity, config, decision_now)
@@ -551,6 +574,9 @@ def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) ->
     client = LocalEventClient(host=args.event_host, port=args.event_port)
     next_csv_fallback = 0.0
     next_target_refresh = 0.0
+    pending_rows: list[ValidatedOpportunity] = []
+    event_batch_deadline = 0.0
+    last_entry_evaluated_at: dict[str, float] = {}
     print(
         f"Strategy event loop connecting to {args.event_host}:{args.event_port}. "
         "Press Ctrl+C to stop."
@@ -596,20 +622,9 @@ def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) ->
                                 continue
                         if not rows:
                             continue
-                        scan_time = format_datetime(rows[0].timestamp_utc)
-                        if scan_time in store.load_processed_scans():
-                            continue
-                        positions = store.load_open_positions()
-                        process_scan(
-                            scan_time=scan_time,
-                            scan_rows=rows,
-                            source_file=Path("event_stream"),
-                            store=store,
-                            engine=engine,
-                            config=config,
-                            positions=positions,
-                        )
-                        print(f"Processed event scan {scan_time} ({len(rows)} validated rows).")
+                        pending_rows.extend(rows)
+                        if not event_batch_deadline:
+                            event_batch_deadline = now_monotonic + args.event_batch_seconds
                     elif channel == "position_orderbook":
                         orderbook = live_books.update_payload(payload)
                         if orderbook is None:
@@ -629,6 +644,42 @@ def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) ->
                                 f"Live exit watcher executed {executed} chunk(s) for "
                                 f"{orderbook.standard_symbol}."
                             )
+
+                now_monotonic = time.monotonic()
+                if pending_rows and now_monotonic >= event_batch_deadline:
+                    # Keep only the newest quote for each route/notional tier.
+                    latest_rows: dict[str, ValidatedOpportunity] = {}
+                    for row in pending_rows:
+                        previous = latest_rows.get(row.opportunity_key)
+                        if previous is None or row.timestamp_utc >= previous.timestamp_utc:
+                            latest_rows[row.opportunity_key] = row
+                    batch_rows = list(latest_rows.values())
+                    scan_time = format_datetime(max(row.timestamp_utc for row in batch_rows))
+                    entry_candidates = choose_event_entry_rows(
+                        batch_rows,
+                        config,
+                        last_evaluated_at=last_entry_evaluated_at,
+                        now_monotonic=now_monotonic,
+                        cooldown_seconds=args.event_entry_cooldown_seconds,
+                        max_candidates=args.event_max_entry_candidates,
+                    )
+                    positions = store.load_open_positions()
+                    process_scan(
+                        scan_time=scan_time,
+                        scan_rows=batch_rows,
+                        source_file=Path("event_stream"),
+                        store=store,
+                        engine=engine,
+                        config=config,
+                        positions=positions,
+                        entry_candidates=entry_candidates,
+                    )
+                    print(
+                        f"Processed event batch {scan_time} "
+                        f"({len(batch_rows)} rows, {len(entry_candidates)} entry candidates)."
+                    )
+                    pending_rows = []
+                    event_batch_deadline = 0.0
             except (ConnectionError, OSError) as exc:
                 client.close()
                 if not args.quiet_idle:
@@ -662,6 +713,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event-host", default="127.0.0.1")
     parser.add_argument("--event-port", type=int, default=8765)
     parser.add_argument("--event-poll-seconds", type=float, default=0.5)
+    parser.add_argument(
+        "--event-batch-seconds",
+        type=float,
+        default=2.0,
+        help="Maximum coalescing window for validated realtime events.",
+    )
+    parser.add_argument(
+        "--event-max-entry-candidates",
+        type=int,
+        default=5,
+        help="Maximum new entry routes evaluated per realtime event batch.",
+    )
+    parser.add_argument(
+        "--event-entry-cooldown-seconds",
+        type=float,
+        default=15.0,
+        help="Minimum seconds before reevaluating the same route for a new entry.",
+    )
     parser.add_argument(
         "--event-csv-fallback-seconds",
         type=float,

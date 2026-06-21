@@ -9,7 +9,7 @@ from strategy.models import Position, ValidatedOpportunity, format_datetime
 from strategy.paper_execution import PaperExecutionEngine
 from strategy.position_store import CsvPositionStore
 from strategy.risk_rules import evaluate_entry_risk
-from strategy.run_strategy_loop import choose_best_entry_rows, process_scan
+from strategy.run_strategy_loop import choose_best_entry_rows, choose_event_entry_rows, process_scan
 from strategy.live_exit_watcher import LiveOrderBookCache, process_live_exit_updates
 from core.symbols import standard_to_exchange_symbol
 
@@ -143,6 +143,42 @@ def test_best_entry_row_prefers_paper_ready_slice():
 
     assert len(selected) == 1
     assert selected[0].notional_usdt == 100.0
+
+
+def test_event_entry_selection_limits_and_cools_down_routes():
+    config = StrategyConfig()
+    first = make_opportunity(symbol="IDUSDT")
+    second = make_opportunity(symbol="TIAUSDT", net_edge_ex_funding_pct=0.4)
+    last_evaluated = {}
+
+    selected = choose_event_entry_rows(
+        [first, second],
+        config,
+        last_evaluated_at=last_evaluated,
+        now_monotonic=100.0,
+        cooldown_seconds=15.0,
+        max_candidates=1,
+    )
+    assert [row.symbol for row in selected] == ["IDUSDT"]
+
+    assert not choose_event_entry_rows(
+        [first],
+        config,
+        last_evaluated_at=last_evaluated,
+        now_monotonic=110.0,
+        cooldown_seconds=15.0,
+        max_candidates=1,
+    )
+
+    selected = choose_event_entry_rows(
+        [first],
+        config,
+        last_evaluated_at=last_evaluated,
+        now_monotonic=116.0,
+        cooldown_seconds=15.0,
+        max_candidates=1,
+    )
+    assert [row.symbol for row in selected] == ["IDUSDT"]
     assert selected[0].paper_ready is True
 
 
@@ -1097,6 +1133,7 @@ if __name__ == "__main__":
     test_pnl_uses_close_side_prices()
     test_one_entry_row_per_position_per_scan()
     test_best_entry_row_prefers_paper_ready_slice()
+    test_event_entry_selection_limits_and_cools_down_routes()
     test_missing_opportunity_waits_until_threshold()
     test_daily_risk_state_from_fills()
     test_funding_capture_ready_window()

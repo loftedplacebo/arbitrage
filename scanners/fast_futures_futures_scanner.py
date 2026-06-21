@@ -1185,6 +1185,7 @@ class EventDrivenCandidatePipeline:
         adapters: dict,
         event_publisher: LocalEventPublisher | None,
         worker_count: int,
+        max_routes_per_symbol: int,
         symbol_debounce_seconds: float,
         depth_wait_seconds: float,
         ws_orderbook_max_age_seconds: float,
@@ -1194,6 +1195,7 @@ class EventDrivenCandidatePipeline:
         self.cache = cache
         self.adapters = adapters
         self.event_publisher = event_publisher
+        self.max_routes_per_symbol = max(1, max_routes_per_symbol)
         self.symbol_debounce_seconds = symbol_debounce_seconds
         self.depth_wait_seconds = depth_wait_seconds
         self.ws_orderbook_max_age_seconds = ws_orderbook_max_age_seconds
@@ -1234,7 +1236,7 @@ class EventDrivenCandidatePipeline:
             exchange: {symbol: row}
             for exchange, row in self.cache.get_symbol_tickers(symbol, max_age_seconds=10).items()
         }
-        for candidate in build_fast_candidates(ticker_data):
+        for candidate in build_fast_candidates(ticker_data)[:self.max_routes_per_symbol]:
             route = candidate_key(candidate)
             with self._lock:
                 if now - self._last_route_at.get(route, 0.0) < self.symbol_debounce_seconds:
@@ -1797,6 +1799,12 @@ def parse_args() -> argparse.Namespace:
         help="Validate fresh websocket ticker candidates from cache without waiting for the scan cycle",
     )
     parser.add_argument("--event-driven-candidate-workers", type=int, default=EVENT_DRIVEN_CANDIDATE_WORKERS)
+    parser.add_argument(
+        "--event-driven-max-routes-per-symbol",
+        type=int,
+        default=2,
+        help="Maximum best cross-exchange routes queued for one ticker update.",
+    )
     parser.add_argument("--event-driven-symbol-debounce-seconds", type=float, default=EVENT_DRIVEN_SYMBOL_DEBOUNCE_SECONDS)
     parser.add_argument("--event-driven-depth-wait-seconds", type=float, default=EVENT_DRIVEN_DEPTH_WAIT_SECONDS)
     return parser.parse_args()
@@ -1911,6 +1919,7 @@ def main():
                 adapters=adapters,
                 event_publisher=event_publisher,
                 worker_count=args.event_driven_candidate_workers,
+                max_routes_per_symbol=args.event_driven_max_routes_per_symbol,
                 symbol_debounce_seconds=args.event_driven_symbol_debounce_seconds,
                 depth_wait_seconds=args.event_driven_depth_wait_seconds,
                 ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,

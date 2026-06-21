@@ -162,6 +162,7 @@ def test_event_candidate_queue_uses_sequence_tie_breaker():
         adapters={},
         event_publisher=None,
         worker_count=1,
+        max_routes_per_symbol=2,
         symbol_debounce_seconds=0,
         depth_wait_seconds=0,
         ws_orderbook_max_age_seconds=10,
@@ -175,6 +176,7 @@ def test_event_candidate_queue_uses_sequence_tie_breaker():
     second = pipeline._queue.get_nowait()
     assert first[0] == second[0]
     assert first[1] != second[1]
+    assert pipeline._queue.empty()
 
 
 def test_replace_depth_targets_removes_stale_targets():
