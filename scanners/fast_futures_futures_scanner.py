@@ -1236,7 +1236,14 @@ class EventDrivenCandidatePipeline:
             exchange: {symbol: row}
             for exchange, row in self.cache.get_symbol_tickers(symbol, max_age_seconds=10).items()
         }
-        for candidate in build_fast_candidates(ticker_data)[:self.max_routes_per_symbol]:
+        candidates = build_fast_candidates(ticker_data)
+        if DEEP_VALIDATE_CRYPTO_ONLY:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.get("instrument_class") == "crypto"
+            ]
+        for candidate in candidates[:self.max_routes_per_symbol]:
             route = candidate_key(candidate)
             with self._lock:
                 if now - self._last_route_at.get(route, 0.0) < self.symbol_debounce_seconds:

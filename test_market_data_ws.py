@@ -178,6 +178,19 @@ def test_event_candidate_queue_uses_sequence_tie_breaker():
     assert first[1] != second[1]
     assert pipeline._queue.empty()
 
+    for exchange, bid, ask in [("binance", 99.0, 100.0), ("bitget", 101.0, 102.0)]:
+        cache.update_ticker(CachedTicker(
+            exchange=exchange,
+            symbol="MSTRUSDT",
+            bid=bid,
+            ask=ask,
+            volume_usdt=1_000_000.0,
+            observed_at_utc=now,
+            source="websocket",
+        ))
+    pipeline._on_cache_update("ticker", SimpleNamespace(symbol="MSTRUSDT"))
+    assert pipeline._queue.empty()
+
 
 def test_replace_depth_targets_removes_stale_targets():
     cache = MarketDataCache()
