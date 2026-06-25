@@ -108,20 +108,6 @@ def choose_best_entry_rows(
             if round_trip_rows:
                 preferred_rows = round_trip_rows
 
-        entry_notional_target = min(
-            config.initial_entry_slice_notional_usd,
-            config.max_slice_notional_usd,
-        )
-        closest_tier_distance = min(
-            abs(row.notional_usdt - entry_notional_target)
-            for row in preferred_rows
-        )
-        preferred_rows = [
-            row
-            for row in preferred_rows
-            if abs(row.notional_usdt - entry_notional_target) == closest_tier_distance
-        ]
-
         best = max(
             preferred_rows,
             key=lambda item: (
@@ -130,9 +116,9 @@ def choose_best_entry_rows(
                 item.route_spread_percentile if item.route_spread_percentile is not None else -999,
                 item.route_spread_zscore if item.route_spread_zscore is not None else -999,
                 item.net_edge_inc_funding_pct if item.net_edge_inc_funding_pct is not None else -999,
-                -abs(config.max_slice_notional_usd - item.notional_usdt)
+                item.notional_usdt
                 if item.notional_usdt <= config.max_slice_notional_usd
-                else -999_999 - item.notional_usdt,
+                else -999_999,
             ),
         )
         selected.append(best)
@@ -296,6 +282,10 @@ def decision_optimisation_context(
         "config_min_take_profit_pct": config.min_take_profit_pct,
         "config_take_profit_edge_fraction": config.take_profit_edge_fraction,
         "config_max_take_profit_pct": config.max_take_profit_pct,
+        "config_adaptive_entry_sizing_enabled": config.adaptive_entry_sizing_enabled,
+        "config_adaptive_scale_min_route_spread_percentile": config.adaptive_scale_min_route_spread_percentile,
+        "config_adaptive_scale_min_route_spread_zscore": config.adaptive_scale_min_route_spread_zscore,
+        "config_adaptive_scale_min_net_edge_inc_funding_pct": config.adaptive_scale_min_net_edge_inc_funding_pct,
     }
     if opportunity is None:
         return context

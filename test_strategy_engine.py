@@ -305,6 +305,67 @@ def test_entry_normal_and_funding_capture_modes():
     assert spread_first_decision.reason == "validated_spread_below_threshold"
 
 
+def test_adaptive_entry_sizing_keeps_new_route_small():
+    now = datetime.now(timezone.utc)
+    opportunity = make_opportunity(
+        timestamp_utc=now,
+        notional_usdt=2_500.0,
+        validated_spread_pct=1.0,
+        net_edge_ex_funding_pct=0.8,
+        net_edge_inc_funding_pct=0.8,
+        route_spread_percentile=0.95,
+        route_spread_zscore=2.0,
+    )
+
+    decision = evaluate_entry(opportunity, {}, StrategyConfig(max_symbol_notional_usd=5_000.0), now=now)
+
+    assert decision.should_enter is True
+    assert decision.desired_notional_usd == 100.0
+
+
+def test_adaptive_entry_sizing_scales_existing_profitable_route():
+    now = datetime.now(timezone.utc)
+    position = make_position(estimated_net_pnl=1.0)
+    opportunity = make_opportunity(
+        timestamp_utc=now,
+        notional_usdt=2_500.0,
+        validated_spread_pct=1.0,
+        net_edge_ex_funding_pct=0.8,
+        net_edge_inc_funding_pct=0.8,
+        route_spread_percentile=0.95,
+        route_spread_zscore=2.0,
+    )
+
+    decision = evaluate_entry(
+        opportunity,
+        {position.position_id: position},
+        StrategyConfig(max_symbol_notional_usd=5_000.0),
+        now=now,
+    )
+
+    assert decision.should_enter is True
+    assert decision.desired_notional_usd == 2_500.0
+
+
+def test_adaptive_entry_sizing_falls_back_to_smaller_risk_allowed_tier():
+    now = datetime.now(timezone.utc)
+    position = make_position(total_notional_usd=2_400.0, estimated_net_pnl=24.0)
+    opportunity = make_opportunity(
+        timestamp_utc=now,
+        notional_usdt=2_500.0,
+        validated_spread_pct=1.0,
+        net_edge_ex_funding_pct=0.8,
+        net_edge_inc_funding_pct=0.8,
+        route_spread_percentile=0.95,
+        route_spread_zscore=2.0,
+    )
+
+    decision = evaluate_entry(opportunity, {position.position_id: position}, StrategyConfig(), now=now)
+
+    assert decision.should_enter is True
+    assert decision.desired_notional_usd == 100.0
+
+
 def test_normal_entry_too_close_to_funding_rejected_without_benefit():
     now = datetime.now(timezone.utc)
     opportunity = make_opportunity(
@@ -424,7 +485,10 @@ def test_funding_capture_cannot_bypass_safety():
         "long_next_funding_time_utc": now + timedelta(minutes=30),
         "short_next_funding_time_utc": now + timedelta(minutes=30),
     }
-    assert evaluate_entry(make_opportunity(**funding_fields, paper_ready=False), {}, config, now=now).reason == "paper_ready_false"
+    assert (
+        evaluate_entry(make_opportunity(**funding_fields, paper_ready=False), {}, config, now=now).reason
+        == "scanner_paper_ready_false"
+    )
     assert evaluate_entry(make_opportunity(**funding_fields, persistence_count=1), {}, config, now=now).reason == "persistence_below_threshold"
     assert evaluate_entry(
         make_opportunity(**funding_fields, instrument_class="tokenised_stock_or_synthetic"),
@@ -1138,6 +1202,9 @@ if __name__ == "__main__":
     test_daily_risk_state_from_fills()
     test_funding_capture_ready_window()
     test_entry_normal_and_funding_capture_modes()
+    test_adaptive_entry_sizing_keeps_new_route_small()
+    test_adaptive_entry_sizing_scales_existing_profitable_route()
+    test_adaptive_entry_sizing_falls_back_to_smaller_risk_allowed_tier()
     test_normal_entry_too_close_to_funding_rejected_without_benefit()
     test_normal_entry_near_funding_allowed_when_favourable()
     test_route_spread_quality_required_for_default_entry()

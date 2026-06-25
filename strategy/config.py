@@ -43,6 +43,22 @@ class StrategyConfig:
     # Open new routes in small, independently validated slices. Scaling remains
     # subject to the same entry and risk rules on later scans.
     initial_entry_slice_notional_usd: float = 100.0
+    adaptive_entry_sizing_enabled: bool = True
+    entry_slice_ladder_usd: tuple[float, ...] = (
+        100.0,
+        200.0,
+        300.0,
+        400.0,
+        500.0,
+        1_000.0,
+        2_500.0,
+    )
+    adaptive_scale_requires_existing_profit: bool = True
+    adaptive_scale_min_route_spread_percentile: float = 0.75
+    adaptive_scale_min_route_spread_zscore: float = 0.75
+    adaptive_scale_min_validated_spread_pct: float = 0.60
+    adaptive_scale_min_net_spread_ex_funding_pct: float = 0.35
+    adaptive_scale_min_net_edge_inc_funding_pct: float = 0.50
     require_entry_round_trip_fillable: bool = True
     entry_round_trip_notional_usd: float = 100.0
 

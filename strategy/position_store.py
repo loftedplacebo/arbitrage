@@ -95,6 +95,10 @@ DECISION_FIELDS = [
     "config_min_take_profit_pct",
     "config_take_profit_edge_fraction",
     "config_max_take_profit_pct",
+    "config_adaptive_entry_sizing_enabled",
+    "config_adaptive_scale_min_route_spread_percentile",
+    "config_adaptive_scale_min_route_spread_zscore",
+    "config_adaptive_scale_min_net_edge_inc_funding_pct",
 ]
 
 FILL_FIELDS = [
@@ -215,6 +219,10 @@ class CsvPositionStore:
         config_min_take_profit_pct: float | None = None,
         config_take_profit_edge_fraction: float | None = None,
         config_max_take_profit_pct: float | None = None,
+        config_adaptive_entry_sizing_enabled: bool | None = None,
+        config_adaptive_scale_min_route_spread_percentile: float | None = None,
+        config_adaptive_scale_min_route_spread_zscore: float | None = None,
+        config_adaptive_scale_min_net_edge_inc_funding_pct: float | None = None,
     ) -> None:
         def optional_float(value: float | None) -> str:
             return "" if value is None else f"{value:.8f}"
@@ -270,6 +278,18 @@ class CsvPositionStore:
                 "config_min_take_profit_pct": optional_float(config_min_take_profit_pct),
                 "config_take_profit_edge_fraction": optional_float(config_take_profit_edge_fraction),
                 "config_max_take_profit_pct": optional_float(config_max_take_profit_pct),
+                "config_adaptive_entry_sizing_enabled": (
+                    "" if config_adaptive_entry_sizing_enabled is None else str(config_adaptive_entry_sizing_enabled)
+                ),
+                "config_adaptive_scale_min_route_spread_percentile": optional_float(
+                    config_adaptive_scale_min_route_spread_percentile
+                ),
+                "config_adaptive_scale_min_route_spread_zscore": optional_float(
+                    config_adaptive_scale_min_route_spread_zscore
+                ),
+                "config_adaptive_scale_min_net_edge_inc_funding_pct": optional_float(
+                    config_adaptive_scale_min_net_edge_inc_funding_pct
+                ),
             },
         )
 

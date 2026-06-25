@@ -158,6 +158,17 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Max open positions: {config.max_open_positions}")
     print(f"  Max slice notional: ${config.max_slice_notional_usd:,.2f}")
     print(f"  Initial entry slice notional: ${config.initial_entry_slice_notional_usd:,.2f}")
+    print(f"  Adaptive entry sizing enabled: {config.adaptive_entry_sizing_enabled}")
+    print(
+        "  Entry slice ladder: $"
+        + ", $".join(f"{tier:,.0f}" for tier in config.entry_slice_ladder_usd)
+    )
+    print(
+        "  Adaptive scale thresholds: "
+        f"route pctile>={config.adaptive_scale_min_route_spread_percentile:g}, "
+        f"z>={config.adaptive_scale_min_route_spread_zscore:g}, "
+        f"net edge>={config.adaptive_scale_min_net_edge_inc_funding_pct:g}%"
+    )
     print(
         "  Require round-trip liquidity at: "
         f"${config.entry_round_trip_notional_usd:,.2f} "

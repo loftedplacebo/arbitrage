@@ -107,6 +107,112 @@ def round_trip_entry_liquidity_decision(
     return True, "round_trip_entry_liquidity_ok"
 
 
+def scanner_paper_readiness_decision(
+    opportunity: ValidatedOpportunity,
+    config: StrategyConfig,
+) -> tuple[bool, str]:
+    if not config.require_paper_ready:
+        return True, "paper_ready_not_required"
+
+    if opportunity.paper_ready:
+        return True, "paper_ready_ok"
+
+    if opportunity.instrument_class != config.approved_instrument_class:
+        return False, "scanner_ready_instrument_rejected"
+
+    if not opportunity.long_fillable or not opportunity.short_fillable:
+        return False, "scanner_ready_entry_not_fillable"
+
+    if not opportunity.persistent:
+        return False, "scanner_ready_not_persistent"
+
+    if not opportunity.spread_ready:
+        return False, "scanner_ready_spread_not_ready"
+
+    if not opportunity.funding_adjusted_ready:
+        return False, "scanner_ready_funding_adjusted_not_ready"
+
+    return False, "scanner_paper_ready_false"
+
+
+def adaptive_scale_quality_ok(
+    opportunity: ValidatedOpportunity,
+    existing: Position | None,
+    config: StrategyConfig,
+) -> bool:
+    if not config.adaptive_entry_sizing_enabled:
+        return False
+
+    if existing is None or existing.total_notional_usd <= 0:
+        return False
+
+    if config.adaptive_scale_requires_existing_profit:
+        existing_pnl_pct = (existing.estimated_net_pnl / existing.total_notional_usd) * 100
+        if existing_pnl_pct < 0:
+            return False
+
+    if (
+        opportunity.route_spread_percentile is None
+        or opportunity.route_spread_percentile < config.adaptive_scale_min_route_spread_percentile
+    ):
+        return False
+
+    if (
+        opportunity.route_spread_zscore is None
+        or opportunity.route_spread_zscore < config.adaptive_scale_min_route_spread_zscore
+    ):
+        return False
+
+    if (
+        opportunity.validated_spread_pct is None
+        or opportunity.validated_spread_pct < config.adaptive_scale_min_validated_spread_pct
+    ):
+        return False
+
+    if (
+        opportunity.net_edge_ex_funding_pct is None
+        or opportunity.net_edge_ex_funding_pct < config.adaptive_scale_min_net_spread_ex_funding_pct
+    ):
+        return False
+
+    if (
+        opportunity.net_edge_inc_funding_pct is None
+        or opportunity.net_edge_inc_funding_pct < config.adaptive_scale_min_net_edge_inc_funding_pct
+    ):
+        return False
+
+    return True
+
+
+def entry_notional_candidates(
+    opportunity: ValidatedOpportunity,
+    open_positions: dict[str, Position],
+    config: StrategyConfig,
+) -> list[float]:
+    base_notional = min(
+        config.initial_entry_slice_notional_usd,
+        config.max_slice_notional_usd,
+        opportunity.notional_usdt,
+    )
+    existing = open_positions.get(opportunity.position_key)
+    if not adaptive_scale_quality_ok(opportunity, existing, config):
+        return [base_notional]
+
+    max_validated = min(config.max_slice_notional_usd, opportunity.notional_usdt)
+    ladder = sorted(
+        {
+            tier
+            for tier in config.entry_slice_ladder_usd
+            if config.min_validated_notional_usd <= tier <= max_validated
+        },
+        reverse=True,
+    )
+    if base_notional not in ladder and base_notional > 0:
+        ladder.append(base_notional)
+
+    return sorted(set(ladder), reverse=True) or [base_notional]
+
+
 def evaluate_entry(
     opportunity: ValidatedOpportunity,
     open_positions: dict[str, Position],
@@ -127,9 +233,6 @@ def evaluate_entry(
     if opportunity.instrument_class != config.approved_instrument_class:
         return EntryDecision(False, "instrument_class_rejected", opportunity.opportunity_key)
 
-    if config.require_paper_ready and not opportunity.paper_ready:
-        return EntryDecision(False, "paper_ready_false", opportunity.opportunity_key)
-
     if not opportunity.long_fillable or not opportunity.short_fillable:
         return EntryDecision(False, "not_fillable", opportunity.opportunity_key)
 
@@ -139,6 +242,10 @@ def evaluate_entry(
     round_trip_ok, round_trip_reason = round_trip_entry_liquidity_decision(opportunity, config)
     if not round_trip_ok:
         return EntryDecision(False, round_trip_reason, opportunity.opportunity_key)
+
+    paper_ready_ok, paper_ready_reason = scanner_paper_readiness_decision(opportunity, config)
+    if not paper_ready_ok:
+        return EntryDecision(False, paper_ready_reason, opportunity.opportunity_key)
 
     if opportunity.validated_spread_pct is None:
         return EntryDecision(False, "missing_validated_spread", opportunity.opportunity_key)
@@ -218,24 +325,24 @@ def evaluate_entry(
             return EntryDecision(False, "net_edge_inc_funding_below_threshold", opportunity.opportunity_key)
         return EntryDecision(False, "edge_thresholds_not_met", opportunity.opportunity_key)
 
-    desired_notional = min(
-        config.initial_entry_slice_notional_usd,
-        config.max_slice_notional_usd,
-        opportunity.notional_usdt,
-    )
-    risk = evaluate_entry_risk(
-        opportunity=opportunity,
-        open_positions=open_positions,
-        config=config,
-        desired_notional_usd=desired_notional,
-        daily_entry_count=daily_entry_count,
-        daily_realised_pnl_usd=daily_realised_pnl_usd,
-        consecutive_losses=consecutive_losses,
-    )
-    if not risk.allowed:
-        return EntryDecision(False, risk.reason, opportunity.opportunity_key, desired_notional)
-
     reason = "spread_entry_funding_bonus_ok" if normal_edge_ok and funding_capture_ready else "spread_entry_ok"
     if funding_capture_edge_ok:
         reason = "funding_capture_entry_ok"
-    return EntryDecision(True, reason, opportunity.opportunity_key, desired_notional)
+
+    candidates = entry_notional_candidates(opportunity, open_positions, config)
+    last_risk_reason = "risk_blocked"
+    for desired_notional in candidates:
+        risk = evaluate_entry_risk(
+            opportunity=opportunity,
+            open_positions=open_positions,
+            config=config,
+            desired_notional_usd=desired_notional,
+            daily_entry_count=daily_entry_count,
+            daily_realised_pnl_usd=daily_realised_pnl_usd,
+            consecutive_losses=consecutive_losses,
+        )
+        if risk.allowed:
+            return EntryDecision(True, reason, opportunity.opportunity_key, desired_notional)
+        last_risk_reason = risk.reason
+
+    return EntryDecision(False, last_risk_reason, opportunity.opportunity_key, candidates[0])
