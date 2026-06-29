@@ -17,10 +17,12 @@ from market_data.scanner_integration import (
     get_ticker_data_with_cache,
     wait_for_candidate_orderbooks,
 )
+from market_data.ws_service import WebsocketMarketDataService
 from scanners.fast_futures_futures_scanner import (
     EventDrivenCandidatePipeline,
     build_depth_warm_candidates,
     build_fast_candidates,
+    calculate_hot_route_score,
     deep_validate_candidate,
     select_deep_candidates,
 )
@@ -162,6 +164,7 @@ def test_event_candidate_queue_uses_sequence_tie_breaker():
         cache=cache,
         adapters={},
         event_publisher=None,
+        route_spread_history={},
         worker_count=1,
         max_routes_per_symbol=2,
         symbol_debounce_seconds=0,
@@ -175,6 +178,11 @@ def test_event_candidate_queue_uses_sequence_tie_breaker():
         route_queue_cooldown_seconds=0,
         hot_depth_ttl_seconds=30,
         hot_depth_priority=75,
+        rest_fallback_enabled=False,
+        rest_fallback_timeout_seconds=1,
+        rest_fallback_min_fast_spread_pct=0.2,
+        rest_fallback_min_hot_route_score=4,
+        rest_fallback_max_per_minute=0,
     )
 
     pipeline._on_cache_update("ticker", SimpleNamespace(symbol="BTCUSDT"))
@@ -182,7 +190,8 @@ def test_event_candidate_queue_uses_sequence_tie_breaker():
     first = pipeline._queue.get_nowait()
     second = pipeline._queue.get_nowait()
     assert first[0] == second[0]
-    assert first[1] != second[1]
+    assert first[1] == second[1]
+    assert first[2] != second[2]
     assert pipeline._queue.empty()
 
     for exchange, bid, ask in [("binance", 99.0, 100.0), ("bitget", 101.0, 102.0)]:
@@ -234,6 +243,79 @@ def test_streaming_route_tracker_confirms_by_updates_or_age():
     )
     assert item is not None
     assert item.confirmed(now_monotonic=200.6, min_updates=2, min_age_seconds=0.5)
+
+
+def test_hot_route_score_prefers_persistent_depth_ready_routes():
+    cache = MarketDataCache()
+    now = datetime.now(timezone.utc)
+    candidate = {
+        "symbol": "BTCUSDT",
+        "long_exchange": "binance",
+        "short_exchange": "bitget",
+        "direction": "long_binance_short_bitget",
+        "fast_spread_pct": 0.3,
+        "combined_volume_usdt": 25_000_000,
+        "stream_update_count": 3,
+        "stream_persistence_seconds": 1.0,
+        "route_spread_percentile": 0.9,
+        "route_spread_zscore": 1.5,
+    }
+    cold_score, _ = calculate_hot_route_score(candidate, market_data_cache=cache)
+
+    cache.update_orderbook(OrderBook(
+        exchange="binance",
+        market_type="futures",
+        standard_symbol="BTCUSDT",
+        exchange_symbol="BTCUSDT",
+        bids=[OrderBookLevel(price=99.0, quantity=1.0)],
+        asks=[OrderBookLevel(price=100.0, quantity=1.0)],
+        observed_at_utc=now,
+    ))
+    cache.update_orderbook(OrderBook(
+        exchange="bitget",
+        market_type="futures",
+        standard_symbol="BTCUSDT",
+        exchange_symbol="BTCUSDT",
+        bids=[OrderBookLevel(price=101.0, quantity=1.0)],
+        asks=[OrderBookLevel(price=102.0, quantity=1.0)],
+        observed_at_utc=now,
+    ))
+    warm_score, reason = calculate_hot_route_score(candidate, market_data_cache=cache)
+
+    assert warm_score > cold_score
+    assert "depth=1.50" in reason
+
+
+def test_dynamic_depth_subscription_messages_are_exchange_specific():
+    service = WebsocketMarketDataService(adapters={}, cache=MarketDataCache())
+
+    binance_sub = service._binance_depth_subscribe_messages(["BTCUSDT"])
+    assert binance_sub[0]["method"] == "SUBSCRIBE"
+    assert binance_sub[0]["params"] == ["btcusdt@depth20@500ms"]
+    assert service._binance_depth_unsubscribe_messages(["BTCUSDT"])[0]["method"] == "UNSUBSCRIBE"
+
+    bitget_sub = service._bitget_depth_subscribe_messages(["BTCUSDT"])
+    assert bitget_sub[0]["op"] == "subscribe"
+    assert bitget_sub[0]["args"][0]["channel"] == "books15"
+    assert service._bitget_depth_unsubscribe_messages(["BTCUSDT"])[0]["op"] == "unsubscribe"
+
+    mexc_sub = service._mexc_depth_subscribe_messages(["BTCUSDT"])
+    assert mexc_sub[0]["method"] == "sub.depth.full"
+    assert mexc_sub[0]["param"]["symbol"] == "BTC_USDT"
+    assert service._mexc_depth_unsubscribe_messages(["BTCUSDT"])[0]["method"] == "unsub.depth.full"
+
+    kucoin_sub = service._kucoin_depth_subscribe_messages(["BTCUSDT"])
+    assert kucoin_sub[0]["type"] == "subscribe"
+    assert "/contractMarket/level2Depth50:" in kucoin_sub[0]["topic"]
+    assert service._kucoin_depth_unsubscribe_messages(["BTCUSDT"])[0]["type"] == "unsubscribe"
+
+    hyperliquid_sub = service._hyperliquid_depth_subscribe_messages(["BTCUSDT"])
+    assert [message["subscription"]["type"] for message in hyperliquid_sub] == [
+        "bbo",
+        "l2Book",
+        "activeAssetCtx",
+    ]
+    assert all(message["method"] == "unsubscribe" for message in service._hyperliquid_depth_unsubscribe_messages(["BTCUSDT"]))
 
 
 def test_replace_depth_targets_removes_stale_targets():
@@ -920,6 +1002,8 @@ if __name__ == "__main__":
     test_local_event_stream_publishes_and_accepts_controls()
     test_event_candidate_queue_uses_sequence_tie_breaker()
     test_streaming_route_tracker_confirms_by_updates_or_age()
+    test_hot_route_score_prefers_persistent_depth_ready_routes()
+    test_dynamic_depth_subscription_messages_are_exchange_specific()
     test_build_depth_targets_from_candidates_limits_and_dedupes()
     test_ticker_data_uses_cache_when_fresh_and_rest_when_cold()
     test_funding_info_cache_avoids_repeated_adapter_calls()

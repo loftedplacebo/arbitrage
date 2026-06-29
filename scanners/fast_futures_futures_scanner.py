@@ -9,7 +9,7 @@ import time
 import statistics
 import threading
 from queue import PriorityQueue, Empty, Full, Queue
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from collections import defaultdict, deque
 from pathlib import Path
 from datetime import datetime, timezone
@@ -76,6 +76,11 @@ EVENT_DRIVEN_ROUTE_QUEUE_COOLDOWN_SECONDS = 0.50
 EVENT_DRIVEN_HOT_DEPTH_TTL_SECONDS = 45.0
 EVENT_DRIVEN_HOT_DEPTH_PRIORITY = 75
 EVENT_DRIVEN_ROUTE_STATE_MAX_ROUTES = 5_000
+EVENT_DRIVEN_REST_FALLBACK_ENABLED = True
+EVENT_DRIVEN_REST_FALLBACK_TIMEOUT_SECONDS = 2.0
+EVENT_DRIVEN_REST_FALLBACK_MIN_FAST_SPREAD_PCT = 0.20
+EVENT_DRIVEN_REST_FALLBACK_MIN_HOT_ROUTE_SCORE = 4.0
+EVENT_DRIVEN_REST_FALLBACK_MAX_PER_MINUTE = 20
 NOTIONALS_USDT = [100, 200, 300, 400, 500, 1_000, 2_500]
 CANDIDATE_WATCHLIST_ENABLED = True
 CANDIDATE_WATCHLIST_TTL_SECONDS = 900
@@ -282,11 +287,104 @@ def update_route_spread_history(rows: list[dict], route_spread_history: dict[str
         ).append(float(spread))
 
 
+def clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def calculate_hot_route_score(
+    candidate: dict,
+    *,
+    market_data_cache: MarketDataCache | None = None,
+    orderbook_max_age_seconds: float = 5.0,
+) -> tuple[float, str]:
+    """
+    Score how aggressively the scanner should spend depth/validation resources.
+
+    This is deliberately lightweight: it uses already-known ticker, route-stat,
+    stream-persistence and cache-readiness features so it can run inside the
+    ticker callback without turning into a bottleneck.
+    """
+    try:
+        spread = max(0.0, float(candidate.get("fast_spread_pct") or 0.0))
+    except (TypeError, ValueError):
+        spread = 0.0
+
+    try:
+        volume = max(0.0, float(candidate.get("combined_volume_usdt") or 0.0))
+    except (TypeError, ValueError):
+        volume = 0.0
+
+    percentile = candidate.get("route_spread_percentile")
+    percentile_score = float(percentile) if percentile is not None else 0.5
+    percentile_score = clamp(percentile_score, 0.0, 1.0)
+
+    zscore = candidate.get("route_spread_zscore")
+    zscore_score = clamp(float(zscore), -1.0, 4.0) if zscore is not None else 0.0
+    zscore_score = max(0.0, zscore_score)
+
+    stream_updates = candidate.get("stream_update_count") or 0
+    stream_seconds = candidate.get("stream_persistence_seconds") or 0.0
+    try:
+        stream_score = min(1.0, float(stream_updates) / 5.0) + min(1.0, float(stream_seconds) / 2.0)
+    except (TypeError, ValueError):
+        stream_score = 0.0
+
+    volume_score = clamp((volume / 25_000_000) ** 0.5, 0.0, 2.0) if volume else 0.0
+
+    depth_bonus = 0.0
+    if market_data_cache is not None:
+        long_book = get_cached_orderbook(
+            cache=market_data_cache,
+            exchange=str(candidate.get("long_exchange", "")),
+            symbol=str(candidate.get("symbol", "")),
+            max_age_seconds=orderbook_max_age_seconds,
+        )
+        short_book = get_cached_orderbook(
+            cache=market_data_cache,
+            exchange=str(candidate.get("short_exchange", "")),
+            symbol=str(candidate.get("symbol", "")),
+            max_age_seconds=orderbook_max_age_seconds,
+        )
+        depth_bonus = (0.75 if long_book is not None else 0.0) + (0.75 if short_book is not None else 0.0)
+
+    score = (
+        spread * 10.0
+        + percentile_score * 1.5
+        + zscore_score * 0.75
+        + volume_score
+        + stream_score
+        + depth_bonus
+    )
+    reason = (
+        f"spread={spread:.4f};pctile={percentile_score:.2f};z={zscore_score:.2f};"
+        f"stream={stream_score:.2f};volume={volume_score:.2f};depth={depth_bonus:.2f}"
+    )
+    return score, reason
+
+
+def annotate_hot_route_scores(
+    candidates: list[dict],
+    *,
+    market_data_cache: MarketDataCache | None = None,
+    orderbook_max_age_seconds: float = 5.0,
+) -> list[dict]:
+    for candidate in candidates:
+        score, reason = calculate_hot_route_score(
+            candidate,
+            market_data_cache=market_data_cache,
+            orderbook_max_age_seconds=orderbook_max_age_seconds,
+        )
+        candidate["hot_route_score"] = score
+        candidate["hot_route_score_reason"] = reason
+    return candidates
+
+
 def deep_candidate_sort_key(candidate: dict, watchlist: CandidateWatchlist | None = None) -> tuple:
     metadata = watchlist.metadata_for(candidate) if watchlist is not None else {}
     return (
         metadata.get("watchlist_priority_bonus") or 0.0,
         metadata.get("watchlist_seen_count") or 0,
+        candidate.get("hot_route_score") if candidate.get("hot_route_score") is not None else -999,
         candidate.get("fast_spread_pct") if candidate.get("fast_spread_pct") is not None else -999,
         candidate.get("route_spread_percentile") if candidate.get("route_spread_percentile") is not None else -999,
         candidate.get("route_spread_zscore") if candidate.get("route_spread_zscore") is not None else -999,
@@ -741,6 +839,7 @@ def deep_validate_candidate(
     funding_cache_seconds: float = 60.0,
     max_cross_venue_book_skew_seconds: float = MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
     require_cached_orderbooks: bool = False,
+    force_rest_orderbooks: bool = False,
 ) -> list[dict]:
     """
     Deep-validate one fast candidate using real order books and funding.
@@ -762,7 +861,7 @@ def deep_validate_candidate(
     results = []
 
     validation_started = time.monotonic()
-    long_orderbook = get_cached_orderbook(
+    long_orderbook = None if force_rest_orderbooks else get_cached_orderbook(
         cache=market_data_cache,
         exchange=long_exchange,
         symbol=symbol,
@@ -772,7 +871,7 @@ def deep_validate_candidate(
     if require_cached_orderbooks and long_orderbook is None:
         raise ValueError("cached_long_orderbook_unavailable")
     long_orderbook = long_orderbook or long_adapter.get_futures_orderbook(symbol, limit=100)
-    short_orderbook = get_cached_orderbook(
+    short_orderbook = None if force_rest_orderbooks else get_cached_orderbook(
         cache=market_data_cache,
         exchange=short_exchange,
         symbol=symbol,
@@ -866,6 +965,10 @@ def deep_validate_candidate(
             "short_orderbook_source": short_book_source,
             "cross_venue_book_skew_ms": book_skew_seconds * 1000,
             "deep_validation_latency_ms": (time.monotonic() - validation_started) * 1000,
+            "depth_validation_mode": candidate.get("depth_validation_mode"),
+            "rest_fallback_reason": candidate.get("rest_fallback_reason"),
+            "hot_route_score": candidate.get("hot_route_score"),
+            "hot_route_score_reason": candidate.get("hot_route_score_reason"),
             "stream_first_seen_utc": candidate.get("stream_first_seen_utc"),
             "stream_last_seen_utc": candidate.get("stream_last_seen_utc"),
             "stream_update_count": candidate.get("stream_update_count"),
@@ -1213,6 +1316,10 @@ def _write_validated_results_to_csv(results: list[dict], timestamp: datetime) ->
         "short_orderbook_source",
         "cross_venue_book_skew_ms",
         "deep_validation_latency_ms",
+        "depth_validation_mode",
+        "rest_fallback_reason",
+        "hot_route_score",
+        "hot_route_score_reason",
         "stream_first_seen_utc",
         "stream_last_seen_utc",
         "stream_update_count",
@@ -1290,8 +1397,11 @@ class LifecycleEventLogger:
         "stream_update_count",
         "stream_persistence_seconds",
         "stream_best_spread_pct",
+        "hot_route_score",
         "confirmed",
         "depth_ready",
+        "depth_validation_mode",
+        "rest_fallback_reason",
         "validated_rows",
         "paper_ready_rows",
         "queue_depth",
@@ -1370,8 +1480,11 @@ class LifecycleEventLogger:
             "stream_update_count": candidate.get("stream_update_count"),
             "stream_persistence_seconds": candidate.get("stream_persistence_seconds"),
             "stream_best_spread_pct": candidate.get("stream_best_spread_pct"),
+            "hot_route_score": candidate.get("hot_route_score"),
             "confirmed": confirmed,
             "depth_ready": depth_ready,
+            "depth_validation_mode": candidate.get("depth_validation_mode"),
+            "rest_fallback_reason": candidate.get("rest_fallback_reason"),
             "validated_rows": validated_rows,
             "paper_ready_rows": paper_ready_rows,
             "queue_depth": queue_depth,
@@ -1408,6 +1521,13 @@ class LifecycleEventLogger:
         for date_key, date_rows in grouped.items():
             output_file = ML_LIFECYCLE_OUTPUT_DIR / f"spread_lifecycle_events_{date_key}.csv"
             file_exists = output_file.exists()
+            if file_exists:
+                with output_file.open("r", newline="", encoding="utf-8") as handle:
+                    existing_header = next(csv.reader(handle), [])
+                if existing_header != self.fieldnames:
+                    suffix = utc_now().strftime("%H%M%S")
+                    output_file = ML_LIFECYCLE_OUTPUT_DIR / f"spread_lifecycle_events_{date_key}_{suffix}.csv"
+                    file_exists = output_file.exists()
             with output_file.open("a", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
                 if not file_exists:
@@ -1425,6 +1545,7 @@ class EventDrivenCandidatePipeline:
         cache: MarketDataCache,
         adapters: dict,
         event_publisher: LocalEventPublisher | None,
+        route_spread_history: dict[str, deque] | None,
         worker_count: int,
         max_routes_per_symbol: int,
         symbol_debounce_seconds: float,
@@ -1438,11 +1559,17 @@ class EventDrivenCandidatePipeline:
         route_queue_cooldown_seconds: float,
         hot_depth_ttl_seconds: float,
         hot_depth_priority: int,
+        rest_fallback_enabled: bool,
+        rest_fallback_timeout_seconds: float,
+        rest_fallback_min_fast_spread_pct: float,
+        rest_fallback_min_hot_route_score: float,
+        rest_fallback_max_per_minute: int,
         lifecycle_logger: LifecycleEventLogger | None = None,
     ):
         self.cache = cache
         self.adapters = adapters
         self.event_publisher = event_publisher
+        self.route_spread_history = route_spread_history
         self.max_routes_per_symbol = max(1, max_routes_per_symbol)
         self.symbol_debounce_seconds = symbol_debounce_seconds
         self.depth_wait_seconds = depth_wait_seconds
@@ -1454,12 +1581,19 @@ class EventDrivenCandidatePipeline:
         self.route_queue_cooldown_seconds = max(0.0, route_queue_cooldown_seconds)
         self.hot_depth_ttl_seconds = max(1.0, hot_depth_ttl_seconds)
         self.hot_depth_priority = hot_depth_priority
+        self.rest_fallback_enabled = rest_fallback_enabled
+        self.rest_fallback_timeout_seconds = max(0.1, rest_fallback_timeout_seconds)
+        self.rest_fallback_min_fast_spread_pct = rest_fallback_min_fast_spread_pct
+        self.rest_fallback_min_hot_route_score = rest_fallback_min_hot_route_score
+        self.rest_fallback_max_per_minute = max(0, rest_fallback_max_per_minute)
         self.lifecycle_logger = lifecycle_logger
+        self._rest_fallback_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rest-depth-fallback")
         self._queue: PriorityQueue = PriorityQueue(maxsize=10_000)
         self._queue_sequence = itertools.count()
         self._stop = threading.Event()
         self._last_symbol_at: dict[str, float] = {}
         self._last_route_at: dict[str, float] = {}
+        self._rest_fallback_at: deque = deque()
         self._queued_routes: set[str] = set()
         self._confirmed_logged_routes: set[str] = set()
         self._detected_logged_routes: set[str] = set()
@@ -1483,6 +1617,7 @@ class EventDrivenCandidatePipeline:
         self._stop.set()
         for thread in self._threads:
             thread.join(timeout=2)
+        self._rest_fallback_executor.shutdown(wait=False, cancel_futures=True)
 
     def _on_cache_update(self, event_type: str, value: object) -> None:
         if event_type != "ticker":
@@ -1505,16 +1640,12 @@ class EventDrivenCandidatePipeline:
                 for candidate in candidates
                 if candidate.get("instrument_class") == "crypto"
             ]
-        hot_depth_targets: set[tuple[str, str]] = set()
-        max_logged_routes = EVENT_DRIVEN_ROUTE_STATE_MAX_ROUTES * 2
+        if self.route_spread_history is not None:
+            candidates = annotate_route_stats(candidates, self.route_spread_history)
 
-        for candidate in candidates[:self.max_routes_per_symbol]:
-            route = candidate_route_key(candidate)
+        enriched_candidates = []
+        for candidate in candidates:
             with self._lock:
-                if len(self._detected_logged_routes) > max_logged_routes:
-                    self._detected_logged_routes.clear()
-                if len(self._confirmed_logged_routes) > max_logged_routes:
-                    self._confirmed_logged_routes.clear()
                 state = self._route_tracker.update(
                     candidate,
                     observed_at_utc=observed_at_utc,
@@ -1529,6 +1660,33 @@ class EventDrivenCandidatePipeline:
                     min_age_seconds=self.route_confirm_seconds,
                 )
                 candidate["_stream_first_seen_monotonic"] = state.first_seen_monotonic
+
+            score, reason = calculate_hot_route_score(
+                candidate,
+                market_data_cache=self.cache,
+                orderbook_max_age_seconds=self.ws_orderbook_max_age_seconds,
+            )
+            candidate["hot_route_score"] = score
+            candidate["hot_route_score_reason"] = reason
+            enriched_candidates.append(candidate)
+
+        enriched_candidates.sort(
+            key=lambda candidate: (
+                candidate.get("hot_route_score") or -999,
+                candidate.get("fast_spread_pct") or -999,
+            ),
+            reverse=True,
+        )
+        hot_depth_targets: set[tuple[str, str]] = set()
+        max_logged_routes = EVENT_DRIVEN_ROUTE_STATE_MAX_ROUTES * 2
+
+        for candidate in enriched_candidates[:self.max_routes_per_symbol]:
+            route = candidate_route_key(candidate)
+            with self._lock:
+                if len(self._detected_logged_routes) > max_logged_routes:
+                    self._detected_logged_routes.clear()
+                if len(self._confirmed_logged_routes) > max_logged_routes:
+                    self._confirmed_logged_routes.clear()
 
                 hot_depth_targets.add((candidate["long_exchange"], candidate["symbol"]))
                 hot_depth_targets.add((candidate["short_exchange"], candidate["symbol"]))
@@ -1567,7 +1725,12 @@ class EventDrivenCandidatePipeline:
 
             try:
                 self._queue.put_nowait(
-                    (-candidate["fast_spread_pct"], next(self._queue_sequence), candidate)
+                    (
+                        -(candidate.get("hot_route_score") or candidate["fast_spread_pct"]),
+                        -candidate["fast_spread_pct"],
+                        next(self._queue_sequence),
+                        candidate,
+                    )
                 )
                 if self.lifecycle_logger is not None:
                     self.lifecycle_logger.log(
@@ -1602,7 +1765,7 @@ class EventDrivenCandidatePipeline:
     def _worker(self) -> None:
         while not self._stop.is_set():
             try:
-                _priority, _sequence, candidate = self._queue.get(timeout=0.2)
+                _priority, _spread_priority, _sequence, candidate = self._queue.get(timeout=0.2)
             except Empty:
                 continue
             route = candidate_route_key(candidate)
@@ -1623,6 +1786,8 @@ class EventDrivenCandidatePipeline:
                     poll_seconds=0.05,
                     max_age_seconds=self.ws_orderbook_max_age_seconds,
                 )
+                timestamp = utc_now()
+                rows = None
                 if not ready:
                     if self.lifecycle_logger is not None:
                         self.lifecycle_logger.log(
@@ -1632,31 +1797,49 @@ class EventDrivenCandidatePipeline:
                             queue_depth=self._queue.qsize(),
                             reason="cached_orderbook_not_ready",
                         )
-                    continue
-                timestamp = utc_now()
-                if self.lifecycle_logger is not None:
-                    self.lifecycle_logger.log(
-                        "depth_ready",
+                    rows = self._validate_with_rest_fallback(
                         candidate=candidate,
                         timestamp=timestamp,
-                        depth_ready=True,
-                        queue_depth=self._queue.qsize(),
-                        latency_ms=(
-                            (time.monotonic() - candidate.get("_stream_first_seen_monotonic")) * 1000
-                            if candidate.get("_stream_first_seen_monotonic") is not None
-                            else None
-                        ),
+                        reason="cached_orderbook_not_ready",
                     )
-                rows = deep_validate_candidate(
-                    candidate=candidate,
-                    adapters=self.adapters,
-                    timestamp=timestamp,
-                    market_data_cache=self.cache,
-                    ws_orderbook_max_age_seconds=self.ws_orderbook_max_age_seconds,
-                    funding_cache_seconds=self.funding_cache_seconds,
-                    max_cross_venue_book_skew_seconds=self.max_book_skew_seconds,
-                    require_cached_orderbooks=True,
-                )
+                    if rows is None:
+                        continue
+                else:
+                    if self.lifecycle_logger is not None:
+                        self.lifecycle_logger.log(
+                            "depth_ready",
+                            candidate=candidate,
+                            timestamp=timestamp,
+                            depth_ready=True,
+                            queue_depth=self._queue.qsize(),
+                            latency_ms=(
+                                (time.monotonic() - candidate.get("_stream_first_seen_monotonic")) * 1000
+                                if candidate.get("_stream_first_seen_monotonic") is not None
+                                else None
+                            ),
+                        )
+                    try:
+                        rows = deep_validate_candidate(
+                            candidate={**candidate, "depth_validation_mode": "websocket"},
+                            adapters=self.adapters,
+                            timestamp=timestamp,
+                            market_data_cache=self.cache,
+                            ws_orderbook_max_age_seconds=self.ws_orderbook_max_age_seconds,
+                            funding_cache_seconds=self.funding_cache_seconds,
+                            max_cross_venue_book_skew_seconds=self.max_book_skew_seconds,
+                            require_cached_orderbooks=True,
+                        )
+                    except ValueError as exc:
+                        reason = str(exc)
+                        if "cross_venue_book_skew" not in reason and "cached_" not in reason:
+                            raise
+                        rows = self._validate_with_rest_fallback(
+                            candidate=candidate,
+                            timestamp=timestamp,
+                            reason=reason,
+                        )
+                        if rows is None:
+                            raise
                 rows = apply_streaming_persistence_and_readiness(
                     rows,
                     min_updates=self.route_confirm_updates,
@@ -1698,6 +1881,110 @@ class EventDrivenCandidatePipeline:
                 with self._lock:
                     self._queued_routes.discard(route)
                 self._queue.task_done()
+
+    def _should_try_rest_fallback(self, candidate: dict) -> bool:
+        if not self.rest_fallback_enabled or self.rest_fallback_max_per_minute <= 0:
+            return False
+
+        try:
+            fast_spread = float(candidate.get("fast_spread_pct") or 0.0)
+        except (TypeError, ValueError):
+            fast_spread = 0.0
+        try:
+            hot_score = float(candidate.get("hot_route_score") or 0.0)
+        except (TypeError, ValueError):
+            hot_score = 0.0
+
+        if (
+            fast_spread < self.rest_fallback_min_fast_spread_pct
+            and hot_score < self.rest_fallback_min_hot_route_score
+        ):
+            return False
+
+        now = time.monotonic()
+        with self._lock:
+            while self._rest_fallback_at and now - self._rest_fallback_at[0] > 60.0:
+                self._rest_fallback_at.popleft()
+            if len(self._rest_fallback_at) >= self.rest_fallback_max_per_minute:
+                return False
+            self._rest_fallback_at.append(now)
+        return True
+
+    def _validate_with_rest_fallback(
+        self,
+        *,
+        candidate: dict,
+        timestamp: datetime,
+        reason: str,
+    ) -> list[dict] | None:
+        if not self._should_try_rest_fallback(candidate):
+            if self.lifecycle_logger is not None:
+                self.lifecycle_logger.log(
+                    "rest_fallback_skipped",
+                    candidate=candidate,
+                    timestamp=timestamp,
+                    reason=reason,
+                    queue_depth=self._queue.qsize(),
+                )
+            return None
+
+        fallback_candidate = {
+            **candidate,
+            "depth_validation_mode": "rest_fallback",
+            "rest_fallback_reason": reason,
+        }
+        started = time.monotonic()
+        future = self._rest_fallback_executor.submit(
+            deep_validate_candidate,
+            fallback_candidate,
+            self.adapters,
+            timestamp,
+            self.cache,
+            self.ws_orderbook_max_age_seconds,
+            self.funding_cache_seconds,
+            self.max_book_skew_seconds,
+            False,
+            True,
+        )
+        try:
+            rows = future.result(timeout=self.rest_fallback_timeout_seconds)
+        except FutureTimeoutError:
+            future.cancel()
+            if self.lifecycle_logger is not None:
+                self.lifecycle_logger.log(
+                    "rest_fallback_timeout",
+                    candidate=fallback_candidate,
+                    timestamp=timestamp,
+                    reason=reason,
+                    queue_depth=self._queue.qsize(),
+                    latency_ms=(time.monotonic() - started) * 1000,
+                )
+            return None
+        except Exception as exc:
+            if self.lifecycle_logger is not None:
+                self.lifecycle_logger.log(
+                    "rest_fallback_error",
+                    candidate=fallback_candidate,
+                    timestamp=timestamp,
+                    reason=str(exc),
+                    queue_depth=self._queue.qsize(),
+                    latency_ms=(time.monotonic() - started) * 1000,
+                )
+            return None
+
+        if self.lifecycle_logger is not None:
+            self.lifecycle_logger.log(
+                "rest_fallback_validated",
+                candidate=fallback_candidate,
+                timestamp=timestamp,
+                depth_ready=True,
+                validated_rows=len(rows),
+                paper_ready_rows=sum(1 for row in rows if row.get("paper_ready")),
+                queue_depth=self._queue.qsize(),
+                reason=reason,
+                latency_ms=(time.monotonic() - started) * 1000,
+            )
+        return rows
 
 
 def write_scan_telemetry_to_csv(row: dict, timestamp: datetime) -> Path:
@@ -1792,6 +2079,11 @@ def run_scan_once(
 
     candidates = build_fast_candidates(ticker_data)
     candidates = annotate_route_stats(candidates, route_spread_history)
+    candidates = annotate_hot_route_scores(
+        candidates,
+        market_data_cache=market_data_cache,
+        orderbook_max_age_seconds=ws_orderbook_max_age_seconds,
+    )
     update_route_spread_history(observations, route_spread_history)
 
     print("\nTop fast spread candidates")
@@ -2128,7 +2420,13 @@ def parse_args() -> argparse.Namespace:
         "--ws-depth-reconnect-seconds",
         type=float,
         default=3.0,
-        help="Seconds between websocket depth subscription rebuilds for changing target sets",
+        help="Legacy fallback depth reconnect seconds; dynamic depth uses target refresh seconds.",
+    )
+    parser.add_argument(
+        "--ws-depth-target-refresh-seconds",
+        type=float,
+        default=0.25,
+        help="Seconds between dynamic websocket depth target diff checks.",
     )
     parser.add_argument(
         "--ws-depth-batch-size",
@@ -2225,6 +2523,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--event-driven-hot-depth-ttl-seconds", type=float, default=EVENT_DRIVEN_HOT_DEPTH_TTL_SECONDS)
     parser.add_argument("--event-driven-hot-depth-priority", type=int, default=EVENT_DRIVEN_HOT_DEPTH_PRIORITY)
+    parser.add_argument("--disable-event-rest-fallback", action="store_true")
+    parser.add_argument("--event-rest-fallback-timeout-seconds", type=float, default=EVENT_DRIVEN_REST_FALLBACK_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--event-rest-fallback-min-fast-spread-pct",
+        type=float,
+        default=EVENT_DRIVEN_REST_FALLBACK_MIN_FAST_SPREAD_PCT,
+    )
+    parser.add_argument(
+        "--event-rest-fallback-min-hot-route-score",
+        type=float,
+        default=EVENT_DRIVEN_REST_FALLBACK_MIN_HOT_ROUTE_SCORE,
+    )
+    parser.add_argument(
+        "--event-rest-fallback-max-per-minute",
+        type=int,
+        default=EVENT_DRIVEN_REST_FALLBACK_MAX_PER_MINUTE,
+    )
     return parser.parse_args()
 
 
@@ -2276,6 +2591,7 @@ def main():
                 enabled_exchanges=enabled_exchanges,
                 ticker_symbol_limit=args.ws_ticker_symbol_limit or None,
                 depth_batch_size=args.ws_depth_batch_size,
+                depth_target_refresh_seconds=args.ws_depth_target_refresh_seconds,
                 depth_reconnect_seconds=args.ws_depth_reconnect_seconds,
                 funding_reconcile_enabled=args.ws_funding_reconcile_seconds > 0,
                 funding_reconcile_seconds=args.ws_funding_reconcile_seconds,
@@ -2286,7 +2602,8 @@ def main():
         print(
             "Websocket depth runtime: "
             f"batch_size={args.ws_depth_batch_size} "
-            f"rebuild={args.ws_depth_reconnect_seconds:g}s"
+            f"target_refresh={args.ws_depth_target_refresh_seconds:g}s "
+            "dynamic_subscriptions=True"
         )
         print(
             "Websocket funding reconciliation: "
@@ -2346,6 +2663,7 @@ def main():
                 cache=market_data_cache,
                 adapters=adapters,
                 event_publisher=event_publisher,
+                route_spread_history=route_spread_history,
                 worker_count=args.event_driven_candidate_workers,
                 max_routes_per_symbol=args.event_driven_max_routes_per_symbol,
                 symbol_debounce_seconds=args.event_driven_symbol_debounce_seconds,
@@ -2359,6 +2677,11 @@ def main():
                 route_queue_cooldown_seconds=args.event_driven_route_queue_cooldown_seconds,
                 hot_depth_ttl_seconds=args.event_driven_hot_depth_ttl_seconds,
                 hot_depth_priority=args.event_driven_hot_depth_priority,
+                rest_fallback_enabled=not args.disable_event_rest_fallback,
+                rest_fallback_timeout_seconds=args.event_rest_fallback_timeout_seconds,
+                rest_fallback_min_fast_spread_pct=args.event_rest_fallback_min_fast_spread_pct,
+                rest_fallback_min_hot_route_score=args.event_rest_fallback_min_hot_route_score,
+                rest_fallback_max_per_minute=args.event_rest_fallback_max_per_minute,
                 lifecycle_logger=lifecycle_logger,
             )
             event_candidate_pipeline.start()
@@ -2367,7 +2690,8 @@ def main():
                 f"workers={args.event_driven_candidate_workers} "
                 f"debounce={args.event_driven_symbol_debounce_seconds:g}s "
                 f"confirm={args.event_driven_route_confirm_updates} updates/"
-                f"{args.event_driven_route_confirm_seconds:g}s"
+                f"{args.event_driven_route_confirm_seconds:g}s "
+                f"rest_fallback={not args.disable_event_rest_fallback}"
             )
 
     try:

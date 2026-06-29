@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import threading
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ except ImportError:  # pragma: no cover - exercised only when dependency missing
 
 BINANCE_BOOK_TICKER_URL = "wss://fstream.binance.com/public/ws/!bookTicker"
 BINANCE_MARK_PRICE_URL = "wss://fstream.binance.com/market/ws/!markPrice@arr@1s"
+BINANCE_PUBLIC_WS_URL = "wss://fstream.binance.com/public/ws"
 BINANCE_PUBLIC_COMBINED_BASE_URL = "wss://fstream.binance.com/public/stream?streams="
 BITGET_PUBLIC_URL = "wss://ws.bitget.com/v2/ws/public"
 MEXC_PUBLIC_URL = "wss://contract.mexc.com/edge"
@@ -51,6 +53,7 @@ class WebsocketRuntimeConfig:
     ticker_batch_size: int = 100
     depth_batch_size: int = 80
     depth_target_ttl_seconds: float = 120.0
+    depth_target_refresh_seconds: float = 0.25
     depth_reconnect_seconds: float = 5.0
     reconnect_delay_seconds: float = 5.0
     ping_interval_seconds: float = 15.0
@@ -78,6 +81,7 @@ class WebsocketMarketDataService:
         self.adapters = adapters
         self.cache = cache
         self.config = config or WebsocketRuntimeConfig()
+        self._message_ids = itertools.count(1)
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
@@ -220,6 +224,69 @@ class WebsocketMarketDataService:
                 print(f"[ws:{name}] disconnected: {exc}")
                 await asyncio.sleep(self.config.reconnect_delay_seconds)
 
+    async def _dynamic_json_subscription_loop(
+        self,
+        *,
+        name: str,
+        exchange: str,
+        url: str | Callable[[], str | Awaitable[str]],
+        on_message: Callable[[dict], None],
+        subscribe_messages: Callable[[list[str]], list[dict]],
+        unsubscribe_messages: Callable[[list[str]], list[dict]],
+        ping_message: dict | None = None,
+    ) -> None:
+        assert self._stop_event is not None
+        while not self._stop_event.is_set():
+            try:
+                stream_url = await self._resolve_stream_url(url)
+                async with websockets.connect(stream_url, ping_interval=None) as ws:
+                    subscribed: set[str] = set()
+                    last_ping = asyncio.get_running_loop().time()
+                    next_target_refresh = 0.0
+
+                    while not self._stop_event.is_set():
+                        now = asyncio.get_running_loop().time()
+
+                        if now >= next_target_refresh:
+                            desired = [
+                                target.symbol
+                                for target in self.cache.get_depth_targets(exchange)
+                            ][: self.config.depth_batch_size]
+                            desired_set = set(desired)
+                            to_unsubscribe = sorted(subscribed - desired_set)
+                            to_subscribe = sorted(desired_set - subscribed)
+
+                            for message in unsubscribe_messages(to_unsubscribe):
+                                await ws.send(json.dumps(message))
+                            for message in subscribe_messages(to_subscribe):
+                                await ws.send(json.dumps(message))
+
+                            subscribed.difference_update(to_unsubscribe)
+                            subscribed.update(to_subscribe)
+                            next_target_refresh = now + self.config.depth_target_refresh_seconds
+
+                        if ping_message and (
+                            now - last_ping
+                        ) >= self.config.ping_interval_seconds:
+                            await ws.send(json.dumps(ping_message))
+                            last_ping = now
+
+                        timeout = min(
+                            1.0,
+                            max(0.05, next_target_refresh - asyncio.get_running_loop().time()),
+                        )
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                        except asyncio.TimeoutError:
+                            continue
+                        payload = json.loads(raw)
+                        on_message(payload.get("data") if _combined_payload(payload) else payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[ws:{name}] disconnected: {exc}")
+                await asyncio.sleep(self.config.reconnect_delay_seconds)
+
     async def _resolve_stream_url(self, url: str | Callable[[], str | Awaitable[str]]) -> str:
         if not callable(url):
             return url
@@ -257,29 +324,38 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
+    def _binance_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
+        if not symbols:
+            return []
+        return [{
+            "method": "SUBSCRIBE",
+            "params": [f"{symbol.lower()}@depth20@500ms" for symbol in symbols],
+            "id": next(self._message_ids),
+        }]
+
+    def _binance_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
+        if not symbols:
+            return []
+        return [{
+            "method": "UNSUBSCRIBE",
+            "params": [f"{symbol.lower()}@depth20@500ms" for symbol in symbols],
+            "id": next(self._message_ids),
+        }]
+
     async def _binance_depth_loop(self) -> None:
-        while True:
-            targets = [
-                target.symbol.lower()
-                for target in self.cache.get_depth_targets("binance")
-            ][: self.config.depth_batch_size]
-            if not targets:
-                await asyncio.sleep(1)
-                continue
+        def on_message(payload: dict) -> None:
+            orderbook = parse_binance_depth(payload)
+            if orderbook:
+                self.cache.update_orderbook(orderbook)
 
-            streams = "/".join(f"{symbol}@depth20@500ms" for symbol in targets)
-            url = f"{BINANCE_PUBLIC_COMBINED_BASE_URL}{streams}"
-
-            def on_message(payload: dict) -> None:
-                orderbook = parse_binance_depth(payload)
-                if orderbook:
-                    self.cache.update_orderbook(orderbook)
-
-            await self._run_depth_connection(
-                name="binance_depth",
-                url=url,
-                on_message=on_message,
-            )
+        await self._dynamic_json_subscription_loop(
+            name="binance_depth",
+            exchange="binance",
+            url=BINANCE_PUBLIC_WS_URL,
+            subscribe_messages=self._binance_depth_subscribe_messages,
+            unsubscribe_messages=self._binance_depth_unsubscribe_messages,
+            on_message=on_message,
+        )
 
     async def _bitget_ticker_loop(self, symbols: list[str]) -> None:
         subscribe_messages = [
@@ -304,37 +380,40 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
+    def _bitget_depth_args(self, symbols: list[str]) -> list[dict]:
+        return [
+            {"instType": "USDT-FUTURES", "channel": "books15", "instId": symbol}
+            for symbol in symbols
+        ]
+
+    def _bitget_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
+        return [
+            {"op": "subscribe", "args": self._bitget_depth_args(batch)}
+            for batch in _chunks(symbols, min(50, max(1, self.config.depth_batch_size)))
+            if batch
+        ]
+
+    def _bitget_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
+        return [
+            {"op": "unsubscribe", "args": self._bitget_depth_args(batch)}
+            for batch in _chunks(symbols, min(50, max(1, self.config.depth_batch_size)))
+            if batch
+        ]
+
     async def _bitget_depth_loop(self) -> None:
-        while True:
-            symbols = [
-                target.symbol
-                for target in self.cache.get_depth_targets("bitget")
-            ][: self.config.depth_batch_size]
-            if not symbols:
-                await asyncio.sleep(1)
-                continue
+        def on_message(payload: dict) -> None:
+            orderbook = parse_bitget_depth(payload)
+            if orderbook:
+                self.cache.update_orderbook(orderbook)
 
-            subscribe_messages = [
-                {
-                    "op": "subscribe",
-                    "args": [
-                        {"instType": "USDT-FUTURES", "channel": "books15", "instId": symbol}
-                        for symbol in symbols
-                    ],
-                }
-            ]
-
-            def on_message(payload: dict) -> None:
-                orderbook = parse_bitget_depth(payload)
-                if orderbook:
-                    self.cache.update_orderbook(orderbook)
-
-            await self._run_depth_connection(
-                name="bitget_depth",
-                url=BITGET_PUBLIC_URL,
-                subscribe_messages=subscribe_messages,
-                on_message=on_message,
-            )
+        await self._dynamic_json_subscription_loop(
+            name="bitget_depth",
+            exchange="bitget",
+            url=BITGET_PUBLIC_URL,
+            subscribe_messages=self._bitget_depth_subscribe_messages,
+            unsubscribe_messages=self._bitget_depth_unsubscribe_messages,
+            on_message=on_message,
+        )
 
     async def _mexc_ticker_loop(self, symbols: list[str]) -> None:
         subscribe_messages = [{"method": "sub.tickers", "param": {}, "gzip": False}]
@@ -368,39 +447,45 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
+    def _mexc_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
+        return [
+            {
+                "method": "sub.depth.full",
+                "param": {
+                    "symbol": standard_to_exchange_symbol(symbol, "mexc", "futures"),
+                    "limit": 20,
+                },
+            }
+            for symbol in symbols
+        ]
+
+    def _mexc_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
+        return [
+            {
+                "method": "unsub.depth.full",
+                "param": {
+                    "symbol": standard_to_exchange_symbol(symbol, "mexc", "futures"),
+                    "limit": 20,
+                },
+            }
+            for symbol in symbols
+        ]
+
     async def _mexc_depth_loop(self) -> None:
-        while True:
-            symbols = [
-                target.symbol
-                for target in self.cache.get_depth_targets("mexc")
-            ][: self.config.depth_batch_size]
-            if not symbols:
-                await asyncio.sleep(1)
-                continue
+        def on_message(payload: dict) -> None:
+            orderbook = parse_mexc_depth(payload)
+            if orderbook:
+                self.cache.update_orderbook(orderbook)
 
-            subscribe_messages = [
-                {
-                    "method": "sub.depth.full",
-                    "param": {
-                        "symbol": standard_to_exchange_symbol(symbol, "mexc", "futures"),
-                        "limit": 20,
-                    },
-                }
-                for symbol in symbols
-            ]
-
-            def on_message(payload: dict) -> None:
-                orderbook = parse_mexc_depth(payload)
-                if orderbook:
-                    self.cache.update_orderbook(orderbook)
-
-            await self._run_depth_connection(
-                name="mexc_depth",
-                url=MEXC_PUBLIC_URL,
-                subscribe_messages=subscribe_messages,
-                ping_message={"method": "ping"},
-                on_message=on_message,
-            )
+        await self._dynamic_json_subscription_loop(
+            name="mexc_depth",
+            exchange="mexc",
+            url=MEXC_PUBLIC_URL,
+            subscribe_messages=self._mexc_depth_subscribe_messages,
+            unsubscribe_messages=self._mexc_depth_unsubscribe_messages,
+            ping_message={"method": "ping"},
+            on_message=on_message,
+        )
 
     async def _kucoin_public_ws_url(self) -> str:
         return await asyncio.to_thread(self._kucoin_public_ws_url_sync)
@@ -428,6 +513,15 @@ class WebsocketMarketDataService:
         return {
             "id": uuid4().hex,
             "type": "subscribe",
+            "topic": topic,
+            "privateChannel": False,
+            "response": True,
+        }
+
+    def _kucoin_unsubscribe_message(self, topic: str) -> dict:
+        return {
+            "id": uuid4().hex,
+            "type": "unsubscribe",
             "topic": topic,
             "privateChannel": False,
             "response": True,
@@ -471,35 +565,39 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
+    def _kucoin_depth_topic(self, symbol: str) -> str:
+        return (
+            "/contractMarket/level2Depth50:"
+            f"{standard_to_exchange_symbol(symbol, 'kucoin', 'futures')}"
+        )
+
+    def _kucoin_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
+        return [
+            self._kucoin_subscribe_message(self._kucoin_depth_topic(symbol))
+            for symbol in symbols
+        ]
+
+    def _kucoin_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
+        return [
+            self._kucoin_unsubscribe_message(self._kucoin_depth_topic(symbol))
+            for symbol in symbols
+        ]
+
     async def _kucoin_depth_loop(self) -> None:
-        while True:
-            symbols = [
-                target.symbol
-                for target in self.cache.get_depth_targets("kucoin")
-            ][: self.config.depth_batch_size]
-            if not symbols:
-                await asyncio.sleep(1)
-                continue
+        def on_message(payload: dict) -> None:
+            orderbook = parse_kucoin_depth(payload)
+            if orderbook:
+                self.cache.update_orderbook(orderbook)
 
-            subscribe_messages = [
-                self._kucoin_subscribe_message(
-                    f"/contractMarket/level2Depth50:{standard_to_exchange_symbol(symbol, 'kucoin', 'futures')}"
-                )
-                for symbol in symbols
-            ]
-
-            def on_message(payload: dict) -> None:
-                orderbook = parse_kucoin_depth(payload)
-                if orderbook:
-                    self.cache.update_orderbook(orderbook)
-
-            await self._run_depth_connection(
-                name="kucoin_depth",
-                url=self._kucoin_public_ws_url,
-                subscribe_messages=subscribe_messages,
-                ping_message={"id": "ping", "type": "ping"},
-                on_message=on_message,
-            )
+        await self._dynamic_json_subscription_loop(
+            name="kucoin_depth",
+            exchange="kucoin",
+            url=self._kucoin_public_ws_url,
+            subscribe_messages=self._kucoin_depth_subscribe_messages,
+            unsubscribe_messages=self._kucoin_depth_unsubscribe_messages,
+            ping_message={"id": "ping", "type": "ping"},
+            on_message=on_message,
+        )
 
     async def _hyperliquid_ticker_loop(self, symbols: list[str]) -> None:
         assert self._stop_event is not None
@@ -551,49 +649,50 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
+    def _hyperliquid_depth_subscription_messages(self, symbols: list[str], method: str) -> list[dict]:
+        messages = []
+        for symbol in symbols:
+            coin = standard_to_exchange_symbol(symbol, "hyperliquid", "futures")
+            messages.extend([
+                {"method": method, "subscription": {"type": "bbo", "coin": coin}},
+                {"method": method, "subscription": {"type": "l2Book", "coin": coin}},
+                {"method": method, "subscription": {"type": "activeAssetCtx", "coin": coin}},
+            ])
+        return messages
+
+    def _hyperliquid_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
+        return self._hyperliquid_depth_subscription_messages(symbols, "subscribe")
+
+    def _hyperliquid_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
+        return self._hyperliquid_depth_subscription_messages(symbols, "unsubscribe")
+
     async def _hyperliquid_depth_loop(self) -> None:
-        while True:
-            symbols = [
-                target.symbol
-                for target in self.cache.get_depth_targets("hyperliquid")
-            ][: self.config.depth_batch_size]
-            if not symbols:
-                await asyncio.sleep(1)
-                continue
+        def on_message(payload: dict) -> None:
+            ticker = parse_hyperliquid_bbo(payload)
+            if ticker:
+                self.cache.update_ticker(ticker)
+            orderbook = parse_hyperliquid_l2_book(payload)
+            if orderbook:
+                self.cache.update_orderbook(orderbook)
+            funding = parse_hyperliquid_active_asset_ctx(payload)
+            if funding:
+                symbol, funding_rate, next_funding, observed_at = funding
+                self.cache.update_funding(
+                    exchange="hyperliquid",
+                    symbol=symbol,
+                    funding_rate=funding_rate,
+                    next_funding_time_utc=next_funding,
+                    observed_at_utc=observed_at,
+                )
 
-            subscribe_messages = []
-            for symbol in symbols:
-                coin = standard_to_exchange_symbol(symbol, "hyperliquid", "futures")
-                subscribe_messages.extend([
-                    {"method": "subscribe", "subscription": {"type": "bbo", "coin": coin}},
-                    {"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}},
-                    {"method": "subscribe", "subscription": {"type": "activeAssetCtx", "coin": coin}},
-                ])
-
-            def on_message(payload: dict) -> None:
-                ticker = parse_hyperliquid_bbo(payload)
-                if ticker:
-                    self.cache.update_ticker(ticker)
-                orderbook = parse_hyperliquid_l2_book(payload)
-                if orderbook:
-                    self.cache.update_orderbook(orderbook)
-                funding = parse_hyperliquid_active_asset_ctx(payload)
-                if funding:
-                    symbol, funding_rate, next_funding, observed_at = funding
-                    self.cache.update_funding(
-                        exchange="hyperliquid",
-                        symbol=symbol,
-                        funding_rate=funding_rate,
-                        next_funding_time_utc=next_funding,
-                        observed_at_utc=observed_at,
-                    )
-
-            await self._run_depth_connection(
-                name="hyperliquid_depth",
-                url=HYPERLIQUID_PUBLIC_URL,
-                subscribe_messages=subscribe_messages,
-                on_message=on_message,
-            )
+        await self._dynamic_json_subscription_loop(
+            name="hyperliquid_depth",
+            exchange="hyperliquid",
+            url=HYPERLIQUID_PUBLIC_URL,
+            subscribe_messages=self._hyperliquid_depth_subscribe_messages,
+            unsubscribe_messages=self._hyperliquid_depth_unsubscribe_messages,
+            on_message=on_message,
+        )
 
     async def _funding_reconciliation_loop(self) -> None:
         assert self._stop_event is not None
