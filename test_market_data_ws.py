@@ -8,6 +8,7 @@ from market_data.cache import CachedTicker, MarketDataCache
 from market_data.event_stream import LocalEventClient, LocalEventPublisher
 from market_data.scanner_integration import (
     CandidateWatchlist,
+    StreamingRouteTracker,
     build_depth_targets_from_candidates,
     candidate_route_key,
     candidates_with_fresh_orderbooks,
@@ -168,6 +169,12 @@ def test_event_candidate_queue_uses_sequence_tie_breaker():
         ws_orderbook_max_age_seconds=10,
         funding_cache_seconds=60,
         max_book_skew_seconds=0.5,
+        route_confirm_updates=1,
+        route_confirm_seconds=0,
+        route_state_ttl_seconds=10,
+        route_queue_cooldown_seconds=0,
+        hot_depth_ttl_seconds=30,
+        hot_depth_priority=75,
     )
 
     pipeline._on_cache_update("ticker", SimpleNamespace(symbol="BTCUSDT"))
@@ -190,6 +197,43 @@ def test_event_candidate_queue_uses_sequence_tie_breaker():
         ))
     pipeline._on_cache_update("ticker", SimpleNamespace(symbol="MSTRUSDT"))
     assert pipeline._queue.empty()
+
+
+def test_streaming_route_tracker_confirms_by_updates_or_age():
+    tracker = StreamingRouteTracker(max_age_seconds=10, max_routes=10)
+    candidate = {
+        "symbol": "BTCUSDT",
+        "long_exchange": "binance",
+        "short_exchange": "bitget",
+        "direction": "long_binance_short_bitget",
+        "fast_spread_pct": 0.2,
+    }
+
+    first = tracker.update(
+        candidate,
+        observed_at_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        now_monotonic=100.0,
+    )
+    assert first is not None
+    assert not first.confirmed(now_monotonic=100.1, min_updates=2, min_age_seconds=0.5)
+
+    second = tracker.update(
+        {**candidate, "fast_spread_pct": 0.25},
+        observed_at_utc=datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+        now_monotonic=100.2,
+    )
+    assert second is not None
+    assert second.confirmed(now_monotonic=100.2, min_updates=2, min_age_seconds=0.5)
+    assert second.best_spread_pct == 0.25
+
+    aged = StreamingRouteTracker(max_age_seconds=10, max_routes=10)
+    item = aged.update(
+        candidate,
+        observed_at_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        now_monotonic=200.0,
+    )
+    assert item is not None
+    assert item.confirmed(now_monotonic=200.6, min_updates=2, min_age_seconds=0.5)
 
 
 def test_replace_depth_targets_removes_stale_targets():
@@ -875,6 +919,7 @@ if __name__ == "__main__":
     test_position_depth_targets_outrank_scanner_targets()
     test_local_event_stream_publishes_and_accepts_controls()
     test_event_candidate_queue_uses_sequence_tie_breaker()
+    test_streaming_route_tracker_confirms_by_updates_or_age()
     test_build_depth_targets_from_candidates_limits_and_dedupes()
     test_ticker_data_uses_cache_when_fresh_and_rest_when_cold()
     test_funding_info_cache_avoids_repeated_adapter_calls()

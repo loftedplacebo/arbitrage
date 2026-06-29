@@ -36,6 +36,137 @@ class WatchlistItem:
         return max(0.0, (now - self.last_seen_utc).total_seconds())
 
 
+@dataclass
+class StreamingRouteItem:
+    key: str
+    candidate: dict
+    first_seen_utc: datetime
+    last_seen_utc: datetime
+    first_seen_monotonic: float
+    last_seen_monotonic: float
+    best_spread_pct: float
+    update_count: int = 1
+
+    def age_seconds(self, now_monotonic: float) -> float:
+        return max(0.0, now_monotonic - self.first_seen_monotonic)
+
+    def idle_seconds(self, now_monotonic: float) -> float:
+        return max(0.0, now_monotonic - self.last_seen_monotonic)
+
+    def confirmed(
+        self,
+        *,
+        now_monotonic: float,
+        min_updates: int,
+        min_age_seconds: float,
+    ) -> bool:
+        return (
+            self.update_count >= min_updates
+            or self.age_seconds(now_monotonic) >= min_age_seconds
+        )
+
+    def metadata(self, *, now_monotonic: float) -> dict:
+        return {
+            "stream_first_seen_utc": self.first_seen_utc.isoformat(),
+            "stream_last_seen_utc": self.last_seen_utc.isoformat(),
+            "stream_update_count": self.update_count,
+            "stream_persistence_seconds": self.age_seconds(now_monotonic),
+            "stream_best_spread_pct": self.best_spread_pct,
+        }
+
+
+class StreamingRouteTracker:
+    """
+    Low-latency route memory for websocket-driven candidate confirmation.
+
+    Scan-cycle persistence is too slow for a streaming scanner. This tracker
+    confirms a route once it survives multiple ticker updates or a short
+    wall-clock window, then expires it quickly if the route stops appearing.
+    """
+
+    def __init__(self, *, max_age_seconds: float, max_routes: int):
+        self.max_age_seconds = max_age_seconds
+        self.max_routes = max_routes
+        self._items: dict[str, StreamingRouteItem] = {}
+
+    def __len__(self) -> int:
+        self.prune()
+        return len(self._items)
+
+    def update(
+        self,
+        candidate: dict,
+        *,
+        observed_at_utc: datetime | None = None,
+        now_monotonic: float | None = None,
+    ) -> StreamingRouteItem | None:
+        key = candidate_route_key(candidate)
+        if key.count("|") != 3 or not candidate.get("symbol"):
+            return None
+
+        observed_at_utc = observed_at_utc or utc_now()
+        now_monotonic = now_monotonic if now_monotonic is not None else time.monotonic()
+        self.prune(now_monotonic=now_monotonic)
+        spread = candidate.get("fast_spread_pct")
+        try:
+            spread_value = float(spread) if spread is not None else 0.0
+        except (TypeError, ValueError):
+            spread_value = 0.0
+
+        existing = self._items.get(key)
+        if existing is None:
+            item = StreamingRouteItem(
+                key=key,
+                candidate=dict(candidate),
+                first_seen_utc=observed_at_utc,
+                last_seen_utc=observed_at_utc,
+                first_seen_monotonic=now_monotonic,
+                last_seen_monotonic=now_monotonic,
+                best_spread_pct=spread_value,
+            )
+            self._items[key] = item
+        else:
+            existing.candidate = {**existing.candidate, **candidate}
+            existing.last_seen_utc = observed_at_utc
+            existing.last_seen_monotonic = now_monotonic
+            existing.best_spread_pct = max(existing.best_spread_pct, spread_value)
+            existing.update_count += 1
+            item = existing
+
+        return item
+
+    def metadata_for(self, candidate: dict, *, now_monotonic: float | None = None) -> dict:
+        now_monotonic = now_monotonic if now_monotonic is not None else time.monotonic()
+        item = self._items.get(candidate_route_key(candidate))
+        if item is None or item.idle_seconds(now_monotonic) > self.max_age_seconds:
+            return {}
+        return item.metadata(now_monotonic=now_monotonic)
+
+    def prune(self, *, now_monotonic: float | None = None) -> None:
+        now_monotonic = now_monotonic if now_monotonic is not None else time.monotonic()
+        expired = [
+            key
+            for key, item in self._items.items()
+            if item.idle_seconds(now_monotonic) > self.max_age_seconds
+        ]
+        for key in expired:
+            self._items.pop(key, None)
+
+        if len(self._items) <= self.max_routes:
+            return
+
+        ranked = sorted(
+            self._items.items(),
+            key=lambda pair: (
+                pair[1].best_spread_pct,
+                pair[1].update_count,
+                pair[1].last_seen_monotonic,
+            ),
+            reverse=True,
+        )
+        self._items = dict(ranked[: self.max_routes])
+
+
 class CandidateWatchlist:
     """
     Short-lived route memory for websocket depth warming.

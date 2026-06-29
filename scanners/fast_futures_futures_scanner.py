@@ -8,7 +8,7 @@ import sys
 import time
 import statistics
 import threading
-from queue import PriorityQueue, Empty, Full
+from queue import PriorityQueue, Empty, Full, Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from pathlib import Path
@@ -33,6 +33,7 @@ from market_data.cache import MarketDataCache
 from market_data.event_stream import LocalEventPublisher, orderbook_to_payload
 from market_data.scanner_integration import (
     CandidateWatchlist,
+    StreamingRouteTracker,
     candidates_with_fresh_orderbooks,
     candidate_route_key,
     get_cached_orderbook,
@@ -66,8 +67,15 @@ DEEP_VALIDATE_CRYPTO_ONLY = True
 DEEP_VALIDATE_WORKERS = 8
 MAX_CROSS_VENUE_BOOK_SKEW_SECONDS = 1.00
 EVENT_DRIVEN_CANDIDATE_WORKERS = 2
-EVENT_DRIVEN_SYMBOL_DEBOUNCE_SECONDS = 0.25
-EVENT_DRIVEN_DEPTH_WAIT_SECONDS = 1.50
+EVENT_DRIVEN_SYMBOL_DEBOUNCE_SECONDS = 0.05
+EVENT_DRIVEN_DEPTH_WAIT_SECONDS = 1.25
+EVENT_DRIVEN_ROUTE_CONFIRM_UPDATES = 2
+EVENT_DRIVEN_ROUTE_CONFIRM_SECONDS = 0.50
+EVENT_DRIVEN_ROUTE_STATE_TTL_SECONDS = 20.0
+EVENT_DRIVEN_ROUTE_QUEUE_COOLDOWN_SECONDS = 0.50
+EVENT_DRIVEN_HOT_DEPTH_TTL_SECONDS = 45.0
+EVENT_DRIVEN_HOT_DEPTH_PRIORITY = 75
+EVENT_DRIVEN_ROUTE_STATE_MAX_ROUTES = 5_000
 NOTIONALS_USDT = [100, 200, 300, 400, 500, 1_000, 2_500]
 CANDIDATE_WATCHLIST_ENABLED = True
 CANDIDATE_WATCHLIST_TTL_SECONDS = 900
@@ -144,6 +152,12 @@ DEEP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 ML_OUTPUT_DIR = REPO_ROOT / "data" / "ml" / "fast_spread_observations"
 ML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+ML_LIFECYCLE_LOGGING_ENABLED = True
+ML_LIFECYCLE_OUTPUT_DIR = REPO_ROOT / "data" / "ml" / "spread_lifecycle_events"
+ML_LIFECYCLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+ML_LIFECYCLE_MAX_QUEUE_ROWS = 50_000
+ML_LIFECYCLE_FLUSH_ROWS = 250
+ML_LIFECYCLE_FLUSH_SECONDS = 1.0
 TELEMETRY_OUTPUT_DIR = REPO_ROOT / "data" / "scanner_telemetry"
 TELEMETRY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 VALIDATED_WRITE_LOCK = threading.Lock()
@@ -852,6 +866,12 @@ def deep_validate_candidate(
             "short_orderbook_source": short_book_source,
             "cross_venue_book_skew_ms": book_skew_seconds * 1000,
             "deep_validation_latency_ms": (time.monotonic() - validation_started) * 1000,
+            "stream_first_seen_utc": candidate.get("stream_first_seen_utc"),
+            "stream_last_seen_utc": candidate.get("stream_last_seen_utc"),
+            "stream_update_count": candidate.get("stream_update_count"),
+            "stream_persistence_seconds": candidate.get("stream_persistence_seconds"),
+            "stream_best_spread_pct": candidate.get("stream_best_spread_pct"),
+            "stream_confirmed": candidate.get("stream_confirmed"),
             "route_observation_count": candidate.get("route_observation_count"),
             "route_spread_mean_pct": candidate.get("route_spread_mean_pct"),
             "route_spread_median_pct": candidate.get("route_spread_median_pct"),
@@ -1029,6 +1049,77 @@ def apply_persistence_and_readiness(
 
     return validated_results
 
+
+def apply_streaming_persistence_and_readiness(
+    validated_results: list[dict],
+    *,
+    min_updates: int,
+    min_age_seconds: float,
+) -> list[dict]:
+    """
+    Apply paper-readiness using websocket route persistence metadata.
+
+    This is the event-driven equivalent of scan-cycle persistence. A route is
+    persistent once it survives multiple ticker updates or a short realtime
+    duration, so strategy events do not have to wait for the next full scan.
+    """
+    for row in validated_results:
+        stream_updates = int(row.get("stream_update_count") or 0)
+        try:
+            stream_seconds = float(row.get("stream_persistence_seconds") or 0.0)
+        except (TypeError, ValueError):
+            stream_seconds = 0.0
+
+        persistent = stream_updates >= min_updates or stream_seconds >= min_age_seconds
+
+        net_ex = row.get("net_edge_ex_funding_pct")
+        net_inc = row.get("net_edge_inc_funding_pct")
+
+        spread_edge_ok = (
+            net_ex is not None
+            and net_ex >= MIN_NET_EX_FUNDING_FOR_READY_PCT
+        )
+
+        funding_adjusted_edge_ok = (
+            net_inc is not None
+            and net_inc >= MIN_NET_INC_FUNDING_FOR_READY_PCT
+        )
+
+        instrument_ok = (
+            row.get("instrument_class") == "crypto"
+            if CRYPTO_ONLY_READY
+            else True
+        )
+
+        fillable_ok = (
+            row.get("long_fillable") is True
+            and row.get("short_fillable") is True
+        )
+
+        spread_ready = bool(
+            spread_edge_ok
+            and persistent
+            and instrument_ok
+            and fillable_ok
+        )
+
+        funding_adjusted_ready = bool(
+            funding_adjusted_edge_ok
+            and persistent
+            and instrument_ok
+            and fillable_ok
+        )
+
+        row["persistence_count"] = stream_updates
+        row["persistent"] = persistent
+        row["stream_confirmed"] = persistent
+        row["spread_ready"] = spread_ready
+        row["funding_adjusted_ready"] = funding_adjusted_ready
+        row["paper_ready"] = funding_adjusted_ready
+
+    return validated_results
+
+
 def build_capacity_summary(validated_results: list[dict]) -> list[dict]:
     """
     Summarise maximum notional that remains positive for each symbol/direction.
@@ -1122,6 +1213,12 @@ def _write_validated_results_to_csv(results: list[dict], timestamp: datetime) ->
         "short_orderbook_source",
         "cross_venue_book_skew_ms",
         "deep_validation_latency_ms",
+        "stream_first_seen_utc",
+        "stream_last_seen_utc",
+        "stream_update_count",
+        "stream_persistence_seconds",
+        "stream_best_spread_pct",
+        "stream_confirmed",
         "route_observation_count",
         "route_spread_mean_pct",
         "route_spread_median_pct",
@@ -1175,6 +1272,150 @@ def write_validated_results_to_csv(results: list[dict], timestamp: datetime) -> 
         return _write_validated_results_to_csv(results, timestamp)
 
 
+class LifecycleEventLogger:
+    """Non-blocking CSV logger for spread opportunity lifecycle events."""
+
+    fieldnames = [
+        "timestamp_utc",
+        "experiment_id",
+        "stage",
+        "lifecycle_id",
+        "route_key",
+        "symbol",
+        "instrument_class",
+        "long_exchange",
+        "short_exchange",
+        "direction",
+        "fast_spread_pct",
+        "stream_update_count",
+        "stream_persistence_seconds",
+        "stream_best_spread_pct",
+        "confirmed",
+        "depth_ready",
+        "validated_rows",
+        "paper_ready_rows",
+        "queue_depth",
+        "reason",
+        "latency_ms",
+    ]
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        max_queue_rows: int = ML_LIFECYCLE_MAX_QUEUE_ROWS,
+        flush_rows: int = ML_LIFECYCLE_FLUSH_ROWS,
+        flush_seconds: float = ML_LIFECYCLE_FLUSH_SECONDS,
+    ):
+        self.enabled = enabled
+        self.flush_rows = flush_rows
+        self.flush_seconds = flush_seconds
+        self._queue: Queue = Queue(maxsize=max_queue_rows)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="lifecycle-csv-writer", daemon=True)
+        self._dropped = 0
+        self._dropped_lock = threading.Lock()
+
+    @property
+    def dropped_rows(self) -> int:
+        with self._dropped_lock:
+            return self._dropped
+
+    def start(self) -> None:
+        if self.enabled and not self._thread.is_alive():
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self.enabled:
+            self._thread.join(timeout=5)
+
+    def log(
+        self,
+        stage: str,
+        *,
+        candidate: dict | None = None,
+        timestamp: datetime | None = None,
+        confirmed: bool | None = None,
+        depth_ready: bool | None = None,
+        validated_rows: int | None = None,
+        paper_ready_rows: int | None = None,
+        queue_depth: int | None = None,
+        reason: str | None = None,
+        latency_ms: float | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        timestamp = timestamp or utc_now()
+        candidate = candidate or {}
+        route = candidate_route_key(candidate) if candidate else ""
+        lifecycle_id = (
+            f"{route}|{candidate.get('stream_first_seen_utc') or timestamp.isoformat()}"
+            if route
+            else timestamp.isoformat()
+        )
+        row = {
+            "timestamp_utc": timestamp.isoformat(),
+            "experiment_id": EXPERIMENT_ID,
+            "stage": stage,
+            "lifecycle_id": lifecycle_id,
+            "route_key": route,
+            "symbol": candidate.get("symbol"),
+            "instrument_class": candidate.get("instrument_class"),
+            "long_exchange": candidate.get("long_exchange"),
+            "short_exchange": candidate.get("short_exchange"),
+            "direction": candidate.get("direction"),
+            "fast_spread_pct": candidate.get("fast_spread_pct"),
+            "stream_update_count": candidate.get("stream_update_count"),
+            "stream_persistence_seconds": candidate.get("stream_persistence_seconds"),
+            "stream_best_spread_pct": candidate.get("stream_best_spread_pct"),
+            "confirmed": confirmed,
+            "depth_ready": depth_ready,
+            "validated_rows": validated_rows,
+            "paper_ready_rows": paper_ready_rows,
+            "queue_depth": queue_depth,
+            "reason": reason,
+            "latency_ms": latency_ms,
+        }
+        try:
+            self._queue.put_nowait(row)
+        except Full:
+            with self._dropped_lock:
+                self._dropped += 1
+
+    def _run(self) -> None:
+        buffer = []
+        next_flush = time.monotonic() + self.flush_seconds
+        while not self._stop.is_set() or not self._queue.empty():
+            timeout = max(0.05, next_flush - time.monotonic())
+            try:
+                buffer.append(self._queue.get(timeout=timeout))
+            except Empty:
+                pass
+
+            now = time.monotonic()
+            if buffer and (len(buffer) >= self.flush_rows or now >= next_flush or self._stop.is_set()):
+                self._flush(buffer)
+                buffer = []
+                next_flush = now + self.flush_seconds
+
+    def _flush(self, rows: list[dict]) -> None:
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for row in rows:
+            grouped[str(row["timestamp_utc"])[:10].replace("-", "")].append(row)
+
+        for date_key, date_rows in grouped.items():
+            output_file = ML_LIFECYCLE_OUTPUT_DIR / f"spread_lifecycle_events_{date_key}.csv"
+            file_exists = output_file.exists()
+            with output_file.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+                for row in date_rows:
+                    writer.writerow({field: row.get(field) for field in self.fieldnames})
+
+
 class EventDrivenCandidatePipeline:
     """Turn fresh websocket ticker updates into cache-only validated route events."""
 
@@ -1191,6 +1432,13 @@ class EventDrivenCandidatePipeline:
         ws_orderbook_max_age_seconds: float,
         funding_cache_seconds: float,
         max_book_skew_seconds: float,
+        route_confirm_updates: int,
+        route_confirm_seconds: float,
+        route_state_ttl_seconds: float,
+        route_queue_cooldown_seconds: float,
+        hot_depth_ttl_seconds: float,
+        hot_depth_priority: int,
+        lifecycle_logger: LifecycleEventLogger | None = None,
     ):
         self.cache = cache
         self.adapters = adapters
@@ -1201,11 +1449,24 @@ class EventDrivenCandidatePipeline:
         self.ws_orderbook_max_age_seconds = ws_orderbook_max_age_seconds
         self.funding_cache_seconds = funding_cache_seconds
         self.max_book_skew_seconds = max_book_skew_seconds
-        self._queue: PriorityQueue = PriorityQueue(maxsize=2_000)
+        self.route_confirm_updates = max(1, route_confirm_updates)
+        self.route_confirm_seconds = max(0.0, route_confirm_seconds)
+        self.route_queue_cooldown_seconds = max(0.0, route_queue_cooldown_seconds)
+        self.hot_depth_ttl_seconds = max(1.0, hot_depth_ttl_seconds)
+        self.hot_depth_priority = hot_depth_priority
+        self.lifecycle_logger = lifecycle_logger
+        self._queue: PriorityQueue = PriorityQueue(maxsize=10_000)
         self._queue_sequence = itertools.count()
         self._stop = threading.Event()
         self._last_symbol_at: dict[str, float] = {}
         self._last_route_at: dict[str, float] = {}
+        self._queued_routes: set[str] = set()
+        self._confirmed_logged_routes: set[str] = set()
+        self._detected_logged_routes: set[str] = set()
+        self._route_tracker = StreamingRouteTracker(
+            max_age_seconds=route_state_ttl_seconds,
+            max_routes=EVENT_DRIVEN_ROUTE_STATE_MAX_ROUTES,
+        )
         self._lock = threading.Lock()
         self._persistence_history: dict[str, deque] = {}
         self._threads = [
@@ -1228,6 +1489,7 @@ class EventDrivenCandidatePipeline:
             return
         symbol = value.symbol
         now = time.monotonic()
+        observed_at_utc = getattr(value, "observed_at_utc", None) or utc_now()
         with self._lock:
             if now - self._last_symbol_at.get(symbol, 0.0) < self.symbol_debounce_seconds:
                 return
@@ -1243,18 +1505,99 @@ class EventDrivenCandidatePipeline:
                 for candidate in candidates
                 if candidate.get("instrument_class") == "crypto"
             ]
+        hot_depth_targets: set[tuple[str, str]] = set()
+        max_logged_routes = EVENT_DRIVEN_ROUTE_STATE_MAX_ROUTES * 2
+
         for candidate in candidates[:self.max_routes_per_symbol]:
-            route = candidate_key(candidate)
+            route = candidate_route_key(candidate)
             with self._lock:
-                if now - self._last_route_at.get(route, 0.0) < self.symbol_debounce_seconds:
+                if len(self._detected_logged_routes) > max_logged_routes:
+                    self._detected_logged_routes.clear()
+                if len(self._confirmed_logged_routes) > max_logged_routes:
+                    self._confirmed_logged_routes.clear()
+                state = self._route_tracker.update(
+                    candidate,
+                    observed_at_utc=observed_at_utc,
+                    now_monotonic=now,
+                )
+                if state is None:
+                    continue
+                candidate.update(state.metadata(now_monotonic=now))
+                candidate["stream_confirmed"] = state.confirmed(
+                    now_monotonic=now,
+                    min_updates=self.route_confirm_updates,
+                    min_age_seconds=self.route_confirm_seconds,
+                )
+                candidate["_stream_first_seen_monotonic"] = state.first_seen_monotonic
+
+                hot_depth_targets.add((candidate["long_exchange"], candidate["symbol"]))
+                hot_depth_targets.add((candidate["short_exchange"], candidate["symbol"]))
+
+                if route not in self._detected_logged_routes:
+                    self._detected_logged_routes.add(route)
+                    if self.lifecycle_logger is not None:
+                        self.lifecycle_logger.log(
+                            "fast_detected",
+                            candidate=candidate,
+                            timestamp=observed_at_utc,
+                            confirmed=False,
+                            queue_depth=self._queue.qsize(),
+                        )
+
+                if not candidate["stream_confirmed"]:
+                    continue
+
+                if route not in self._confirmed_logged_routes:
+                    self._confirmed_logged_routes.add(route)
+                    if self.lifecycle_logger is not None:
+                        self.lifecycle_logger.log(
+                            "stream_confirmed",
+                            candidate=candidate,
+                            timestamp=observed_at_utc,
+                            confirmed=True,
+                            queue_depth=self._queue.qsize(),
+                        )
+
+                if now - self._last_route_at.get(route, 0.0) < self.route_queue_cooldown_seconds:
+                    continue
+                if route in self._queued_routes:
                     continue
                 self._last_route_at[route] = now
+                self._queued_routes.add(route)
+
             try:
                 self._queue.put_nowait(
                     (-candidate["fast_spread_pct"], next(self._queue_sequence), candidate)
                 )
+                if self.lifecycle_logger is not None:
+                    self.lifecycle_logger.log(
+                        "validation_queued",
+                        candidate=candidate,
+                        timestamp=observed_at_utc,
+                        confirmed=True,
+                        queue_depth=self._queue.qsize(),
+                    )
             except Full:
-                return
+                with self._lock:
+                    self._queued_routes.discard(route)
+                if self.lifecycle_logger is not None:
+                    self.lifecycle_logger.log(
+                        "validation_queue_full",
+                        candidate=candidate,
+                        timestamp=observed_at_utc,
+                        confirmed=True,
+                        queue_depth=self._queue.qsize(),
+                        reason="priority_queue_full",
+                    )
+                break
+
+        if hot_depth_targets:
+            self.cache.set_depth_targets(
+                hot_depth_targets,
+                ttl_seconds=self.hot_depth_ttl_seconds,
+                source="event_hot_routes",
+                priority=self.hot_depth_priority,
+            )
 
     def _worker(self) -> None:
         while not self._stop.is_set():
@@ -1262,15 +1605,16 @@ class EventDrivenCandidatePipeline:
                 _priority, _sequence, candidate = self._queue.get(timeout=0.2)
             except Empty:
                 continue
+            route = candidate_route_key(candidate)
             try:
                 self.cache.set_depth_targets(
                     [
                         (candidate["long_exchange"], candidate["symbol"]),
                         (candidate["short_exchange"], candidate["symbol"]),
                     ],
-                    ttl_seconds=30,
+                    ttl_seconds=self.hot_depth_ttl_seconds,
                     source="event_candidates",
-                    priority=50,
+                    priority=self.hot_depth_priority + 5,
                 )
                 ready, _ = wait_for_candidate_orderbooks(
                     candidates=[candidate],
@@ -1280,8 +1624,29 @@ class EventDrivenCandidatePipeline:
                     max_age_seconds=self.ws_orderbook_max_age_seconds,
                 )
                 if not ready:
+                    if self.lifecycle_logger is not None:
+                        self.lifecycle_logger.log(
+                            "depth_timeout",
+                            candidate=candidate,
+                            depth_ready=False,
+                            queue_depth=self._queue.qsize(),
+                            reason="cached_orderbook_not_ready",
+                        )
                     continue
                 timestamp = utc_now()
+                if self.lifecycle_logger is not None:
+                    self.lifecycle_logger.log(
+                        "depth_ready",
+                        candidate=candidate,
+                        timestamp=timestamp,
+                        depth_ready=True,
+                        queue_depth=self._queue.qsize(),
+                        latency_ms=(
+                            (time.monotonic() - candidate.get("_stream_first_seen_monotonic")) * 1000
+                            if candidate.get("_stream_first_seen_monotonic") is not None
+                            else None
+                        ),
+                    )
                 rows = deep_validate_candidate(
                     candidate=candidate,
                     adapters=self.adapters,
@@ -1292,17 +1657,46 @@ class EventDrivenCandidatePipeline:
                     max_cross_venue_book_skew_seconds=self.max_book_skew_seconds,
                     require_cached_orderbooks=True,
                 )
-                with self._lock:
-                    rows = apply_persistence_and_readiness(rows, self._persistence_history)
-                write_validated_results_to_csv(rows, timestamp)
+                rows = apply_streaming_persistence_and_readiness(
+                    rows,
+                    min_updates=self.route_confirm_updates,
+                    min_age_seconds=self.route_confirm_seconds,
+                )
+                paper_ready_rows = sum(1 for row in rows if row.get("paper_ready"))
                 if self.event_publisher is not None:
                     self.event_publisher.publish(
                         "validated_scan",
                         {"timestamp_utc": timestamp.isoformat(), "rows": rows, "source": "ticker_event"},
                     )
+                if self.lifecycle_logger is not None:
+                    self.lifecycle_logger.log(
+                        "validated",
+                        candidate=candidate,
+                        timestamp=timestamp,
+                        confirmed=True,
+                        depth_ready=True,
+                        validated_rows=len(rows),
+                        paper_ready_rows=paper_ready_rows,
+                        queue_depth=self._queue.qsize(),
+                        latency_ms=(
+                            (time.monotonic() - candidate.get("_stream_first_seen_monotonic")) * 1000
+                            if candidate.get("_stream_first_seen_monotonic") is not None
+                            else None
+                        ),
+                    )
+                write_validated_results_to_csv(rows, timestamp)
             except Exception as exc:
+                if self.lifecycle_logger is not None:
+                    self.lifecycle_logger.log(
+                        "validation_error",
+                        candidate=candidate,
+                        queue_depth=self._queue.qsize(),
+                        reason=str(exc),
+                    )
                 print(f"[event-candidate] {candidate.get('symbol')} skipped: {exc}")
             finally:
+                with self._lock:
+                    self._queued_routes.discard(route)
                 self._queue.task_done()
 
 
@@ -1620,6 +2014,16 @@ def run_scan_once(
             f"{row['paper_ready_any']}"
         )
 
+    if event_publisher is not None:
+        event_publisher.publish(
+            "validated_scan",
+            {
+                "timestamp_utc": timestamp.isoformat(),
+                "rows": validated_results,
+                "source": "scan_cycle",
+            },
+        )
+
     validated_output_file = write_validated_results_to_csv(
         validated_results,
         timestamp,
@@ -1629,15 +2033,6 @@ def run_scan_once(
         print(f"\nWrote {len(validated_results)} validated rows to {validated_output_file}")
     else:
         print("\nNo validated rows written.")
-
-    if event_publisher is not None:
-        event_publisher.publish(
-            "validated_scan",
-            {
-                "timestamp_utc": timestamp.isoformat(),
-                "rows": validated_results,
-            },
-        )
 
     websocket_validations = sum(
         1 for row in validated_results
@@ -1732,8 +2127,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ws-depth-reconnect-seconds",
         type=float,
-        default=5.0,
+        default=3.0,
         help="Seconds between websocket depth subscription rebuilds for changing target sets",
+    )
+    parser.add_argument(
+        "--ws-depth-batch-size",
+        type=int,
+        default=DEEP_VALIDATE_TOP_N,
+        help="Maximum hot depth symbols subscribed per exchange.",
     )
     parser.add_argument(
         "--funding-cache-seconds",
@@ -1814,6 +2215,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--event-driven-symbol-debounce-seconds", type=float, default=EVENT_DRIVEN_SYMBOL_DEBOUNCE_SECONDS)
     parser.add_argument("--event-driven-depth-wait-seconds", type=float, default=EVENT_DRIVEN_DEPTH_WAIT_SECONDS)
+    parser.add_argument("--event-driven-route-confirm-updates", type=int, default=EVENT_DRIVEN_ROUTE_CONFIRM_UPDATES)
+    parser.add_argument("--event-driven-route-confirm-seconds", type=float, default=EVENT_DRIVEN_ROUTE_CONFIRM_SECONDS)
+    parser.add_argument("--event-driven-route-state-ttl-seconds", type=float, default=EVENT_DRIVEN_ROUTE_STATE_TTL_SECONDS)
+    parser.add_argument(
+        "--event-driven-route-queue-cooldown-seconds",
+        type=float,
+        default=EVENT_DRIVEN_ROUTE_QUEUE_COOLDOWN_SECONDS,
+    )
+    parser.add_argument("--event-driven-hot-depth-ttl-seconds", type=float, default=EVENT_DRIVEN_HOT_DEPTH_TTL_SECONDS)
+    parser.add_argument("--event-driven-hot-depth-priority", type=int, default=EVENT_DRIVEN_HOT_DEPTH_PRIORITY)
     return parser.parse_args()
 
 
@@ -1845,6 +2256,10 @@ def main():
     websocket_service = None
     event_publisher = None
     event_candidate_pipeline = None
+    lifecycle_logger = LifecycleEventLogger(enabled=ML_LIFECYCLE_LOGGING_ENABLED)
+    lifecycle_logger.start()
+    if ML_LIFECYCLE_LOGGING_ENABLED:
+        print(f"ML lifecycle logging enabled: {ML_LIFECYCLE_OUTPUT_DIR}")
     use_websocket_features = args.use_websocket_cache or args.ws_depth_cache
 
     if use_websocket_features:
@@ -1860,6 +2275,7 @@ def main():
             config=WebsocketRuntimeConfig(
                 enabled_exchanges=enabled_exchanges,
                 ticker_symbol_limit=args.ws_ticker_symbol_limit or None,
+                depth_batch_size=args.ws_depth_batch_size,
                 depth_reconnect_seconds=args.ws_depth_reconnect_seconds,
                 funding_reconcile_enabled=args.ws_funding_reconcile_seconds > 0,
                 funding_reconcile_seconds=args.ws_funding_reconcile_seconds,
@@ -1867,6 +2283,11 @@ def main():
             ),
         )
         print(f"Starting websocket market data service for: {sorted(enabled_exchanges)}")
+        print(
+            "Websocket depth runtime: "
+            f"batch_size={args.ws_depth_batch_size} "
+            f"rebuild={args.ws_depth_reconnect_seconds:g}s"
+        )
         print(
             "Websocket funding reconciliation: "
             f"{args.ws_funding_reconcile_seconds > 0} "
@@ -1932,12 +2353,21 @@ def main():
                 ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,
                 funding_cache_seconds=args.funding_cache_seconds,
                 max_book_skew_seconds=args.max_cross_venue_book_skew_seconds,
+                route_confirm_updates=args.event_driven_route_confirm_updates,
+                route_confirm_seconds=args.event_driven_route_confirm_seconds,
+                route_state_ttl_seconds=args.event_driven_route_state_ttl_seconds,
+                route_queue_cooldown_seconds=args.event_driven_route_queue_cooldown_seconds,
+                hot_depth_ttl_seconds=args.event_driven_hot_depth_ttl_seconds,
+                hot_depth_priority=args.event_driven_hot_depth_priority,
+                lifecycle_logger=lifecycle_logger,
             )
             event_candidate_pipeline.start()
             print(
                 "Event-driven candidate pipeline enabled: "
                 f"workers={args.event_driven_candidate_workers} "
-                f"debounce={args.event_driven_symbol_debounce_seconds:g}s"
+                f"debounce={args.event_driven_symbol_debounce_seconds:g}s "
+                f"confirm={args.event_driven_route_confirm_updates} updates/"
+                f"{args.event_driven_route_confirm_seconds:g}s"
             )
 
     try:
@@ -2000,6 +2430,10 @@ def main():
             event_candidate_pipeline.stop()
         if event_publisher is not None:
             event_publisher.stop()
+        if lifecycle_logger is not None:
+            lifecycle_logger.stop()
+            if lifecycle_logger.dropped_rows:
+                print(f"Lifecycle logger dropped {lifecycle_logger.dropped_rows} rows under load.")
 
 
 if __name__ == "__main__":

@@ -565,6 +565,7 @@ def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) ->
     next_csv_fallback = 0.0
     next_target_refresh = 0.0
     pending_rows: list[ValidatedOpportunity] = []
+    pending_entry_rows: list[ValidatedOpportunity] = []
     event_batch_deadline = 0.0
     last_entry_evaluated_at: dict[str, float] = {}
     print(
@@ -576,8 +577,13 @@ def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) ->
         while True:
             now_monotonic = time.monotonic()
             if now_monotonic >= next_csv_fallback:
-                summary = process_available_scans(args, config)
-                if summary["scans_processed"] or not args.quiet_idle:
+                try:
+                    summary = process_available_scans(args, config)
+                except SystemExit as exc:
+                    summary = None
+                    if not args.quiet_idle:
+                        print(f"CSV fallback skipped: {exc}")
+                if summary is not None and (summary["scans_processed"] or not args.quiet_idle):
                     print_summary(summary, config)
                 next_csv_fallback = now_monotonic + args.event_csv_fallback_seconds
 
@@ -596,7 +602,7 @@ def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) ->
                             {"exchange": position.short_exchange, "symbol": position.symbol},
                         ])
                     client.send({"type": "depth_targets", "targets": targets, "ttl_seconds": 30.0})
-                    next_target_refresh = now_monotonic + 10.0
+                    next_target_refresh = now_monotonic + args.position_depth_refresh_seconds
 
                 for event in client.receive(args.event_poll_seconds):
                     if event.get("type") != "event":
@@ -613,6 +619,11 @@ def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) ->
                         if not rows:
                             continue
                         pending_rows.extend(rows)
+                        if (
+                            payload.get("source") != "scan_cycle"
+                            or args.event_allow_scan_cycle_entries
+                        ):
+                            pending_entry_rows.extend(rows)
                         if not event_batch_deadline:
                             event_batch_deadline = now_monotonic + args.event_batch_seconds
                     elif channel == "position_orderbook":
@@ -644,9 +655,15 @@ def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) ->
                         if previous is None or row.timestamp_utc >= previous.timestamp_utc:
                             latest_rows[row.opportunity_key] = row
                     batch_rows = list(latest_rows.values())
+                    latest_entry_rows: dict[str, ValidatedOpportunity] = {}
+                    for row in pending_entry_rows:
+                        previous = latest_entry_rows.get(row.opportunity_key)
+                        if previous is None or row.timestamp_utc >= previous.timestamp_utc:
+                            latest_entry_rows[row.opportunity_key] = row
+                    entry_rows = list(latest_entry_rows.values())
                     scan_time = format_datetime(max(row.timestamp_utc for row in batch_rows))
                     entry_candidates = choose_event_entry_rows(
-                        batch_rows,
+                        entry_rows,
                         config,
                         last_evaluated_at=last_entry_evaluated_at,
                         now_monotonic=now_monotonic,
@@ -666,9 +683,11 @@ def run_event_strategy_loop(args: argparse.Namespace, config: StrategyConfig) ->
                     )
                     print(
                         f"Processed event batch {scan_time} "
-                        f"({len(batch_rows)} rows, {len(entry_candidates)} entry candidates)."
+                        f"({len(batch_rows)} rows, {len(entry_rows)} entry rows, "
+                        f"{len(entry_candidates)} entry candidates)."
                     )
                     pending_rows = []
+                    pending_entry_rows = []
                     event_batch_deadline = 0.0
             except (ConnectionError, OSError) as exc:
                 client.close()
@@ -702,30 +721,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event-stream", action="store_true", help="Consume scanner localhost events for immediate strategy processing.")
     parser.add_argument("--event-host", default="127.0.0.1")
     parser.add_argument("--event-port", type=int, default=8765)
-    parser.add_argument("--event-poll-seconds", type=float, default=0.5)
+    parser.add_argument("--event-poll-seconds", type=float, default=0.1)
     parser.add_argument(
         "--event-batch-seconds",
         type=float,
-        default=2.0,
+        default=0.25,
         help="Maximum coalescing window for validated realtime events.",
     )
     parser.add_argument(
         "--event-max-entry-candidates",
         type=int,
-        default=5,
+        default=10,
         help="Maximum new entry routes evaluated per realtime event batch.",
     )
     parser.add_argument(
         "--event-entry-cooldown-seconds",
         type=float,
-        default=15.0,
+        default=2.0,
         help="Minimum seconds before reevaluating the same route for a new entry.",
+    )
+    parser.add_argument(
+        "--position-depth-refresh-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds between open-position websocket depth target refreshes.",
     )
     parser.add_argument(
         "--event-csv-fallback-seconds",
         type=float,
         default=300.0,
         help="Periodic CSV reconciliation interval while event mode is active.",
+    )
+    parser.add_argument(
+        "--event-allow-scan-cycle-entries",
+        action="store_true",
+        help="Allow scan-cycle validated events to create new entries in event mode.",
     )
     return parser.parse_args()
 
