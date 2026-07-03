@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from core.models import FundingInfo, OrderBook, OrderBookLevel
-from market_data.cache import CachedTicker, MarketDataCache
+from market_data.cache import CachedTicker, DepthTarget, MarketDataCache
 from market_data.event_stream import LocalEventClient, LocalEventPublisher
 from market_data.scanner_integration import (
     CandidateWatchlist,
@@ -22,7 +22,9 @@ from scanners.fast_futures_futures_scanner import (
     EventDrivenCandidatePipeline,
     build_depth_warm_candidates,
     build_fast_candidates,
+    build_fast_observations,
     calculate_hot_route_score,
+    classify_instrument,
     deep_validate_candidate,
     select_deep_candidates,
 )
@@ -172,6 +174,8 @@ def test_event_candidate_queue_uses_sequence_tie_breaker():
         ws_orderbook_max_age_seconds=10,
         funding_cache_seconds=60,
         max_book_skew_seconds=0.5,
+        strong_edge_max_book_skew_seconds=5.0,
+        strong_edge_min_fast_spread_pct=0.5,
         route_confirm_updates=1,
         route_confirm_seconds=0,
         route_state_ttl_seconds=10,
@@ -291,17 +295,45 @@ def test_dynamic_depth_subscription_messages_are_exchange_specific():
 
     binance_sub = service._binance_depth_subscribe_messages(["BTCUSDT"])
     assert binance_sub[0]["method"] == "SUBSCRIBE"
-    assert binance_sub[0]["params"] == ["btcusdt@depth20@500ms"]
+    assert binance_sub[0]["params"] == ["btcusdt@depth20@100ms"]
+    binance_shallow = service._binance_depth_subscribe_messages([
+        DepthTarget(
+            exchange="binance",
+            symbol="BTCUSDT",
+            expires_at_utc=datetime.now(timezone.utc),
+            depth_tier="shallow",
+        )
+    ])
+    assert binance_shallow[0]["params"] == ["btcusdt@depth5@100ms"]
     assert service._binance_depth_unsubscribe_messages(["BTCUSDT"])[0]["method"] == "UNSUBSCRIBE"
 
     bitget_sub = service._bitget_depth_subscribe_messages(["BTCUSDT"])
     assert bitget_sub[0]["op"] == "subscribe"
     assert bitget_sub[0]["args"][0]["channel"] == "books15"
+    bitget_shallow = service._bitget_depth_subscribe_messages([
+        DepthTarget(
+            exchange="bitget",
+            symbol="BTCUSDT",
+            expires_at_utc=datetime.now(timezone.utc),
+            depth_tier="shallow",
+        )
+    ])
+    assert bitget_shallow[0]["args"][0]["channel"] == "books5"
     assert service._bitget_depth_unsubscribe_messages(["BTCUSDT"])[0]["op"] == "unsubscribe"
 
     mexc_sub = service._mexc_depth_subscribe_messages(["BTCUSDT"])
     assert mexc_sub[0]["method"] == "sub.depth.full"
     assert mexc_sub[0]["param"]["symbol"] == "BTC_USDT"
+    assert mexc_sub[0]["param"]["limit"] == 20
+    mexc_shallow = service._mexc_depth_subscribe_messages([
+        DepthTarget(
+            exchange="mexc",
+            symbol="BTCUSDT",
+            expires_at_utc=datetime.now(timezone.utc),
+            depth_tier="shallow",
+        )
+    ])
+    assert mexc_shallow[0]["param"]["limit"] == 5
     assert service._mexc_depth_unsubscribe_messages(["BTCUSDT"])[0]["method"] == "unsub.depth.full"
 
     kucoin_sub = service._kucoin_depth_subscribe_messages(["BTCUSDT"])
@@ -316,6 +348,37 @@ def test_dynamic_depth_subscription_messages_are_exchange_specific():
         "activeAssetCtx",
     ]
     assert all(message["method"] == "unsubscribe" for message in service._hyperliquid_depth_unsubscribe_messages(["BTCUSDT"]))
+
+
+def test_depth_target_tiers_can_promote_shallow_to_deep_subscription():
+    cache = MarketDataCache()
+    service = WebsocketMarketDataService(adapters={}, cache=cache)
+    cache.set_depth_targets(
+        [("binance", "BTCUSDT")],
+        ttl_seconds=60,
+        source="scanner_hot",
+        priority=35,
+        depth_tier="shallow",
+    )
+    cache.set_depth_targets(
+        [("binance", "BTCUSDT")],
+        ttl_seconds=60,
+        source="validation",
+        priority=45,
+        depth_tier="deep",
+    )
+
+    targets = cache.get_depth_targets("binance")
+    assert sorted(target.depth_tier for target in targets) == ["deep", "shallow"]
+    subscribed = service._coalesce_depth_targets_for_subscription(targets)
+    assert len(subscribed) == 1
+    assert subscribed[0].depth_tier == "deep"
+
+
+def test_stock_like_symbols_are_not_classified_as_crypto():
+    for symbol in ["SPYUSDT", "QQQUSDT", "ASMLUSDT", "MRVLUSDT", "MUUSDT", "SMCIUSDT"]:
+        assert classify_instrument(symbol) == "tokenised_stock_or_synthetic"
+    assert classify_instrument("BTCUSDT") == "crypto"
 
 
 def test_replace_depth_targets_removes_stale_targets():
@@ -561,7 +624,7 @@ def test_hyperliquid_midpoint_rows_do_not_create_fast_candidates():
     assert build_fast_candidates(ticker_data) == []
 
 
-def test_hyperliquid_bbo_rows_can_create_fast_candidates():
+def test_hyperliquid_bbo_rows_are_observation_only_by_default():
     ticker_data = {
         "binance": {
             "BTCUSDT": {
@@ -585,10 +648,12 @@ def test_hyperliquid_bbo_rows_can_create_fast_candidates():
     }
 
     candidates = build_fast_candidates(ticker_data)
+    observations = build_fast_observations(ticker_data)
 
-    assert len(candidates) == 1
-    assert candidates[0]["short_exchange"] == "hyperliquid"
-    assert candidates[0]["short_price_source"] == "websocket_bbo"
+    assert candidates == []
+    assert len(observations) == 1
+    assert observations[0]["short_exchange"] == "hyperliquid"
+    assert observations[0]["short_price_source"] == "websocket_bbo"
 
 
 def test_generic_websocket_bid_ask_rows_can_create_fast_candidates():
@@ -774,6 +839,8 @@ def test_deep_validation_rejects_excessive_cross_venue_book_skew():
             market_data_cache=cache,
             ws_orderbook_max_age_seconds=10,
             max_cross_venue_book_skew_seconds=0.5,
+            strong_edge_max_cross_venue_book_skew_seconds=0.5,
+            strong_edge_min_fast_spread_pct=99.0,
         )
     except ValueError as exc:
         assert "cross_venue_book_skew" in str(exc)
@@ -1004,12 +1071,14 @@ if __name__ == "__main__":
     test_streaming_route_tracker_confirms_by_updates_or_age()
     test_hot_route_score_prefers_persistent_depth_ready_routes()
     test_dynamic_depth_subscription_messages_are_exchange_specific()
+    test_depth_target_tiers_can_promote_shallow_to_deep_subscription()
+    test_stock_like_symbols_are_not_classified_as_crypto()
     test_build_depth_targets_from_candidates_limits_and_dedupes()
     test_ticker_data_uses_cache_when_fresh_and_rest_when_cold()
     test_funding_info_cache_avoids_repeated_adapter_calls()
     test_ticker_funding_fields_update_funding_cache()
     test_hyperliquid_midpoint_rows_do_not_create_fast_candidates()
-    test_hyperliquid_bbo_rows_can_create_fast_candidates()
+    test_hyperliquid_bbo_rows_are_observation_only_by_default()
     test_generic_websocket_bid_ask_rows_can_create_fast_candidates()
     test_wait_for_candidate_orderbooks_reports_ready_routes()
     test_deep_validation_uses_cached_books_and_funding()

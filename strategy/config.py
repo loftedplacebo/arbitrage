@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    experiment_id: str = "spread_roundtrip_loose_20260620_v1"
+    experiment_id: str = "one_event_streaming_20260703_v1"
     data_dir: Path = REPO_ROOT / "data" / "strategy"
     validated_input_dir: Path = REPO_ROOT / "data" / "validated_futures_futures_snapshots"
 

@@ -5,13 +5,14 @@ import itertools
 import json
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Awaitable, Callable, Iterable
 
 import requests
 
 from core.symbols import standard_to_exchange_symbol
-from market_data.cache import MarketDataCache
+from market_data.cache import DepthTarget, MarketDataCache
 from market_data.ws_parsers import (
     parse_binance_book_ticker,
     parse_binance_depth,
@@ -108,6 +109,10 @@ class WebsocketMarketDataService:
         *,
         max_candidates: int,
         replace: bool = False,
+        depth_tier: str = "deep",
+        source: str = "scanner",
+        priority: int = 0,
+        ttl_seconds: float | None = None,
     ) -> None:
         from market_data.scanner_integration import build_depth_targets_from_candidates
 
@@ -118,12 +123,18 @@ class WebsocketMarketDataService:
         if replace:
             self.cache.replace_depth_targets(
                 targets,
-                ttl_seconds=self.config.depth_target_ttl_seconds,
+                ttl_seconds=ttl_seconds or self.config.depth_target_ttl_seconds,
+                source=source,
+                priority=priority,
+                depth_tier=depth_tier,
             )
         else:
             self.cache.set_depth_targets(
                 targets,
-                ttl_seconds=self.config.depth_target_ttl_seconds,
+                ttl_seconds=ttl_seconds or self.config.depth_target_ttl_seconds,
+                source=source,
+                priority=priority,
+                depth_tier=depth_tier,
             )
 
     def _run_thread(self) -> None:
@@ -231,8 +242,8 @@ class WebsocketMarketDataService:
         exchange: str,
         url: str | Callable[[], str | Awaitable[str]],
         on_message: Callable[[dict], None],
-        subscribe_messages: Callable[[list[str]], list[dict]],
-        unsubscribe_messages: Callable[[list[str]], list[dict]],
+        subscribe_messages: Callable[[list[DepthTarget | str]], list[dict]],
+        unsubscribe_messages: Callable[[list[DepthTarget | str]], list[dict]],
         ping_message: dict | None = None,
     ) -> None:
         assert self._stop_event is not None
@@ -248,21 +259,29 @@ class WebsocketMarketDataService:
                         now = asyncio.get_running_loop().time()
 
                         if now >= next_target_refresh:
-                            desired = [
-                                target.symbol
-                                for target in self.cache.get_depth_targets(exchange)
-                            ][: self.config.depth_batch_size]
+                            desired_targets = self._coalesce_depth_targets_for_subscription(
+                                self.cache.get_depth_targets(exchange)
+                            )[: self.config.depth_batch_size]
+                            desired = {
+                                target.subscription_key: target
+                                for target in desired_targets
+                            }
                             desired_set = set(desired)
-                            to_unsubscribe = sorted(subscribed - desired_set)
-                            to_subscribe = sorted(desired_set - subscribed)
+                            to_unsubscribe_keys = sorted(subscribed - desired_set)
+                            to_subscribe_keys = sorted(desired_set - subscribed)
+                            to_unsubscribe = [
+                                self._target_from_subscription_key(key)
+                                for key in to_unsubscribe_keys
+                            ]
+                            to_subscribe = [desired[key] for key in to_subscribe_keys]
 
                             for message in unsubscribe_messages(to_unsubscribe):
                                 await ws.send(json.dumps(message))
                             for message in subscribe_messages(to_subscribe):
                                 await ws.send(json.dumps(message))
 
-                            subscribed.difference_update(to_unsubscribe)
-                            subscribed.update(to_subscribe)
+                            subscribed.difference_update(to_unsubscribe_keys)
+                            subscribed.update(to_subscribe_keys)
                             next_target_refresh = now + self.config.depth_target_refresh_seconds
 
                         if ping_message and (
@@ -295,6 +314,40 @@ class WebsocketMarketDataService:
             return await resolved
         return resolved
 
+    def _target_symbol(self, target: DepthTarget | str) -> str:
+        return target.symbol if isinstance(target, DepthTarget) else str(target)
+
+    def _target_depth_tier(self, target: DepthTarget | str) -> str:
+        return target.depth_tier if isinstance(target, DepthTarget) else "deep"
+
+    def _coalesce_depth_targets_for_subscription(
+        self,
+        targets: list[DepthTarget],
+    ) -> list[DepthTarget]:
+        best_by_symbol: dict[str, DepthTarget] = {}
+        for target in targets:
+            existing = best_by_symbol.get(target.symbol)
+            if existing is None or self._depth_target_rank(target) > self._depth_target_rank(existing):
+                best_by_symbol[target.symbol] = target
+        return sorted(
+            best_by_symbol.values(),
+            key=lambda item: self._depth_target_rank(item),
+            reverse=True,
+        )
+
+    def _depth_target_rank(self, target: DepthTarget) -> tuple[int, int, float]:
+        tier_rank = 1 if target.depth_tier == "deep" else 0
+        return (target.priority, tier_rank, target.expires_at_utc.timestamp())
+
+    def _target_from_subscription_key(self, key: str) -> DepthTarget:
+        exchange, symbol, depth_tier = key.split("|", 2)
+        return DepthTarget(
+            exchange=exchange,
+            symbol=symbol,
+            expires_at_utc=datetime.now(timezone.utc),
+            depth_tier=depth_tier,
+        )
+
     async def _binance_book_ticker_loop(self) -> None:
         def on_message(payload: dict) -> None:
             ticker = parse_binance_book_ticker(payload)
@@ -324,21 +377,26 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
-    def _binance_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
-        if not symbols:
+    def _binance_depth_stream(self, target: DepthTarget | str) -> str:
+        symbol = self._target_symbol(target).lower()
+        levels = "depth5" if self._target_depth_tier(target) == "shallow" else "depth20"
+        return f"{symbol}@{levels}@100ms"
+
+    def _binance_depth_subscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
+        if not targets:
             return []
         return [{
             "method": "SUBSCRIBE",
-            "params": [f"{symbol.lower()}@depth20@500ms" for symbol in symbols],
+            "params": [self._binance_depth_stream(target) for target in targets],
             "id": next(self._message_ids),
         }]
 
-    def _binance_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
-        if not symbols:
+    def _binance_depth_unsubscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
+        if not targets:
             return []
         return [{
             "method": "UNSUBSCRIBE",
-            "params": [f"{symbol.lower()}@depth20@500ms" for symbol in symbols],
+            "params": [self._binance_depth_stream(target) for target in targets],
             "id": next(self._message_ids),
         }]
 
@@ -380,23 +438,27 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
-    def _bitget_depth_args(self, symbols: list[str]) -> list[dict]:
+    def _bitget_depth_args(self, targets: list[DepthTarget | str]) -> list[dict]:
         return [
-            {"instType": "USDT-FUTURES", "channel": "books15", "instId": symbol}
-            for symbol in symbols
+            {
+                "instType": "USDT-FUTURES",
+                "channel": "books5" if self._target_depth_tier(target) == "shallow" else "books15",
+                "instId": self._target_symbol(target),
+            }
+            for target in targets
         ]
 
-    def _bitget_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
+    def _bitget_depth_subscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
         return [
             {"op": "subscribe", "args": self._bitget_depth_args(batch)}
-            for batch in _chunks(symbols, min(50, max(1, self.config.depth_batch_size)))
+            for batch in _chunks(targets, min(50, max(1, self.config.depth_batch_size)))
             if batch
         ]
 
-    def _bitget_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
+    def _bitget_depth_unsubscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
         return [
             {"op": "unsubscribe", "args": self._bitget_depth_args(batch)}
-            for batch in _chunks(symbols, min(50, max(1, self.config.depth_batch_size)))
+            for batch in _chunks(targets, min(50, max(1, self.config.depth_batch_size)))
             if batch
         ]
 
@@ -447,28 +509,39 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
-    def _mexc_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
+    def _mexc_depth_limit(self, target: DepthTarget | str) -> int:
+        return 5 if self._target_depth_tier(target) == "shallow" else 20
+
+    def _mexc_depth_subscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
         return [
             {
                 "method": "sub.depth.full",
                 "param": {
-                    "symbol": standard_to_exchange_symbol(symbol, "mexc", "futures"),
-                    "limit": 20,
+                    "symbol": standard_to_exchange_symbol(
+                        self._target_symbol(target),
+                        "mexc",
+                        "futures",
+                    ),
+                    "limit": self._mexc_depth_limit(target),
                 },
             }
-            for symbol in symbols
+            for target in targets
         ]
 
-    def _mexc_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
+    def _mexc_depth_unsubscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
         return [
             {
                 "method": "unsub.depth.full",
                 "param": {
-                    "symbol": standard_to_exchange_symbol(symbol, "mexc", "futures"),
-                    "limit": 20,
+                    "symbol": standard_to_exchange_symbol(
+                        self._target_symbol(target),
+                        "mexc",
+                        "futures",
+                    ),
+                    "limit": self._mexc_depth_limit(target),
                 },
             }
-            for symbol in symbols
+            for target in targets
         ]
 
     async def _mexc_depth_loop(self) -> None:
@@ -565,22 +638,23 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
-    def _kucoin_depth_topic(self, symbol: str) -> str:
+    def _kucoin_depth_topic(self, target: DepthTarget | str) -> str:
+        symbol = self._target_symbol(target)
         return (
             "/contractMarket/level2Depth50:"
             f"{standard_to_exchange_symbol(symbol, 'kucoin', 'futures')}"
         )
 
-    def _kucoin_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
+    def _kucoin_depth_subscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
         return [
-            self._kucoin_subscribe_message(self._kucoin_depth_topic(symbol))
-            for symbol in symbols
+            self._kucoin_subscribe_message(self._kucoin_depth_topic(target))
+            for target in targets
         ]
 
-    def _kucoin_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
+    def _kucoin_depth_unsubscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
         return [
-            self._kucoin_unsubscribe_message(self._kucoin_depth_topic(symbol))
-            for symbol in symbols
+            self._kucoin_unsubscribe_message(self._kucoin_depth_topic(target))
+            for target in targets
         ]
 
     async def _kucoin_depth_loop(self) -> None:
@@ -649,9 +723,14 @@ class WebsocketMarketDataService:
             on_message=on_message,
         )
 
-    def _hyperliquid_depth_subscription_messages(self, symbols: list[str], method: str) -> list[dict]:
+    def _hyperliquid_depth_subscription_messages(
+        self,
+        targets: list[DepthTarget | str],
+        method: str,
+    ) -> list[dict]:
         messages = []
-        for symbol in symbols:
+        for target in targets:
+            symbol = self._target_symbol(target)
             coin = standard_to_exchange_symbol(symbol, "hyperliquid", "futures")
             messages.extend([
                 {"method": method, "subscription": {"type": "bbo", "coin": coin}},
@@ -660,11 +739,11 @@ class WebsocketMarketDataService:
             ])
         return messages
 
-    def _hyperliquid_depth_subscribe_messages(self, symbols: list[str]) -> list[dict]:
-        return self._hyperliquid_depth_subscription_messages(symbols, "subscribe")
+    def _hyperliquid_depth_subscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
+        return self._hyperliquid_depth_subscription_messages(targets, "subscribe")
 
-    def _hyperliquid_depth_unsubscribe_messages(self, symbols: list[str]) -> list[dict]:
-        return self._hyperliquid_depth_subscription_messages(symbols, "unsubscribe")
+    def _hyperliquid_depth_unsubscribe_messages(self, targets: list[DepthTarget | str]) -> list[dict]:
+        return self._hyperliquid_depth_subscription_messages(targets, "unsubscribe")
 
     async def _hyperliquid_depth_loop(self) -> None:
         def on_message(payload: dict) -> None:

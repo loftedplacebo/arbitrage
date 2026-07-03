@@ -57,9 +57,14 @@ class DepthTarget:
     expires_at_utc: datetime
     source: str = "scanner"
     priority: int = 0
+    depth_tier: str = "deep"
 
     def is_active(self, now: datetime | None = None) -> bool:
         return self.expires_at_utc > (now or utc_now())
+
+    @property
+    def subscription_key(self) -> str:
+        return f"{self.exchange}|{self.symbol}|{self.depth_tier}"
 
 
 @dataclass(frozen=True)
@@ -84,7 +89,7 @@ class MarketDataCache:
         self._tickers: dict[tuple[str, str], CachedTicker] = {}
         self._orderbooks: dict[tuple[str, str], OrderBook] = {}
         self._funding: dict[tuple[str, str], FundingInfo] = {}
-        self._depth_targets: dict[tuple[str, str, str], DepthTarget] = {}
+        self._depth_targets: dict[tuple[str, str, str, str], DepthTarget] = {}
         self._listeners: list[Callable[[str, object], None]] = []
 
     def add_listener(self, listener: Callable[[str, object], None]) -> None:
@@ -270,33 +275,43 @@ class MarketDataCache:
 
     def set_depth_targets(
         self,
-        targets: Iterable[tuple[str, str]],
+        targets: Iterable[tuple[str, str] | tuple[str, str, str]],
         *,
         ttl_seconds: float,
         source: str = "scanner",
         priority: int = 0,
+        depth_tier: str = "deep",
     ) -> None:
         expires_at = utc_now() + timedelta(seconds=ttl_seconds)
         with self._lock:
-            for exchange, symbol in targets:
-                self._depth_targets[(source, exchange, symbol)] = DepthTarget(
+            for exchange, symbol, target_depth_tier in self._normalise_depth_targets(
+                targets,
+                default_depth_tier=depth_tier,
+            ):
+                self._depth_targets[(source, exchange, symbol, target_depth_tier)] = DepthTarget(
                     exchange=exchange,
                     symbol=symbol,
                     expires_at_utc=expires_at,
                     source=source,
                     priority=priority,
+                    depth_tier=target_depth_tier,
                 )
             self._prune_depth_targets_locked()
 
     def replace_depth_targets(
         self,
-        targets: Iterable[tuple[str, str]],
+        targets: Iterable[tuple[str, str] | tuple[str, str, str]],
         *,
         ttl_seconds: float,
         source: str = "scanner",
         priority: int = 0,
+        depth_tier: str = "deep",
     ) -> None:
         expires_at = utc_now() + timedelta(seconds=ttl_seconds)
+        normalised_targets = list(self._normalise_depth_targets(
+            targets,
+            default_depth_tier=depth_tier,
+        ))
         with self._lock:
             self._depth_targets = {
                 key: target
@@ -304,28 +319,36 @@ class MarketDataCache:
                 if target.source != source
             }
             self._depth_targets.update({
-                (source, exchange, symbol): DepthTarget(
+                (source, exchange, symbol, target_depth_tier): DepthTarget(
                     exchange=exchange,
                     symbol=symbol,
                     expires_at_utc=expires_at,
                     source=source,
                     priority=priority,
+                    depth_tier=target_depth_tier,
                 )
-                for exchange, symbol in targets
+                for exchange, symbol, target_depth_tier in normalised_targets
             })
 
-    def get_depth_targets(self, exchange: str | None = None) -> list[DepthTarget]:
+    def get_depth_targets(
+        self,
+        exchange: str | None = None,
+        *,
+        depth_tier: str | None = None,
+    ) -> list[DepthTarget]:
         now = utc_now()
         with self._lock:
             self._prune_depth_targets_locked(now=now)
             raw_targets = [
                 target
                 for target in self._depth_targets.values()
-                if target.is_active(now) and (exchange is None or target.exchange == exchange)
+                if target.is_active(now)
+                and (exchange is None or target.exchange == exchange)
+                and (depth_tier is None or target.depth_tier == depth_tier)
             ]
-        merged: dict[tuple[str, str], DepthTarget] = {}
+        merged: dict[tuple[str, str, str], DepthTarget] = {}
         for target in raw_targets:
-            key = (target.exchange, target.symbol)
+            key = (target.exchange, target.symbol, target.depth_tier)
             existing = merged.get(key)
             if existing is None or (target.priority, target.expires_at_utc) > (
                 existing.priority,
@@ -334,7 +357,12 @@ class MarketDataCache:
                 merged[key] = target
         return sorted(
             merged.values(),
-            key=lambda item: (-item.priority, item.exchange, item.symbol),
+            key=lambda item: (
+                -item.priority,
+                0 if item.depth_tier == "deep" else 1,
+                item.exchange,
+                item.symbol,
+            ),
         )
 
     def has_depth_target(
@@ -343,6 +371,7 @@ class MarketDataCache:
         symbol: str,
         *,
         source: str | None = None,
+        depth_tier: str | None = None,
     ) -> bool:
         now = utc_now()
         with self._lock:
@@ -351,9 +380,28 @@ class MarketDataCache:
                 target.exchange == exchange
                 and target.symbol == symbol
                 and (source is None or target.source == source)
+                and (depth_tier is None or target.depth_tier == depth_tier)
                 and target.is_active(now)
                 for target in self._depth_targets.values()
             )
+
+    def _normalise_depth_targets(
+        self,
+        targets: Iterable[tuple[str, str] | tuple[str, str, str]],
+        *,
+        default_depth_tier: str,
+    ) -> list[tuple[str, str, str]]:
+        normalised = []
+        for target in targets:
+            if len(target) == 2:
+                exchange, symbol = target
+                depth_tier = default_depth_tier
+            elif len(target) == 3:
+                exchange, symbol, depth_tier = target
+            else:
+                continue
+            normalised.append((str(exchange), str(symbol), str(depth_tier or default_depth_tier)))
+        return normalised
 
     def get_ticker_symbols(
         self,

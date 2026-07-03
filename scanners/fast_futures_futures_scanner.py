@@ -52,6 +52,7 @@ FAST_SPREAD_THRESHOLD_PCT = 0.08
 MIN_COMBINED_VOLUME_USDT = 1_000_000
 MAX_FAST_CANDIDATES = 500
 FAST_SCAN_CRYPTO_ONLY = False
+TRADE_ENABLED_EXCHANGES = {"binance", "bitget", "mexc", "kucoin"}
 ML_OBSERVATION_LOGGING_ENABLED = True
 ML_FAST_SPREAD_LOG_THRESHOLD_PCT = 0.03
 ML_MAX_FAST_OBSERVATIONS = 2_000
@@ -65,12 +66,14 @@ ROUTE_STATS_BOOTSTRAP_MAX_ROWS = 200_000
 DEEP_VALIDATE_TOP_N = 150
 DEEP_VALIDATE_CRYPTO_ONLY = True
 DEEP_VALIDATE_WORKERS = 8
-MAX_CROSS_VENUE_BOOK_SKEW_SECONDS = 1.00
+MAX_CROSS_VENUE_BOOK_SKEW_SECONDS = 2.50
+STRONG_EDGE_MAX_CROSS_VENUE_BOOK_SKEW_SECONDS = 5.00
+STRONG_EDGE_MIN_FAST_SPREAD_PCT = 0.50
 EVENT_DRIVEN_CANDIDATE_WORKERS = 2
 EVENT_DRIVEN_SYMBOL_DEBOUNCE_SECONDS = 0.05
 EVENT_DRIVEN_DEPTH_WAIT_SECONDS = 1.25
-EVENT_DRIVEN_ROUTE_CONFIRM_UPDATES = 2
-EVENT_DRIVEN_ROUTE_CONFIRM_SECONDS = 0.50
+EVENT_DRIVEN_ROUTE_CONFIRM_UPDATES = 1
+EVENT_DRIVEN_ROUTE_CONFIRM_SECONDS = 0.0
 EVENT_DRIVEN_ROUTE_STATE_TTL_SECONDS = 20.0
 EVENT_DRIVEN_ROUTE_QUEUE_COOLDOWN_SECONDS = 0.50
 EVENT_DRIVEN_HOT_DEPTH_TTL_SECONDS = 45.0
@@ -86,6 +89,9 @@ CANDIDATE_WATCHLIST_ENABLED = True
 CANDIDATE_WATCHLIST_TTL_SECONDS = 900
 CANDIDATE_WATCHLIST_MAX_ROUTES = 750
 CANDIDATE_WATCHLIST_DEPTH_TARGET_LIMIT = 150
+SHALLOW_DEPTH_TARGET_LIMIT = 500
+SHALLOW_DEPTH_TTL_SECONDS = 180.0
+SHALLOW_DEPTH_PRIORITY = 35
 
 # Rough taker/taker assumption for opening both futures legs only.
 # Later we should model entry + exit and exchange-specific maker/taker fees.
@@ -130,14 +136,48 @@ TOKENISED_STOCK_KEYWORDS = [
 ]
 
 TOKENISED_STOCK_BASE_SYMBOLS = {
+    "AAPL",
+    "AMZN",
     "ANTHROPIC",
+    "ASML",
     "APLD",
+    "AVGO",
+    "BABA",
     "BP",
+    "COIN",
+    "CRCL",
+    "DIA",
+    "DIS",
+    "DRAM",
+    "EWY",
+    "GLW",
+    "GOOG",
+    "GOOGL",
+    "IBIT",
+    "IWM",
+    "MARA",
+    "META",
+    "MRVL",
+    "MSFT",
+    "MU",
+    "NFLX",
+    "NKE",
+    "NVDA",
     "OKLO",
+    "ORCL",
+    "PLTR",
     "QNTSTOCK",
+    "QQQ",
     "RDDT",
+    "RIOT",
+    "SMCI",
+    "SNDK",
     "SOXS",
+    "SPY",
     "SQQQ",
+    "TSLA",
+    "XLE",
+    "XLK",
 }
 
 # Keep this permissive for now. We can expand once real examples appear.
@@ -189,22 +229,56 @@ def fmt(value):
     return " NOFILL" if value is None else f"{value:>8.4f}"
 
 
-def classify_instrument(symbol: str) -> str:
+def classify_instrument_with_reason(symbol: str) -> tuple[str, str]:
     symbol = symbol.upper()
     base_symbol = symbol.removesuffix("USDT")
 
     if base_symbol in TOKENISED_STOCK_BASE_SYMBOLS:
-        return "tokenised_stock_or_synthetic"
+        return "tokenised_stock_or_synthetic", f"base_symbol:{base_symbol}"
 
     for keyword in TOKENISED_STOCK_KEYWORDS:
         if keyword in symbol:
-            return "tokenised_stock_or_synthetic"
+            return "tokenised_stock_or_synthetic", f"keyword:{keyword}"
 
     for keyword in UNKNOWN_OR_SPECIAL_KEYWORDS:
         if keyword in symbol:
-            return "unknown_or_special"
+            return "unknown_or_special", f"keyword:{keyword}"
 
-    return "crypto"
+    return "crypto", "default_crypto"
+
+
+def classify_instrument(symbol: str) -> str:
+    instrument_class, _reason = classify_instrument_with_reason(symbol)
+    return instrument_class
+
+
+def is_trade_enabled_route(long_exchange: str, short_exchange: str) -> bool:
+    return long_exchange in TRADE_ENABLED_EXCHANGES and short_exchange in TRADE_ENABLED_EXCHANGES
+
+
+def adaptive_book_skew_limit_seconds(
+    candidate: dict,
+    *,
+    base_limit_seconds: float,
+    strong_edge_limit_seconds: float,
+    strong_edge_min_fast_spread_pct: float,
+) -> tuple[float, str]:
+    try:
+        fast_spread_pct = float(candidate.get("fast_spread_pct") or 0.0)
+    except (TypeError, ValueError):
+        fast_spread_pct = 0.0
+    try:
+        hot_route_score = float(candidate.get("hot_route_score") or 0.0)
+    except (TypeError, ValueError):
+        hot_route_score = 0.0
+
+    if (
+        fast_spread_pct >= strong_edge_min_fast_spread_pct
+        or hot_route_score >= EVENT_DRIVEN_REST_FALLBACK_MIN_HOT_ROUTE_SCORE
+    ):
+        return max(base_limit_seconds, strong_edge_limit_seconds), "strong_edge_relaxed"
+
+    return base_limit_seconds, "normal"
 
 
 def persistence_key(row: dict) -> str:
@@ -549,7 +623,7 @@ def build_fast_candidates(ticker_data: dict[str, dict[str, dict]]) -> list[dict]
             if combined_volume < MIN_COMBINED_VOLUME_USDT:
                 continue
 
-            instrument_class = classify_instrument(symbol)
+            instrument_class, instrument_class_reason = classify_instrument_with_reason(symbol)
             if FAST_SCAN_CRYPTO_ONLY and instrument_class != "crypto":
                 continue
 
@@ -561,9 +635,12 @@ def build_fast_candidates(ticker_data: dict[str, dict[str, dict]]) -> list[dict]
             )
 
             if spread_ab >= FAST_SPREAD_THRESHOLD_PCT:
+                if not is_trade_enabled_route(exchange_a, exchange_b):
+                    continue
                 candidates.append({
                     "symbol": symbol,
                     "instrument_class": instrument_class,
+                    "instrument_class_reason": instrument_class_reason,
                     "long_exchange": exchange_a,
                     "short_exchange": exchange_b,
                     "direction": f"long_{exchange_a}_short_{exchange_b}",
@@ -585,9 +662,12 @@ def build_fast_candidates(ticker_data: dict[str, dict[str, dict]]) -> list[dict]
             )
 
             if spread_ba >= FAST_SPREAD_THRESHOLD_PCT:
+                if not is_trade_enabled_route(exchange_b, exchange_a):
+                    continue
                 candidates.append({
                     "symbol": symbol,
                     "instrument_class": instrument_class,
+                    "instrument_class_reason": instrument_class_reason,
                     "long_exchange": exchange_b,
                     "short_exchange": exchange_a,
                     "direction": f"long_{exchange_b}_short_{exchange_a}",
@@ -641,7 +721,7 @@ def build_fast_observations(ticker_data: dict[str, dict[str, dict]]) -> list[dic
             if combined_volume < MIN_COMBINED_VOLUME_USDT:
                 continue
 
-            instrument_class = classify_instrument(symbol)
+            instrument_class, instrument_class_reason = classify_instrument_with_reason(symbol)
             if FAST_SCAN_CRYPTO_ONLY and instrument_class != "crypto":
                 continue
 
@@ -653,6 +733,7 @@ def build_fast_observations(ticker_data: dict[str, dict[str, dict]]) -> list[dic
                 observations.append({
                     "symbol": symbol,
                     "instrument_class": instrument_class,
+                    "instrument_class_reason": instrument_class_reason,
                     "long_exchange": exchange_a,
                     "short_exchange": exchange_b,
                     "direction": f"long_{exchange_a}_short_{exchange_b}",
@@ -676,6 +757,7 @@ def build_fast_observations(ticker_data: dict[str, dict[str, dict]]) -> list[dic
                 observations.append({
                     "symbol": symbol,
                     "instrument_class": instrument_class,
+                    "instrument_class_reason": instrument_class_reason,
                     "long_exchange": exchange_b,
                     "short_exchange": exchange_a,
                     "direction": f"long_{exchange_b}_short_{exchange_a}",
@@ -722,6 +804,7 @@ def write_fast_observations_to_csv(observations: list[dict], timestamp: datetime
         "observation_id",
         "symbol",
         "instrument_class",
+        "instrument_class_reason",
         "long_exchange",
         "short_exchange",
         "direction",
@@ -742,6 +825,7 @@ def write_fast_observations_to_csv(observations: list[dict], timestamp: datetime
         "config_deep_validate_top_n",
         "config_deep_validate_crypto_only",
         "config_fast_scan_crypto_only",
+        "config_trade_enabled_exchanges",
         "config_ml_max_fast_observations",
     ]
 
@@ -771,6 +855,7 @@ def write_fast_observations_to_csv(observations: list[dict], timestamp: datetime
                 "config_deep_validate_top_n": DEEP_VALIDATE_TOP_N,
                 "config_deep_validate_crypto_only": DEEP_VALIDATE_CRYPTO_ONLY,
                 "config_fast_scan_crypto_only": FAST_SCAN_CRYPTO_ONLY,
+                "config_trade_enabled_exchanges": ",".join(sorted(TRADE_ENABLED_EXCHANGES)),
                 "config_ml_max_fast_observations": ML_MAX_FAST_OBSERVATIONS,
                 **row,
             })
@@ -789,6 +874,7 @@ def write_fast_candidates_to_csv(candidates: list[dict], timestamp: datetime) ->
         "experiment_id",
         "symbol",
         "instrument_class",
+        "instrument_class_reason",
         "long_exchange",
         "short_exchange",
         "direction",
@@ -838,6 +924,8 @@ def deep_validate_candidate(
     ws_orderbook_max_age_seconds: float = 5.0,
     funding_cache_seconds: float = 60.0,
     max_cross_venue_book_skew_seconds: float = MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
+    strong_edge_max_cross_venue_book_skew_seconds: float = STRONG_EDGE_MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
+    strong_edge_min_fast_spread_pct: float = STRONG_EDGE_MIN_FAST_SPREAD_PCT,
     require_cached_orderbooks: bool = False,
     force_rest_orderbooks: bool = False,
 ) -> list[dict]:
@@ -882,13 +970,22 @@ def deep_validate_candidate(
         raise ValueError("cached_short_orderbook_unavailable")
     short_orderbook = short_orderbook or short_adapter.get_futures_orderbook(symbol, limit=100)
 
+    book_skew_limit_seconds, book_freshness_mode = adaptive_book_skew_limit_seconds(
+        candidate,
+        base_limit_seconds=max_cross_venue_book_skew_seconds,
+        strong_edge_limit_seconds=strong_edge_max_cross_venue_book_skew_seconds,
+        strong_edge_min_fast_spread_pct=strong_edge_min_fast_spread_pct,
+    )
+    long_book_age_seconds = max(0.0, (timestamp - long_orderbook.observed_at_utc).total_seconds())
+    short_book_age_seconds = max(0.0, (timestamp - short_orderbook.observed_at_utc).total_seconds())
     book_skew_seconds = abs(
         (long_orderbook.observed_at_utc - short_orderbook.observed_at_utc).total_seconds()
     )
-    if book_skew_seconds > max_cross_venue_book_skew_seconds:
+    if book_skew_seconds > book_skew_limit_seconds:
         raise ValueError(
             f"cross_venue_book_skew={book_skew_seconds:.3f}s "
-            f"limit={max_cross_venue_book_skew_seconds:.3f}s"
+            f"limit={book_skew_limit_seconds:.3f}s "
+            f"mode={book_freshness_mode}"
         )
 
     long_funding = get_funding_info_with_cache(
@@ -938,6 +1035,7 @@ def deep_validate_candidate(
             "timestamp_utc": timestamp.isoformat(),
             "symbol": symbol,
             "instrument_class": candidate["instrument_class"],
+            "instrument_class_reason": candidate.get("instrument_class_reason"),
             "notional_usdt": notional,
             "long_exchange": long_exchange,
             "short_exchange": short_exchange,
@@ -963,7 +1061,11 @@ def deep_validate_candidate(
             ),
             "long_orderbook_source": long_book_source,
             "short_orderbook_source": short_book_source,
+            "long_orderbook_age_ms": long_book_age_seconds * 1000,
+            "short_orderbook_age_ms": short_book_age_seconds * 1000,
             "cross_venue_book_skew_ms": book_skew_seconds * 1000,
+            "cross_venue_book_skew_limit_ms": book_skew_limit_seconds * 1000,
+            "book_freshness_mode": book_freshness_mode,
             "deep_validation_latency_ms": (time.monotonic() - validation_started) * 1000,
             "depth_validation_mode": candidate.get("depth_validation_mode"),
             "rest_fallback_reason": candidate.get("rest_fallback_reason"),
@@ -1295,6 +1397,7 @@ def _write_validated_results_to_csv(results: list[dict], timestamp: datetime) ->
         "experiment_id",
         "symbol",
         "instrument_class",
+        "instrument_class_reason",
         "notional_usdt",
         "long_exchange",
         "short_exchange",
@@ -1314,7 +1417,11 @@ def _write_validated_results_to_csv(results: list[dict], timestamp: datetime) ->
         "close_slippage_pct",
         "long_orderbook_source",
         "short_orderbook_source",
+        "long_orderbook_age_ms",
+        "short_orderbook_age_ms",
         "cross_venue_book_skew_ms",
+        "cross_venue_book_skew_limit_ms",
+        "book_freshness_mode",
         "deep_validation_latency_ms",
         "depth_validation_mode",
         "rest_fallback_reason",
@@ -1390,6 +1497,7 @@ class LifecycleEventLogger:
         "route_key",
         "symbol",
         "instrument_class",
+        "instrument_class_reason",
         "long_exchange",
         "short_exchange",
         "direction",
@@ -1553,6 +1661,8 @@ class EventDrivenCandidatePipeline:
         ws_orderbook_max_age_seconds: float,
         funding_cache_seconds: float,
         max_book_skew_seconds: float,
+        strong_edge_max_book_skew_seconds: float,
+        strong_edge_min_fast_spread_pct: float,
         route_confirm_updates: int,
         route_confirm_seconds: float,
         route_state_ttl_seconds: float,
@@ -1576,6 +1686,8 @@ class EventDrivenCandidatePipeline:
         self.ws_orderbook_max_age_seconds = ws_orderbook_max_age_seconds
         self.funding_cache_seconds = funding_cache_seconds
         self.max_book_skew_seconds = max_book_skew_seconds
+        self.strong_edge_max_book_skew_seconds = strong_edge_max_book_skew_seconds
+        self.strong_edge_min_fast_spread_pct = strong_edge_min_fast_spread_pct
         self.route_confirm_updates = max(1, route_confirm_updates)
         self.route_confirm_seconds = max(0.0, route_confirm_seconds)
         self.route_queue_cooldown_seconds = max(0.0, route_queue_cooldown_seconds)
@@ -1758,8 +1870,9 @@ class EventDrivenCandidatePipeline:
             self.cache.set_depth_targets(
                 hot_depth_targets,
                 ttl_seconds=self.hot_depth_ttl_seconds,
-                source="event_hot_routes",
+                source="event_hot_routes_shallow",
                 priority=self.hot_depth_priority,
+                depth_tier="shallow",
             )
 
     def _worker(self) -> None:
@@ -1778,6 +1891,7 @@ class EventDrivenCandidatePipeline:
                     ttl_seconds=self.hot_depth_ttl_seconds,
                     source="event_candidates",
                     priority=self.hot_depth_priority + 5,
+                    depth_tier="deep",
                 )
                 ready, _ = wait_for_candidate_orderbooks(
                     candidates=[candidate],
@@ -1827,6 +1941,10 @@ class EventDrivenCandidatePipeline:
                             ws_orderbook_max_age_seconds=self.ws_orderbook_max_age_seconds,
                             funding_cache_seconds=self.funding_cache_seconds,
                             max_cross_venue_book_skew_seconds=self.max_book_skew_seconds,
+                            strong_edge_max_cross_venue_book_skew_seconds=(
+                                self.strong_edge_max_book_skew_seconds
+                            ),
+                            strong_edge_min_fast_spread_pct=self.strong_edge_min_fast_spread_pct,
                             require_cached_orderbooks=True,
                         )
                     except ValueError as exc:
@@ -1936,15 +2054,17 @@ class EventDrivenCandidatePipeline:
         started = time.monotonic()
         future = self._rest_fallback_executor.submit(
             deep_validate_candidate,
-            fallback_candidate,
-            self.adapters,
-            timestamp,
-            self.cache,
-            self.ws_orderbook_max_age_seconds,
-            self.funding_cache_seconds,
-            self.max_book_skew_seconds,
-            False,
-            True,
+            candidate=fallback_candidate,
+            adapters=self.adapters,
+            timestamp=timestamp,
+            market_data_cache=self.cache,
+            ws_orderbook_max_age_seconds=self.ws_orderbook_max_age_seconds,
+            funding_cache_seconds=self.funding_cache_seconds,
+            max_cross_venue_book_skew_seconds=self.max_book_skew_seconds,
+            strong_edge_max_cross_venue_book_skew_seconds=self.strong_edge_max_book_skew_seconds,
+            strong_edge_min_fast_spread_pct=self.strong_edge_min_fast_spread_pct,
+            require_cached_orderbooks=False,
+            force_rest_orderbooks=True,
         )
         try:
             rows = future.result(timeout=self.rest_fallback_timeout_seconds)
@@ -1995,6 +2115,7 @@ def write_scan_telemetry_to_csv(row: dict, timestamp: datetime) -> Path:
         "websocket_deep_validations", "rest_fallback_deep_validations",
         "skew_rejections", "deep_validation_errors", "deep_validation_seconds",
         "scan_duration_seconds", "deep_validate_workers", "max_book_skew_ms",
+        "strong_edge_max_book_skew_ms", "strong_edge_min_fast_spread_pct",
     ]
     exists = output_file.exists()
     with output_file.open("a", newline="", encoding="utf-8") as handle:
@@ -2026,6 +2147,8 @@ def run_scan_once(
     event_publisher: LocalEventPublisher | None = None,
     deep_validate_workers: int = DEEP_VALIDATE_WORKERS,
     max_cross_venue_book_skew_seconds: float = MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
+    strong_edge_max_cross_venue_book_skew_seconds: float = STRONG_EDGE_MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
+    strong_edge_min_fast_spread_pct: float = STRONG_EDGE_MIN_FAST_SPREAD_PCT,
 ) -> tuple[list[dict], list[dict]]:
     scan_started_monotonic = time.monotonic()
     timestamp = utc_now()
@@ -2045,6 +2168,12 @@ def run_scan_once(
     print(f"Funding cache seconds: {funding_cache_seconds:g}")
     print(f"Deep validation workers: {deep_validate_workers}")
     print(f"Max cross-venue book skew ms: {max_cross_venue_book_skew_seconds * 1000:g}")
+    print(
+        "Strong-edge relaxed skew ms: "
+        f"{strong_edge_max_cross_venue_book_skew_seconds * 1000:g} "
+        f"when fast spread >= {strong_edge_min_fast_spread_pct:.4f}%"
+    )
+    print(f"Trade-enabled exchanges: {sorted(TRADE_ENABLED_EXCHANGES)}")
     print(f"Candidate watchlist enabled: {candidate_watchlist is not None}")
 
     ticker_data = {}
@@ -2160,6 +2289,19 @@ def run_scan_once(
             depth_warm_candidates,
             max_candidates=max(ws_depth_target_limit, CANDIDATE_WATCHLIST_DEPTH_TARGET_LIMIT),
             replace=True,
+            depth_tier="shallow",
+            source="scanner_shallow_watchlist",
+            priority=SHALLOW_DEPTH_PRIORITY,
+            ttl_seconds=SHALLOW_DEPTH_TTL_SECONDS,
+        )
+        websocket_service.set_depth_targets(
+            deep_candidates,
+            max_candidates=ws_depth_target_limit,
+            replace=True,
+            depth_tier="deep",
+            source="scanner_deep_candidates",
+            priority=SHALLOW_DEPTH_PRIORITY + 10,
+            ttl_seconds=EVENT_DRIVEN_HOT_DEPTH_TTL_SECONDS,
         )
         ready, total = wait_for_candidate_orderbooks(
             candidates=deep_candidates[:ws_depth_target_limit],
@@ -2201,14 +2343,16 @@ def run_scan_once(
         futures = {
             executor.submit(
                 deep_validate_candidate,
-                candidate,
-                adapters,
-                timestamp,
-                market_data_cache if ws_depth_cache else None,
-                ws_orderbook_max_age_seconds,
-                funding_cache_seconds,
-                max_cross_venue_book_skew_seconds,
-                ws_depth_cache,
+                candidate=candidate,
+                adapters=adapters,
+                timestamp=timestamp,
+                market_data_cache=market_data_cache if ws_depth_cache else None,
+                ws_orderbook_max_age_seconds=ws_orderbook_max_age_seconds,
+                funding_cache_seconds=funding_cache_seconds,
+                max_cross_venue_book_skew_seconds=max_cross_venue_book_skew_seconds,
+                strong_edge_max_cross_venue_book_skew_seconds=strong_edge_max_cross_venue_book_skew_seconds,
+                strong_edge_min_fast_spread_pct=strong_edge_min_fast_spread_pct,
+                require_cached_orderbooks=ws_depth_cache,
             ): candidate
             for candidate in deep_candidates
         }
@@ -2347,6 +2491,8 @@ def run_scan_once(
             "scan_duration_seconds": f"{time.monotonic() - scan_started_monotonic:.4f}",
             "deep_validate_workers": deep_validate_workers,
             "max_book_skew_ms": max_cross_venue_book_skew_seconds * 1000,
+            "strong_edge_max_book_skew_ms": strong_edge_max_cross_venue_book_skew_seconds * 1000,
+            "strong_edge_min_fast_spread_pct": strong_edge_min_fast_spread_pct,
         },
         timestamp,
     )
@@ -2498,6 +2644,18 @@ def parse_args() -> argparse.Namespace:
         "--max-cross-venue-book-skew-seconds",
         type=float,
         default=MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
+    )
+    parser.add_argument(
+        "--strong-edge-max-cross-venue-book-skew-seconds",
+        type=float,
+        default=STRONG_EDGE_MAX_CROSS_VENUE_BOOK_SKEW_SECONDS,
+        help="Relaxed cross-venue book skew limit for strong/hot routes.",
+    )
+    parser.add_argument(
+        "--strong-edge-min-fast-spread-pct",
+        type=float,
+        default=STRONG_EDGE_MIN_FAST_SPREAD_PCT,
+        help="Fast spread threshold that allows the relaxed skew limit.",
     )
     parser.add_argument(
         "--event-driven-candidates",
@@ -2671,6 +2829,8 @@ def main():
                 ws_orderbook_max_age_seconds=args.ws_orderbook_max_age_seconds,
                 funding_cache_seconds=args.funding_cache_seconds,
                 max_book_skew_seconds=args.max_cross_venue_book_skew_seconds,
+                strong_edge_max_book_skew_seconds=args.strong_edge_max_cross_venue_book_skew_seconds,
+                strong_edge_min_fast_spread_pct=args.strong_edge_min_fast_spread_pct,
                 route_confirm_updates=args.event_driven_route_confirm_updates,
                 route_confirm_seconds=args.event_driven_route_confirm_seconds,
                 route_state_ttl_seconds=args.event_driven_route_state_ttl_seconds,
@@ -2714,6 +2874,10 @@ def main():
                 event_publisher=event_publisher,
                 deep_validate_workers=args.deep_validate_workers,
                 max_cross_venue_book_skew_seconds=args.max_cross_venue_book_skew_seconds,
+                strong_edge_max_cross_venue_book_skew_seconds=(
+                    args.strong_edge_max_cross_venue_book_skew_seconds
+                ),
+                strong_edge_min_fast_spread_pct=args.strong_edge_min_fast_spread_pct,
             )
             return
 
@@ -2739,6 +2903,10 @@ def main():
                     event_publisher=event_publisher,
                     deep_validate_workers=args.deep_validate_workers,
                     max_cross_venue_book_skew_seconds=args.max_cross_venue_book_skew_seconds,
+                    strong_edge_max_cross_venue_book_skew_seconds=(
+                        args.strong_edge_max_cross_venue_book_skew_seconds
+                    ),
+                    strong_edge_min_fast_spread_pct=args.strong_edge_min_fast_spread_pct,
                 )
                 time.sleep(args.interval)
             except KeyboardInterrupt:
