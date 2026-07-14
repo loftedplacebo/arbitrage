@@ -13,6 +13,9 @@ POSITION_FIELDS = [
     "displayed_rate_at_entry_pct", "actual_funding_rate_pct", "entry_basis_pct",
     "current_basis_pct", "basis_pnl_pct", "funding_pnl_pct", "estimated_net_pnl_pct",
     "realised_pnl_usd", "status", "exit_at_utc", "exit_reason",
+    "spot_qty", "perp_qty", "spot_entry_price", "perp_entry_price",
+    "entry_fees_usd", "realised_funding_pnl_usd", "funding_events_captured",
+    "funding_interval_hours", "last_layer_at_utc",
 ]
 SIGNAL_FIELDS = [
     "event_key", "base", "perp_symbol", "direction", "funding_time_utc", "first_seen_utc",
@@ -32,6 +35,7 @@ FUNDING_FIELDS = [
     "timestamp_utc", "position_id", "event_key", "perp_symbol", "funding_time_utc",
     "displayed_rate_pct", "actual_rate_pct", "funding_benefit_pct", "funding_pnl_usd",
 ]
+COOLDOWN_FIELDS = ["timestamp_utc", "base", "direction", "reason", "expires_at_utc"]
 
 
 class PaperStore:
@@ -43,6 +47,7 @@ class PaperStore:
         self.fills_path = self.root / "fills.csv"
         self.decisions_path = self.root / "decisions.csv"
         self.funding_events_path = self.root / "funding_events.csv"
+        self.cooldowns_path = self.root / "cooldowns.csv"
 
     @staticmethod
     def read_rows(path: Path) -> list[dict]:
@@ -88,3 +93,16 @@ class PaperStore:
 
     def append_funding(self, row: dict) -> None:
         self.append_row(self.funding_events_path, FUNDING_FIELDS, row)
+
+    def append_cooldown(self, row: dict) -> None:
+        self.append_row(self.cooldowns_path, COOLDOWN_FIELDS, row)
+
+    def load_active_cooldowns(self, now) -> dict[tuple[str, str], dict]:
+        from mexc_extreme_funding.models import parse_datetime
+
+        active: dict[tuple[str, str], dict] = {}
+        for row in self.read_rows(self.cooldowns_path):
+            expires = parse_datetime(row.get("expires_at_utc"))
+            if expires is not None and expires > now:
+                active[(row.get("base", ""), row.get("direction", ""))] = row
+        return active

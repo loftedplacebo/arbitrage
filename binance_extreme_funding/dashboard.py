@@ -122,7 +122,7 @@ def _shortlist_payload(config: BinanceExtremeFundingConfig) -> dict:
         {"label": "Active signals", "value": str(sum(row.get("status") == "ACTIVE" for row in items))},
         {"label": "Tracked events", "value": str(len(items))},
         {"label": "Required observations", "value": str(config.min_consistent_observations)},
-        {"label": "Layer interval", "value": f"{config.layer_interval_minutes:.0f} min"},
+        {"label": "Minimum layer interval", "value": f"{config.min_layer_interval_minutes:.0f} min"},
     ]}
 
 
@@ -150,6 +150,7 @@ def _summary_payload(config: BinanceExtremeFundingConfig) -> dict:
         {"label": "Displayed direction held", "value": f"{(same / len(comparisons) * 100 if comparisons else 0):.1f}%"},
         {"label": "Mean displayed error", "value": f"{mean_error:.4f}%"},
         {"label": "Basis take profit", "value": f"{config.basis_take_profit_pct:.2f}%"},
+        {"label": "Adverse-basis stop", "value": "Disabled; hold and layer"},
         {"label": "Layer ladder", "value": " / ".join(f"${value:,.0f}" for value in config.layer_ladder_usd)},
         {"label": "Most common decision", "value": reasons.most_common(1)[0][0] if reasons else "-"},
     ]

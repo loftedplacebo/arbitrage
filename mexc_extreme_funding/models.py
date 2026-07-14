@@ -36,6 +36,10 @@ def parse_int(value, default: int = 0) -> int:
     return default if parsed is None else int(parsed)
 
 
+def parse_bool(value) -> bool:
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
 def iso(value: Optional[datetime]) -> str:
     return "" if value is None else value.astimezone(timezone.utc).isoformat()
 
@@ -114,6 +118,79 @@ class FundingSnapshot:
         )
 
 
+@dataclass(frozen=True)
+class OpportunityRow:
+    timestamp_utc: datetime
+    event_key: str
+    base: str
+    direction: str
+    spot_symbol: str
+    perp_symbol: str
+    funding_rate_pct: Optional[float]
+    predicted_funding_rate_pct: Optional[float]
+    funding_time_utc: Optional[datetime]
+    funding_interval_hours: Optional[float]
+    minutes_to_funding: Optional[float]
+    basis_pct: Optional[float]
+    notional_usd: float
+    spot_entry_avg_price: Optional[float]
+    perp_entry_avg_price: Optional[float]
+    spot_exit_avg_price: Optional[float]
+    perp_exit_avg_price: Optional[float]
+    spot_entry_slippage_pct: Optional[float]
+    perp_entry_slippage_pct: Optional[float]
+    spot_exit_slippage_pct: Optional[float]
+    perp_exit_slippage_pct: Optional[float]
+    expected_edge_pct: Optional[float]
+    round_trip_fillable: bool
+    decision: str
+    reason: str
+    basis_observation_count: int = 0
+    basis_mean_pct: Optional[float] = None
+    basis_std_pct: Optional[float] = None
+    basis_percentile: Optional[float] = None
+    basis_trend_pct: Optional[float] = None
+
+    def to_csv_row(self) -> dict:
+        row = asdict(self)
+        row["timestamp_utc"] = iso(self.timestamp_utc)
+        row["funding_time_utc"] = iso(self.funding_time_utc)
+        row["round_trip_fillable"] = str(self.round_trip_fillable)
+        return row
+
+    @classmethod
+    def from_csv_row(cls, row: dict) -> "OpportunityRow":
+        return cls(
+            timestamp_utc=parse_datetime(row.get("timestamp_utc")) or utc_now(),
+            event_key=str(row.get("event_key", "")), base=str(row.get("base", "")),
+            direction=str(row.get("direction", "")), spot_symbol=str(row.get("spot_symbol", "")),
+            perp_symbol=str(row.get("perp_symbol", "")),
+            funding_rate_pct=parse_float(row.get("funding_rate_pct")),
+            predicted_funding_rate_pct=parse_float(row.get("predicted_funding_rate_pct")),
+            funding_time_utc=parse_datetime(row.get("funding_time_utc")),
+            funding_interval_hours=parse_float(row.get("funding_interval_hours")),
+            minutes_to_funding=parse_float(row.get("minutes_to_funding")),
+            basis_pct=parse_float(row.get("basis_pct")),
+            notional_usd=parse_float(row.get("notional_usd"), 0.0) or 0.0,
+            spot_entry_avg_price=parse_float(row.get("spot_entry_avg_price")),
+            perp_entry_avg_price=parse_float(row.get("perp_entry_avg_price")),
+            spot_exit_avg_price=parse_float(row.get("spot_exit_avg_price")),
+            perp_exit_avg_price=parse_float(row.get("perp_exit_avg_price")),
+            spot_entry_slippage_pct=parse_float(row.get("spot_entry_slippage_pct")),
+            perp_entry_slippage_pct=parse_float(row.get("perp_entry_slippage_pct")),
+            spot_exit_slippage_pct=parse_float(row.get("spot_exit_slippage_pct")),
+            perp_exit_slippage_pct=parse_float(row.get("perp_exit_slippage_pct")),
+            expected_edge_pct=parse_float(row.get("expected_edge_pct")),
+            round_trip_fillable=parse_bool(row.get("round_trip_fillable")),
+            decision=str(row.get("decision", "")), reason=str(row.get("reason", "")),
+            basis_observation_count=parse_int(row.get("basis_observation_count")),
+            basis_mean_pct=parse_float(row.get("basis_mean_pct")),
+            basis_std_pct=parse_float(row.get("basis_std_pct")),
+            basis_percentile=parse_float(row.get("basis_percentile")),
+            basis_trend_pct=parse_float(row.get("basis_trend_pct")),
+        )
+
+
 @dataclass
 class PaperPosition:
     position_id: str
@@ -138,10 +215,19 @@ class PaperPosition:
     status: str
     exit_at_utc: Optional[datetime]
     exit_reason: str
+    spot_qty: float = 0.0
+    perp_qty: float = 0.0
+    spot_entry_price: float = 0.0
+    perp_entry_price: float = 0.0
+    entry_fees_usd: float = 0.0
+    realised_funding_pnl_usd: float = 0.0
+    funding_events_captured: int = 0
+    funding_interval_hours: Optional[float] = None
+    last_layer_at_utc: Optional[datetime] = None
 
     def to_csv_row(self) -> dict:
         row = asdict(self)
-        for key in ("entry_at_utc", "updated_at_utc", "funding_time_utc", "exit_at_utc"):
+        for key in ("entry_at_utc", "updated_at_utc", "funding_time_utc", "exit_at_utc", "last_layer_at_utc"):
             row[key] = iso(row[key])
         return row
 
@@ -170,4 +256,13 @@ class PaperPosition:
             status=str(row.get("status", "OPEN")),
             exit_at_utc=parse_datetime(row.get("exit_at_utc")),
             exit_reason=str(row.get("exit_reason", "")),
+            spot_qty=parse_float(row.get("spot_qty"), 0.0) or 0.0,
+            perp_qty=parse_float(row.get("perp_qty"), 0.0) or 0.0,
+            spot_entry_price=parse_float(row.get("spot_entry_price"), 0.0) or 0.0,
+            perp_entry_price=parse_float(row.get("perp_entry_price"), 0.0) or 0.0,
+            entry_fees_usd=parse_float(row.get("entry_fees_usd"), 0.0) or 0.0,
+            realised_funding_pnl_usd=parse_float(row.get("realised_funding_pnl_usd"), 0.0) or 0.0,
+            funding_events_captured=parse_int(row.get("funding_events_captured")),
+            funding_interval_hours=parse_float(row.get("funding_interval_hours")),
+            last_layer_at_utc=parse_datetime(row.get("last_layer_at_utc")),
         )

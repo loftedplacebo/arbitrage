@@ -7,6 +7,8 @@ import requests
 
 from binance_extreme_funding.config import BinanceExtremeFundingConfig, DEFAULT_CONFIG
 from binance_extreme_funding.models import FundingSnapshot, parse_float, utc_now
+from core.models import OrderBook
+from core.orderbook import parse_orderbook_levels
 
 
 FUTURES_URL = "https://fapi.binance.com"
@@ -64,10 +66,18 @@ class BinancePublicClient:
     def fetch_snapshots(self, now: Optional[datetime] = None) -> list[FundingSnapshot]:
         observed = now or utc_now()
         premium = self._get(FUTURES_URL, "/fapi/v1/premiumIndex")
+        try:
+            funding_info = self._get(FUTURES_URL, "/fapi/v1/fundingInfo")
+        except requests.RequestException:
+            funding_info = []
         futures_books = self._get(FUTURES_URL, "/fapi/v1/ticker/bookTicker")
         spot_books = self._get(SPOT_URL, "/api/v3/ticker/bookTicker")
         futures_lookup = {str(row.get("symbol")): row for row in futures_books if isinstance(row, dict)}
         spot_lookup = {str(row.get("symbol")): row for row in spot_books if isinstance(row, dict)}
+        interval_lookup = {
+            str(row.get("symbol")): parse_float(row.get("fundingIntervalHours"), 8.0) or 8.0
+            for row in funding_info if isinstance(row, dict)
+        }
         snapshots: list[FundingSnapshot] = []
 
         for row in premium if isinstance(premium, list) else []:
@@ -116,7 +126,7 @@ class BinancePublicClient:
                     predicted_funding_rate_pct=rate_pct,
                     next_funding_time_utc=funding_time,
                     minutes_to_funding=minutes,
-                    funding_interval_hours=8.0,
+                    funding_interval_hours=interval_lookup.get(symbol, 8.0),
                     index_price=index_price,
                     mark_price=mark_price,
                     mark_index_basis_pct=_basis(index_price, mark_price),
@@ -148,3 +158,30 @@ class BinancePublicClient:
             if rate is not None and diff <= 120_000 and (nearest is None or diff < nearest[0]):
                 nearest = (diff, rate * 100)
         return None if nearest is None else nearest[1]
+
+    def fetch_orderbooks(
+        self,
+        spot_symbol: str,
+        perp_symbol: str,
+        observed_at: datetime,
+        limit: int = 100,
+    ) -> tuple[OrderBook, OrderBook]:
+        spot = self._get(SPOT_URL, "/api/v3/depth", params={"symbol": spot_symbol, "limit": limit})
+        perp = self._get(FUTURES_URL, "/fapi/v1/depth", params={"symbol": perp_symbol, "limit": limit})
+        standard_symbol = perp_symbol
+        return (
+            OrderBook(
+                exchange="binance", market_type="spot", standard_symbol=standard_symbol,
+                exchange_symbol=spot_symbol,
+                bids=parse_orderbook_levels(spot.get("bids", []), max_levels=limit),
+                asks=parse_orderbook_levels(spot.get("asks", []), max_levels=limit),
+                observed_at_utc=observed_at,
+            ),
+            OrderBook(
+                exchange="binance", market_type="futures", standard_symbol=standard_symbol,
+                exchange_symbol=perp_symbol,
+                bids=parse_orderbook_levels(perp.get("bids", []), max_levels=limit),
+                asks=parse_orderbook_levels(perp.get("asks", []), max_levels=limit),
+                observed_at_utc=observed_at,
+            ),
+        )

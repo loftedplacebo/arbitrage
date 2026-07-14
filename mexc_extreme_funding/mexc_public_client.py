@@ -8,6 +8,8 @@ import requests
 
 from mexc_extreme_funding.config import DEFAULT_CONFIG, MexcExtremeFundingConfig
 from mexc_extreme_funding.models import FundingSnapshot, parse_float, utc_now
+from core.models import OrderBook, OrderBookLevel
+from core.orderbook import parse_orderbook_levels
 
 
 CONTRACT_URL = "https://contract.mexc.com"
@@ -52,6 +54,7 @@ class MexcPublicClient:
         self.config = config
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "mexc-extreme-funding-paper/1.0"})
+        self._contract_size_cache: dict[str, float] | None = None
 
     def _get(self, base_url: str, path: str, params: Optional[dict] = None) -> Any:
         response = self.session.get(
@@ -71,6 +74,19 @@ class MexcPublicClient:
         payload = self._get(CONTRACT_URL, f"/api/v1/contract/funding_rate/{symbol}")
         data = payload.get("data") if isinstance(payload, dict) else {}
         return data if isinstance(data, dict) else {}
+
+    def _contract_size(self, symbol: str) -> float:
+        if self._contract_size_cache is None:
+            payload = self._get(CONTRACT_URL, "/api/v1/contract/detail")
+            rows = payload.get("data") if isinstance(payload, dict) else []
+            self._contract_size_cache = {
+                str(row.get("symbol")): parse_float(row.get("contractSize"), 0.0) or 0.0
+                for row in rows if isinstance(row, dict) and row.get("symbol")
+            }
+        size = self._contract_size_cache.get(symbol, 0.0)
+        if size <= 0:
+            raise ValueError(f"MEXC contract size missing for {symbol}")
+        return size
 
     def fetch_snapshots(self, now: Optional[datetime] = None) -> list[FundingSnapshot]:
         observed = now or utc_now()
@@ -169,3 +185,45 @@ class MexcPublicClient:
             if rate is not None and diff <= 120_000 and (nearest is None or diff < nearest[0]):
                 nearest = (diff, rate * 100)
         return None if nearest is None else nearest[1]
+
+    def fetch_orderbooks(
+        self,
+        spot_symbol: str,
+        perp_symbol: str,
+        observed_at: datetime,
+        limit: int = 100,
+    ) -> tuple[OrderBook, OrderBook]:
+        spot = self._get(SPOT_URL, "/api/v3/depth", params={"symbol": spot_symbol, "limit": limit})
+        perp_payload = self._get(CONTRACT_URL, f"/api/v1/contract/depth/{perp_symbol}", params={"limit": limit})
+        perp = perp_payload.get("data") if isinstance(perp_payload, dict) else {}
+        contract_size = self._contract_size(perp_symbol)
+
+        def contract_levels(raw_levels) -> list[OrderBookLevel]:
+            levels: list[OrderBookLevel] = []
+            for level in (raw_levels or [])[:limit]:
+                if isinstance(level, dict):
+                    price = parse_float(level.get("price") or level.get("p"))
+                    contracts = parse_float(level.get("vol") or level.get("quantity") or level.get("qty"))
+                else:
+                    price = parse_float(level[0] if len(level) > 0 else None)
+                    contracts = parse_float(level[1] if len(level) > 1 else None)
+                if price is not None and price > 0 and contracts is not None and contracts > 0:
+                    levels.append(OrderBookLevel(price=price, quantity=contracts * contract_size))
+            return levels
+
+        return (
+            OrderBook(
+                exchange="mexc", market_type="spot", standard_symbol=spot_symbol,
+                exchange_symbol=spot_symbol,
+                bids=parse_orderbook_levels(spot.get("bids", []), max_levels=limit),
+                asks=parse_orderbook_levels(spot.get("asks", []), max_levels=limit),
+                observed_at_utc=observed_at,
+            ),
+            OrderBook(
+                exchange="mexc", market_type="futures", standard_symbol=spot_symbol,
+                exchange_symbol=perp_symbol,
+                bids=contract_levels(perp.get("bids", []) if isinstance(perp, dict) else []),
+                asks=contract_levels(perp.get("asks", []) if isinstance(perp, dict) else []),
+                observed_at_utc=observed_at,
+            ),
+        )

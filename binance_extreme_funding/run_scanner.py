@@ -16,6 +16,7 @@ def main() -> None:
         result = scan_once(DEFAULT_CONFIG)
         print(
             f"Binance snapshots={result['snapshots']} eligible={result['eligible']} "
+            f"opportunities={result['opportunities']} errors={len(result['errors'])} "
             f"settlement_comparisons={result['comparisons']} path={result['path']}",
             flush=True,
         )
