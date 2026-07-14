@@ -1,0 +1,17 @@
+[Unit]
+Description=MEXC extreme-funding paper strategy
+After=network-online.target mexc-extreme-funding-scanner.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/arbitrage
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/arbitrage/.venv/bin/python -m mexc_extreme_funding.run_paper_strategy --loop --interval 60
+Restart=always
+RestartSec=15
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

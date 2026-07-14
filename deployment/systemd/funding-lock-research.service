@@ -1,0 +1,19 @@
+[Unit]
+Description=Funding lock research collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/arbitrage
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/arbitrage/.venv/bin/python funding_lock_research/run_funding_lock_research.py --loop --interval 300 --request-sleep 0.12 --exchanges okx
+Restart=always
+RestartSec=15
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

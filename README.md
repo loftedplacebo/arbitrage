@@ -88,6 +88,9 @@ data/validated_futures_futures_snapshots/
 data/ml/fast_spread_observations/
 data/ml/labelled_observations/
 data/strategy/
+data/funding_lock_research/
+data/binance_extreme_funding/
+data/mexc_extreme_funding/
 ```
 
 The strategy archive script moves active paper state into:
@@ -188,6 +191,39 @@ Reattach:
 ```bash
 tmux attach -t arbitrage
 ```
+
+## Funding Lock Research
+
+Funding-lock research is separate from the scanner and paper strategies. It
+captures MEXC, Binance, and OKX displayed funding rates and later compares them
+with settled historical funding so we can measure whether a rate was locked
+before settlement.
+
+```bash
+python funding_lock_research/run_funding_lock_research.py --max-symbols 3
+python funding_lock_research/run_funding_lock_research.py --loop --interval 300
+```
+
+Outputs are written under `data/funding_lock_research/`. See
+`docs/funding_lock_research.md` for the CSV schema and systemd deployment.
+
+## Independent Extreme-Funding Paper Strategies
+
+Binance and MEXC each have a standalone live scanner, paper ledger, strategy,
+and four-tab dashboard. They do not consume funding-lock research CSVs.
+
+```bash
+python -m binance_extreme_funding.run_scanner
+python -m binance_extreme_funding.run_paper_strategy
+python -m binance_extreme_funding.run_dashboard --port 8770
+
+python -m mexc_extreme_funding.run_scanner
+python -m mexc_extreme_funding.run_paper_strategy
+python -m mexc_extreme_funding.run_dashboard --port 8771
+```
+
+See `docs/extreme_funding_paper_strategies.md` for rules, data ownership,
+service names, and the combined dashboard SSH tunnel.
 
 ## Clean Paper Restart
 

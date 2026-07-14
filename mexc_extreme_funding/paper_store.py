@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+
+from mexc_extreme_funding.config import MexcExtremeFundingConfig
+from mexc_extreme_funding.models import PaperPosition
+
+
+POSITION_FIELDS = [
+    "position_id", "event_key", "base", "spot_symbol", "perp_symbol", "direction",
+    "layer_index", "notional_usd", "entry_at_utc", "updated_at_utc", "funding_time_utc",
+    "displayed_rate_at_entry_pct", "actual_funding_rate_pct", "entry_basis_pct",
+    "current_basis_pct", "basis_pnl_pct", "funding_pnl_pct", "estimated_net_pnl_pct",
+    "realised_pnl_usd", "status", "exit_at_utc", "exit_reason",
+]
+SIGNAL_FIELDS = [
+    "event_key", "base", "perp_symbol", "direction", "funding_time_utc", "first_seen_utc",
+    "last_seen_utc", "observations", "first_rate_pct", "latest_rate_pct", "min_abs_rate_pct",
+    "max_abs_rate_pct", "status",
+]
+FILL_FIELDS = [
+    "timestamp_utc", "event_type", "position_id", "event_key", "perp_symbol", "direction",
+    "layer_index", "notional_usd", "basis_pct", "funding_rate_pct", "net_pnl_pct",
+    "realised_pnl_usd", "reason",
+]
+DECISION_FIELDS = [
+    "timestamp_utc", "decision", "event_key", "perp_symbol", "allowed", "reason",
+    "layer_index", "notional_usd",
+]
+FUNDING_FIELDS = [
+    "timestamp_utc", "position_id", "event_key", "perp_symbol", "funding_time_utc",
+    "displayed_rate_pct", "actual_rate_pct", "funding_benefit_pct", "funding_pnl_usd",
+]
+
+
+class PaperStore:
+    def __init__(self, config: MexcExtremeFundingConfig) -> None:
+        self.root = Path(config.paper_dir)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.positions_path = self.root / "positions.csv"
+        self.signals_path = self.root / "signals.csv"
+        self.fills_path = self.root / "fills.csv"
+        self.decisions_path = self.root / "decisions.csv"
+        self.funding_events_path = self.root / "funding_events.csv"
+
+    @staticmethod
+    def read_rows(path: Path) -> list[dict]:
+        if not path.exists():
+            return []
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+
+    @staticmethod
+    def write_rows(path: Path, fields: list[str], rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
+
+    @staticmethod
+    def append_row(path: Path, fields: list[str], row: dict) -> None:
+        exists = path.exists() and path.stat().st_size > 0
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+            if not exists:
+                writer.writeheader()
+            writer.writerow({field: row.get(field, "") for field in fields})
+
+    def load_positions(self) -> list[PaperPosition]:
+        return [PaperPosition.from_csv_row(row) for row in self.read_rows(self.positions_path)]
+
+    def write_positions(self, positions: list[PaperPosition]) -> None:
+        self.write_rows(self.positions_path, POSITION_FIELDS, [position.to_csv_row() for position in positions])
+
+    def load_signals(self) -> dict[str, dict]:
+        return {row.get("event_key", ""): row for row in self.read_rows(self.signals_path)}
+
+    def write_signals(self, signals: dict[str, dict]) -> None:
+        self.write_rows(self.signals_path, SIGNAL_FIELDS, list(signals.values()))
+
+    def append_fill(self, row: dict) -> None:
+        self.append_row(self.fills_path, FILL_FIELDS, row)
+
+    def append_decision(self, row: dict) -> None:
+        self.append_row(self.decisions_path, DECISION_FIELDS, row)
+
+    def append_funding(self, row: dict) -> None:
+        self.append_row(self.funding_events_path, FUNDING_FIELDS, row)
