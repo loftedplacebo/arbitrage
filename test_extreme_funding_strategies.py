@@ -15,7 +15,8 @@ from binance_extreme_funding.scanner import backfill_extreme_observations as bac
 from binance_extreme_funding.scanner import scan_once as scan_binance
 from mexc_extreme_funding.config import DEFAULT_CONFIG as MEXC_DEFAULT
 from mexc_extreme_funding.mexc_public_client import MexcPublicClient
-from mexc_extreme_funding.models import FundingSnapshot as MexcSnapshot
+from mexc_extreme_funding.models import FundingSnapshot as MexcSnapshot, MexcMarketRules
+from mexc_extreme_funding.orderbook import estimate_basis_round_trip as estimate_mexc_round_trip
 from mexc_extreme_funding.paper_store import PaperStore as MexcStore
 from mexc_extreme_funding.paper_strategy import run_paper_strategy_once as run_mexc
 from mexc_extreme_funding.scanner import scan_once as scan_mexc
@@ -48,6 +49,21 @@ class FakeScannerClient(FakeClient):
         return (
             OrderBook("binance", "spot", spot_symbol, spot_symbol, bids, asks, fresh),
             OrderBook("binance", "futures", perp_symbol, perp_symbol, bids, asks, fresh),
+        )
+
+    def fetch_market_rules(self, spot_symbol, perp_symbol):
+        return MexcMarketRules(
+            spot_symbol=spot_symbol,
+            perp_symbol=perp_symbol,
+            spot_trading_allowed=True,
+            spot_margin_allowed=False,
+            spot_quantity_step=0.001,
+            perp_api_allowed=True,
+            perp_state=0,
+            contract_size=0.001,
+            contract_volume_step=1.0,
+            min_contract_volume=1.0,
+            max_contract_volume=1_000_000.0,
         )
 
 
@@ -98,6 +114,30 @@ def fast_binance_config(root: Path, **overrides):
     }
     values.update(overrides)
     return replace(BINANCE_DEFAULT, **values)
+
+
+def fast_mexc_config(root: Path, **overrides):
+    values = {
+        "data_dir": root,
+        "snapshots_dir": root / "snapshots",
+        "opportunities_dir": root / "opportunities",
+        "paper_dir": root / "paper",
+        "inventory_backed_short_spot_symbols": ("TESTUSDT",),
+        "min_consistent_observations": 2,
+        "layer_min_signal_age_minutes": (1.0, 1.0, 1.0, 1.0),
+        "layer_max_minutes_before_funding": (None, None, None, None),
+        "layer_min_conservative_edge_pct": (0.0, 0.0, 0.0, 0.0),
+        "funding_prediction_haircuts_pct": ((0.0, 0.0),),
+        "max_signal_observation_gap_seconds": 100_000.0,
+        "min_layer_interval_minutes": 1.0,
+        "min_exit_interval_minutes": 0.0,
+        "min_expected_edge_pct": 0.02,
+        "max_entry_exit_cost_pct": 1.0,
+        "max_basis_std_pct": 5.0,
+        "max_basis_abs_trend_pct": 5.0,
+    }
+    values.update(overrides)
+    return replace(MEXC_DEFAULT, **values)
 
 
 class ExtremeFundingStrategyTests(unittest.TestCase):
@@ -424,13 +464,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
     def test_mexc_uses_actual_settlement_and_smaller_first_layer(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                MEXC_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-            )
+            config = fast_mexc_config(root)
             start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
             funding_time = start + timedelta(minutes=20)
             client = FakeClient(settled_rate_pct=-0.60)
@@ -459,13 +493,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
     def test_mexc_scanner_builds_independent_depth_priced_opportunities(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                MEXC_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-            )
+            config = fast_mexc_config(root)
             now = datetime.now(timezone.utc)
             item = snapshot(
                 MexcSnapshot, now - timedelta(minutes=2), now - timedelta(minutes=1),
@@ -481,13 +509,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
     def test_mexc_prefunding_basis_exit_is_chunked_and_does_not_relayer(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                MEXC_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-            )
+            config = fast_mexc_config(root)
             start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
             funding_time = start + timedelta(hours=4)
             client = FakeClient()
@@ -514,13 +536,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
     def test_mexc_adverse_basis_holds_and_adds_the_next_layer(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                MEXC_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-            )
+            config = fast_mexc_config(root)
             start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
             funding_time = start + timedelta(hours=4)
             client = FakeClient()
@@ -542,13 +558,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
     def test_mexc_legacy_position_is_not_layered_or_repriced(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                MEXC_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-            )
+            config = fast_mexc_config(root)
             start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
             funding_time = start + timedelta(hours=4)
             client = FakeClient()
@@ -576,10 +586,18 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
         client = MexcPublicClient(config)
 
         def fake_get(base_url, path, params=None):
+            if path == "/api/v3/exchangeInfo":
+                return {"symbols": [{
+                    "symbol": "TESTUSDT", "isSpotTradingAllowed": True,
+                    "isMarginTradingAllowed": False, "baseSizePrecision": "0.001",
+                }]}
             if path == "/api/v3/depth":
                 return {"bids": [["99", "2"]], "asks": [["101", "3"]]}
             if path == "/api/v1/contract/detail":
-                return {"success": True, "data": [{"symbol": "TEST_USDT", "contractSize": "0.001"}]}
+                return {"success": True, "data": [{
+                    "symbol": "TEST_USDT", "contractSize": "0.001", "volUnit": "1",
+                    "minVol": "1", "maxVol": "100000", "state": 0, "apiAllowed": True,
+                }]}
             return {"success": True, "data": {"bids": [["100", "10", "1"]], "asks": [["102", "20", "1"]]}}
 
         client._get = fake_get
@@ -588,6 +606,138 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
         self.assertEqual(spot_book.bids[0].quantity, 2.0)
         self.assertAlmostEqual(perp_book.bids[0].quantity, 0.01)
         self.assertAlmostEqual(perp_book.asks[0].quantity, 0.02)
+
+    def test_mexc_rejects_layer_above_contract_maximum(self):
+        observed = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+        levels = [OrderBookLevel(price=100.0, quantity=1_000.0)]
+        spot_book = OrderBook("mexc", "spot", "TESTUSDT", "TESTUSDT", levels, levels, observed)
+        perp_book = OrderBook("mexc", "futures", "TEST_USDT", "TEST_USDT", levels, levels, observed)
+        rules = MexcMarketRules(
+            spot_symbol="TESTUSDT", perp_symbol="TEST_USDT",
+            spot_trading_allowed=True, spot_margin_allowed=True,
+            spot_quantity_step=0.001, perp_api_allowed=True, perp_state=0,
+            contract_size=0.001, contract_volume_step=1.0,
+            min_contract_volume=1.0, max_contract_volume=10.0,
+        )
+        estimate = estimate_mexc_round_trip(
+            direction="LONG_SPOT_SHORT_PERP", spot_book=spot_book,
+            perp_book=perp_book, notional_usd=50.0, rules=rules,
+        )
+        self.assertFalse(estimate.rules_valid)
+        self.assertFalse(estimate.round_trip_fillable)
+
+    def test_mexc_rejects_unborrowable_short_spot_but_keeps_research_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_mexc_config(
+                root,
+                inventory_backed_short_spot_symbols=(),
+                min_expected_edge_pct=0.10,
+                max_entry_exit_cost_pct=0.60,
+            )
+            now = datetime.now(timezone.utc)
+            item = snapshot(
+                MexcSnapshot, now, now + timedelta(hours=2),
+                -0.80, -1.0, "MEXC", "TEST_USDT",
+            )
+            result = scan_mexc(config, client=FakeScannerClient([item], settled_rate_pct=None))
+            self.assertEqual(result["opportunities"], 4)
+            rows = MexcStore.read_rows(root / "latest_opportunities.csv")
+            self.assertTrue(all(row["decision"] == "REJECT" for row in rows))
+            self.assertTrue(all(row["reason"] == "spot_short_unavailable" for row in rows))
+            self.assertTrue(all(row["short_spot_available"] == "False" for row in rows))
+
+    def test_mexc_v2_layers_only_at_funding_window_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_mexc_config(
+                root,
+                min_consistent_observations=3,
+                layer_min_signal_age_minutes=MEXC_DEFAULT.layer_min_signal_age_minutes,
+                layer_max_minutes_before_funding=MEXC_DEFAULT.layer_max_minutes_before_funding,
+                layer_min_conservative_edge_pct=MEXC_DEFAULT.layer_min_conservative_edge_pct,
+                funding_prediction_haircuts_pct=MEXC_DEFAULT.funding_prediction_haircuts_pct,
+                min_layer_interval_minutes=MEXC_DEFAULT.min_layer_interval_minutes,
+            )
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(minutes=130)
+            client = FakeClient()
+
+            for minute in (0, 1, 2):
+                observed = start + timedelta(minutes=minute)
+                item = snapshot(MexcSnapshot, observed, funding_time, -0.90, -1.0, "MEXC", "TEST_USDT")
+                result = run_mexc(config, client=client, snapshots=[item], now=observed)
+            self.assertEqual(result["opened"], 0)
+
+            observed = start + timedelta(minutes=10)
+            item = snapshot(MexcSnapshot, observed, funding_time, -0.90, -1.0, "MEXC", "TEST_USDT")
+            self.assertEqual(run_mexc(config, client=client, snapshots=[item], now=observed)["opened"], 1)
+            self.assertEqual(MexcStore(config).load_positions()[0].notional_usd, 50.0)
+
+            observed = start + timedelta(minutes=15)
+            item = snapshot(MexcSnapshot, observed, funding_time, -0.90, -1.0, "MEXC", "TEST_USDT")
+            self.assertEqual(run_mexc(config, client=client, snapshots=[item], now=observed)["opened"], 0)
+            self.assertEqual(MexcStore(config).load_positions()[0].notional_usd, 50.0)
+
+            for minute, expected_notional in ((70, 150.0), (100, 400.0), (118, 900.0)):
+                observed = start + timedelta(minutes=minute)
+                item = snapshot(MexcSnapshot, observed, funding_time, -0.90, -1.0, "MEXC", "TEST_USDT")
+                self.assertEqual(run_mexc(config, client=client, snapshots=[item], now=observed)["opened"], 1)
+                self.assertEqual(MexcStore(config).load_positions()[0].notional_usd, expected_notional)
+
+    def test_mexc_applies_layer_thresholds_per_symbol(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_mexc_config(
+                root,
+                layer_min_signal_age_minutes=(0.0, 100.0, 0.0, 0.0),
+                min_layer_interval_minutes=0.0,
+                inventory_backed_short_spot_symbols=("TESTUSDT", "SECONDUSDT"),
+            )
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(hours=4)
+            client = FakeClient()
+            for minute in (0, 1):
+                observed = start + timedelta(minutes=minute)
+                first = snapshot(MexcSnapshot, observed, funding_time, -0.90, -1.0, "MEXC", "TEST_USDT")
+                run_mexc(config, client=client, snapshots=[first], now=observed)
+
+            result = None
+            for minute in (2, 3):
+                observed = start + timedelta(minutes=minute)
+                first = snapshot(MexcSnapshot, observed, funding_time, -0.90, -1.0, "MEXC", "TEST_USDT")
+                second = snapshot(MexcSnapshot, observed, funding_time, -0.80, -1.0, "MEXC", "SECOND_USDT")
+                second.base = "SECOND"
+                second.spot_symbol = "SECONDUSDT"
+                result = run_mexc(config, client=client, snapshots=[first, second], now=observed)
+
+            self.assertEqual(result["opened"], 1)
+            positions = {position.base: position for position in MexcStore(config).load_positions()}
+            self.assertEqual(positions["TEST"].notional_usd, 50.0)
+            self.assertEqual(positions["SECOND"].notional_usd, 50.0)
+
+    def test_mexc_funding_uses_equal_hedge_quantity_and_settlement_fair_price(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_mexc_config(root)
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(minutes=10)
+            client = FakeClient(settled_rate_pct=-0.60)
+            client.fetch_settlement_fair_price = lambda symbol, when: 120.0
+            for minute in (0, 1):
+                observed = start + timedelta(minutes=minute)
+                item = snapshot(MexcSnapshot, observed, funding_time, -0.80, -1.0, "MEXC", "TEST_USDT")
+                run_mexc(config, client=client, snapshots=[item], now=observed)
+            position = MexcStore(config).load_positions()[0]
+            self.assertAlmostEqual(position.spot_qty, position.perp_qty)
+
+            settled = snapshot(MexcSnapshot, funding_time, funding_time, -0.20, -1.0, "MEXC", "TEST_USDT")
+            settled.eligible = False
+            run_mexc(config, client=client, snapshots=[settled], now=funding_time)
+            funding = MexcStore.read_rows(MexcStore(config).funding_events_path)[0]
+            expected_notional = position.perp_qty * 120.0
+            self.assertAlmostEqual(float(funding["funding_notional_usd"]), expected_notional)
+            self.assertAlmostEqual(float(funding["funding_pnl_usd"]), expected_notional * 0.006)
 
     def test_repeated_strategy_pass_does_not_count_same_snapshot_twice(self):
         with tempfile.TemporaryDirectory() as temporary:

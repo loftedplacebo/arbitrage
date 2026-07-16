@@ -1,239 +1,256 @@
-# MEXC Extreme-Funding Paper Strategy
+# MEXC Extreme-Funding V2 Paper Strategy
 
 This package is an independent public-data scanner, paper ledger, strategy, and
-dashboard for MEXC USDT perpetual funding events. It does not import Binance or
-KuCoin strategy code, read funding-lock research CSVs, use API keys, or submit
-orders.
+dashboard for MEXC USDT perpetual funding events. It does not consume
+`data/funding_lock_research/`, share state with Binance or KuCoin, use API keys,
+or submit orders.
 
-MEXC uses the same tested hold and controlled-unwind philosophy as Binance, but
-keeps its own nominal ladder, exposure limits, fee assumptions, symbol mapping,
-funding interval, API pacing, and futures contract multiplier handling.
+V2 keeps the KuCoin-style hold and controlled-exit philosophy, but adds
+MEXC-specific capability checks, integer contract sizing, timed confidence
+layers, continuous signal streaks, fair-price funding accounting, and compact
+settlement reconciliation.
 
 ## Activation
 
 | Process | Command | VPS service | Interval/port |
 | --- | --- | --- | --- |
-| Scanner | `python -m mexc_extreme_funding.run_scanner --loop` | `mexc-extreme-funding-scanner` | 60 seconds |
+| Scanner | `python -m mexc_extreme_funding.run_scanner --loop` | `mexc-extreme-funding-scanner` | 60 seconds after each pass |
 | Paper strategy | `python -m mexc_extreme_funding.run_paper_strategy --loop` | `mexc-extreme-funding-strategy` | 60 seconds |
 | Dashboard | `python -m mexc_extreme_funding.run_dashboard --port 8771` | `mexc-extreme-funding-dashboard` | `127.0.0.1:8771` |
 
-Service activation only starts data collection. A paper trade activates after
-all funding, signal, depth, basis, cost, and portfolio gates pass.
+Starting the services does not activate a position. Every funding, capability,
+contract, depth, timing, basis, volatility, edge, lifecycle, and portfolio gate
+below must pass independently.
 
-## Direction And Basis
+## Direction And Executability
 
-| Displayed funding | Paper hedge | Funding benefit |
-| --- | --- | --- |
-| Positive | Long spot, short perpetual | The short perpetual receives funding |
-| Negative | Short spot, long perpetual | The long perpetual receives funding |
+| Displayed funding | Hedge | Funding receiver | Default V2 status |
+| --- | --- | --- | --- |
+| Positive | Long spot, short perpetual | Short perpetual | Eligible when all other gates pass |
+| Negative | Short spot, long perpetual | Long perpetual | Rejected unless the spot symbol is margin-enabled or explicitly inventory-backed |
 
-Basis is:
+MEXC `exchangeInfo` is the capability source. V2 records
+`spot_margin_allowed`, `short_spot_available`, and `perp_api_allowed` on every
+depth-priced opportunity. The scanner continues researching an unborrowable
+negative-rate event, but writes `spot_short_unavailable` and the strategy cannot
+open it.
 
-```text
-basis_pct = (perpetual_price / spot_price - 1) * 100
-```
+`inventory_backed_short_spot_symbols` is empty by default. Adding a symbol is an
+explicit paper assumption that sufficient spot inventory is reserved for the
+entire short-and-buyback cycle. It is not an authenticated balance check.
 
-Basis improvement is entry basis minus current exit basis for
-`LONG_SPOT_SHORT_PERP`, and current exit basis minus entry basis for
-`SHORT_SPOT_LONG_PERP`.
+## Scanner And Source Of Truth
 
-## MEXC Market-Data Handling
+Every pass:
 
-Every scanner pass:
-
-1. Downloads the complete MEXC contract ticker set and MEXC spot top of book.
-2. For rates at or above the extreme threshold, queries the contract funding
-   endpoint for the detailed rate, next settlement time, and `collectCycle`.
-3. Maps `BASE_USDT` perpetual symbols to `BASEUSDT` spot symbols.
-4. For an entry candidate or open-position watch row, downloads 100 levels of
+1. Downloads all MEXC USDT perpetual tickers and spot top of book.
+2. For rates with absolute value at least `0.50%`, fetches the detailed current
+   funding rate, `nextSettleTime`, and `collectCycle`.
+3. Records current/predicted funding, next settlement, mark/index basis, matching
+   spot market, and executable top-of-book basis.
+4. Fetches and caches spot `exchangeInfo` plus perpetual contract metadata.
+5. For extreme candidates and open-position watch rows, downloads 100 levels of
    spot and perpetual depth.
-5. Downloads and caches MEXC contract metadata.
-6. Converts futures book volume from contracts to base quantity using
-   `contractSize` before estimating hedge quantity, fillability, or slippage.
-7. Prices all four entry/exit legs for every relevant notional.
-8. Reconciles displayed observations with actual MEXC funding history after
-   settlement.
+6. Rejects books older than two seconds or with more than two seconds of
+   cross-market observation skew.
+7. Converts MEXC contract volume into base quantity using `contractSize`, then
+   prices the same rounded base quantity through spot and perpetual entry and
+   exit books.
+8. Writes full snapshots, compact extreme observations, rolling basis history,
+   and notional-specific opportunity rows.
+9. Reconciles compact extreme observations against actual settlement history.
 
-MEXC requests are deliberately paced by 0.11 seconds. A missing or invalid
-contract multiplier rejects the opportunity instead of assuming one contract is
-one base unit.
+`latest_opportunities.csv` is the strategy execution source of truth.
+`latest_snapshots.csv` is the live research feed. The scanner no longer rereads
+the large full-market snapshot archives every minute.
 
-`latest_opportunities.csv` is the strategy's execution source of truth.
-`latest_snapshots.csv` remains the funding audit feed.
+## Contract And Hedge Rules
+
+Before an opportunity is executable:
+
+- Spot API trading must be enabled.
+- The perpetual must have `state == 0` and `apiAllowed == true`.
+- `contractSize`, `volUnit`, `minVol`, and `maxVol` must be present.
+- Contract count is rounded down to `volUnit` and kept within the exchange
+  minimum and maximum.
+- The resulting base quantity must also satisfy the spot quantity step.
+- Exactly the same base quantity is priced on both legs.
+- Residual delta must not exceed `0.25%` of requested notional.
+- All four rounded-quantity legs must be fillable.
+
+The requested ladder notional remains the portfolio budget and row key. Actual
+spot and perpetual entry notionals are stored separately for fees and audit.
 
 ## Entry Rules
 
-### 1. Funding snapshot eligibility
+### Funding and market gate
 
-- Absolute displayed funding must be at least `0.50%`.
-- At least 15 minutes must remain before settlement.
-- The detailed MEXC funding endpoint must provide a funding timestamp.
-- A matching MEXC spot market and valid spot/perpetual prices must exist.
-- Positive funding selects long spot/short perpetual; negative funding selects
-  short spot/long perpetual.
+- Absolute displayed funding is at least `0.50%`.
+- At least seven minutes remain before settlement.
+- Funding sign determines the hedge direction.
+- Matching spot and perpetual markets and valid prices exist.
+- A negative-rate trade passes the short-spot capability rule above.
 
-### 2. Depth and expected-edge eligibility
-
-- The tested notional must be fillable across spot entry, perpetual entry, spot
-  exit, and perpetual exit.
-- Expected edge after depth slippage, modeled fees, and safety buffer must be at
-  least `0.02%`.
-- Exit slippage plus modeled exit fees must not exceed `1.00%`.
-- The strategy accepts only rows from the newest scanner timestamp, no more than
-  180 seconds old.
+### Depth and edge gate
 
 Expected edge is:
 
 ```text
-funding benefit
-- four measured slippage components
-- 0.10% spot entry fee
-- 0.02% perpetual entry fee
-- 0.17% combined exit fee allowance
+directional displayed funding benefit
+- spot entry slippage
+- perpetual entry slippage
+- spot exit slippage
+- perpetual exit slippage
+- 0.10% modeled spot entry fee
+- 0.02% modeled perpetual entry fee
+- 0.17% modeled combined exit fee
 - 0.03% safety buffer
 ```
 
-The fixed fee/safety component is `0.32%` before measured slippage. This is why
-a large displayed MEXC rate can still reject every layer except the smallest, or
-reject the event entirely.
+- The fixed modeled cost is `0.32%` before measured slippage.
+- Raw expected edge must be at least `0.10%`.
+- Exit slippage plus modeled exit fees must not exceed `0.60%`.
+- The opportunity must come from the newest scanner timestamp and be no more
+  than 180 seconds old.
 
-### 3. Basis-history gate
+### Basis and volatility gate
 
 The latest 15 basis observations are retained. After five observations:
 
-- `LONG_SPOT_SHORT_PERP` requires the 75th percentile or higher.
+- `LONG_SPOT_SHORT_PERP` requires the 75th basis percentile or higher.
 - `SHORT_SPOT_LONG_PERP` requires the 25th percentile or lower.
-- Basis standard deviation above `5.00%`, or absolute lookback trend above
-  `5.00%`, starts a 60-minute entry cooldown.
+- Basis standard deviation above `0.75%`, or absolute lookback trend above
+  `2.00%`, starts a 60-minute entry cooldown.
 
-An orderly adverse widening may improve a later layer. Volatility pauses adds;
-it does not close the existing hedge.
+Orderly adverse basis can improve a later entry. Volatility pauses new risk but
+never forces an existing hedge to close.
 
-### 4. Signal activation
+### Continuous signal gate
 
-- The same symbol, funding timestamp, and direction must be seen twice.
-- At least one minute must pass from the first observation.
-- The latest observation must still be an eligible depth-priced candidate.
-- Reprocessing one scanner timestamp does not increase the observation count.
+- The same event key, funding timestamp, symbol, and direction must remain
+  extreme for three consecutive fresh scanner observations.
+- Consecutive observations may be no more than 90 seconds apart.
+- A below-threshold rate, direction change, stale/missing snapshot, settlement,
+  or longer gap resets the active streak.
+- Lifetime observations remain available for research but cannot reactivate a
+  broken streak.
+- Reprocessing the same scanner timestamp does not increment the streak.
 
-### 5. Layer and portfolio gate
+### Timed layer gate
 
-- Entry ladder: `$50`, `$100`, `$250`, `$500`.
-- Layers are used in that order and aggregated into one weighted position.
-- At most one layer is added per base/direction in a strategy cycle.
-- At least one minute must pass between layers.
-- Maximum symbol notional is `$2,000`.
-- Maximum total strategy notional is `$10,000`.
-- Maximum aggregated open positions is 30.
-- An opposite-direction position in the same base blocks entry.
-- Full closure starts a 60-minute re-entry cooldown.
+| Layer | Notional | Maximum time to funding | Minimum continuous signal age | Minimum conservative edge |
+| --- | ---: | ---: | ---: | ---: |
+| Probe | `$50` | 120 minutes | 2 minutes | `0.25%` |
+| Layer 2 | `$100` | 60 minutes | 15 minutes | `0.20%` |
+| Layer 3 | `$250` | 30 minutes | 30 minutes | `0.15%` |
+| Layer 4 | `$500` | 12 minutes | 45 minutes | `0.10%` |
 
-The four entry layers are finite. A rejected larger layer does not cause the
-strategy to substitute a different amount; it waits for that required layer to
-become independently profitable and fillable.
+- Layers are finite and used in order.
+- At least five minutes must pass between layers.
+- At most one layer per base/direction can be added in one strategy cycle.
+- Later layers use the minimum rate in the current streak and subtract a
+  lead-time haircut: `0.25%` beyond 60 minutes, `0.20%` beyond 30, `0.12%`
+  beyond 15, and `0.05%` beyond seven.
+- A late signal cannot compress all four layers into a few cycles because each
+  later layer also requires its increasing continuous-signal age.
+- Any position in a controlled exit state blocks every additional layer.
+
+Portfolio caps remain `$2,000` per symbol, `$10,000` total open notional, and 30
+aggregated positions. Opposite-direction exposure in the same base is blocked.
 
 ## Hold Rules
 
-MEXC has no adverse-basis stop and no maximum holding time.
+There is no adverse-basis stop and no maximum holding time.
 
-Before the first funding event:
+Before first funding:
 
 - Hold through flat or adverse basis.
-- Continue considering the next layer while all entry rules remain valid.
-- Pause new exposure on stale data, missing depth, failed multiplier lookup,
-  excessive volatility, insufficient expected edge, or an exposure limit.
-- Use only the controlled profitable basis exit described below.
+- Continue considering the next timed layer while every entry gate passes.
+- Missing, stale, unfillable, volatile, or capability-invalid data pauses entry.
+- The only exit is the profitable controlled basis exit below.
 
-After funding:
+After first funding:
 
-1. Hold when the next funding benefit is at least `1.00%`.
-2. From `0.30%` up to but excluding `1.00%`, request a profitable unwind.
-3. When next funding is missing, below `0.30%`, or reversed, request a
-   weak-funding unwind and permit funding-harvest logic.
-4. Hold whenever no requested exit is both fillable and profitable.
-
-The configured `0.50%` near-flat basis threshold is retained for marking and
-diagnostics. With a known next rate, the funding hierarchy is evaluated first.
+1. Hold when the next directional funding benefit is at least `1.00%`, unless a
+   controlled post-funding exit has already begun.
+2. From `0.30%` to below `1.00%`, start a profitable gentle unwind.
+3. If next funding is missing, below `0.30%`, or reversed, start a weak-funding
+   unwind and allow funding-harvest chunks.
+4. Once post-funding exit begins, it remains `EXITING_POSTFUNDING`; new layers
+   cannot restart the position.
+5. If no fillable profitable chunk exists, hold.
 
 ## Exit Rules
 
-### Controlled pre-funding basis exit
+### Pre-funding basis exit
 
 - Activates at `0.75%` executable basis improvement.
-- Requires at least `0.02%` net profit excluding funding after allocated entry
-  fees, depth-priced exit, exit fees, and safety buffer.
-- Evaluates `$50`, `$100`, and `$250` chunks.
-- Chooses the highest net percentage profitable chunk, breaking a tie in favor
-  of the larger notional.
-- Removes at most one chunk per cycle.
-- Blocks same-cycle re-layering after a successful partial exit.
-- Allows only a final remainder no larger than `$250` to close in full.
-- Holds when no chunk is profitable and fillable.
+- Requires at least `0.02%` profit excluding funding after entry fees,
+  depth-priced exit, exit fees, and safety buffer.
+- Evaluates `$50/$100/$250` chunks.
+- Chooses the largest profitable chunk within `0.05%` of the best net percentage.
+- Removes at most one chunk every five minutes.
+- Persists `EXITING_PREFUNDING` after the first trigger and blocks all re-entry.
+- A final remainder no larger than `$250` can close in full when profitable and
+  fillable.
+- An adverse move never causes an uncontrolled exit.
 
 ### Post-funding unwind
 
-1. Test a complete fillable exit and allow it when net PnL excluding funding is
-   at least `0.02%`.
-2. Otherwise test `$50`, `$100`, and `$250` chunks and select the best profitable
-   net percentage excluding funding.
-3. For missing, weak, or reversed next funding, allow a `$50` funding-harvest
-   chunk when total profit including allocated funding is at least `$0.15`.
-4. Otherwise record `exit_wanted_no_profitable_chunk` and hold.
-
-No exit signal can bypass fillability or profitability because basis moved
-adversely.
+- Uses the same largest-near-best chunk rule and five-minute pacing.
+- Full closure is considered only when the remainder is at most `$250` and earns
+  at least `0.02%` excluding funding.
+- Weak, missing, or reversed next funding may harvest a `$50` chunk when total
+  allocated profit including funding is at least `$0.15`.
+- No qualifying chunk means `exit_wanted_no_profitable_chunk` and continued hold.
 
 ## Funding Accounting
 
-- Funding uses the actual settled MEXC rate, not the displayed entry estimate.
-- `collectCycle` is stored on the position; eight hours is used only as fallback.
-- Each crossed settlement is accrued in sequence when the strategy resumes.
-- Funding PnL uses current open notional and direction.
-- Partial exits allocate funding, fees, quantities, and notional proportionally.
+- Actual funding rate is fetched from MEXC settlement history.
+- Settlement fair price is fetched from the one-minute fair-price series; the
+  latest mark or entry price is a fallback if the public series is unavailable.
+- Funding notional is open perpetual base quantity multiplied by settlement fair
+  price, not the original requested USD amount.
+- Every event stores actual rate, fair price, funding notional, benefit, and PnL.
+- `collectCycle` advances the next timestamp; eight hours is fallback only.
+- Partial exits proportionally allocate quantities, fees, and accrued funding.
 
-## Legacy Paper-State Guard
-
-Positions written by the old schema have no stored spot/perpetual quantities or
-entry prices. Such a row is marked `legacy_position_missing_execution_quantities`.
-The new strategy will not add, reprice, accrue funding, or exit that row. It must
-be archived or explicitly migrated. The July 2026 VPS deployment reset the old
-Binance and MEXC paper data before activating this schema.
-
-## Data And Audit Files
+## Data And Migration
 
 All files are under `data/mexc_extreme_funding/`:
 
 | File | Purpose |
 | --- | --- |
-| `snapshots/snapshots_YYYYMMDD.csv` | Full funding-window observations |
-| `latest_snapshots.csv` | Latest contract funding state |
-| `opportunities/opportunities_YYYYMMDD.csv` | Depth-priced notional rows |
+| `snapshots/snapshots_YYYYMMDD.csv` | Full funding-window research archive |
+| `extreme_observations/extreme_observations_YYYYMMDD.csv` | Compact settlement source |
+| `latest_snapshots.csv` | Latest funding state |
+| `opportunities/opportunities_YYYYMMDD.csv` | Contract-aware depth rows |
 | `latest_opportunities.csv` | Fresh strategy input |
 | `basis_history.csv` | Rolling basis observations |
-| `settlement_comparisons.csv` | Displayed versus settled funding |
-| `paper/signals.csv` | Two-observation activation state |
-| `paper/positions.csv` | Aggregated paper positions |
-| `paper/fills.csv` | Entry and exit ledger |
+| `settlement_comparisons.csv` | Displayed versus actual funding |
+| `paper/signals.csv` | Lifetime and continuous streak state |
+| `paper/positions.csv` | Aggregated positions and lifecycle state |
+| `paper/fills.csv` | Entry and controlled-exit ledger |
 | `paper/decisions.csv` | Entry allow/reject audit |
-| `paper/funding_events.csv` | Actual funding ledger |
+| `paper/funding_events.csv` | Fair-price funding ledger |
 | `paper/cooldowns.csv` | Volatility and post-close cooldowns |
 
-## Paper And Live Limitations
-
-- Negative funding requires spot margin borrowing. Borrow availability, borrow
-  interest, recalls, margin tiers, and liquidation are not modeled.
-- Live execution must enforce MEXC contract quantity precision, minimum volume,
-  spot minimum notional, price precision, and current account fee tier.
-- Contract metadata can change and must remain part of the live pre-trade check.
-- Separate REST books are not an atomic cross-market execution guarantee.
-- This package is deliberately paper-only and unauthenticated.
+CSV headers migrate when first rewritten. Existing open positions retain their
+stored quantities and continue to be managed. Old rows with no execution
+quantities remain open but are marked `legacy_position_missing_execution_quantities`
+and cannot be repriced, funded, layered, or exited automatically.
 
 ## Commands
 
 ```bash
 python -m mexc_extreme_funding.run_scanner
+python -m mexc_extreme_funding.run_backfill_extreme_observations
 python -m mexc_extreme_funding.run_paper_strategy
 python -m mexc_extreme_funding.run_dashboard --port 8771
 python -m mexc_extreme_funding.print_summary
 python test_extreme_funding_strategies.py
 ```
+
+The package remains deliberately paper-only. A future authenticated executor
+must replace the inventory whitelist with real balances/borrows and revalidate
+fees, price/quantity precision, order limits, and both-leg execution risk.

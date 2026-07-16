@@ -52,6 +52,21 @@ def benefit_for_direction(direction: str, rate_pct: float) -> float:
     return rate_pct if direction == "LONG_SPOT_SHORT_PERP" else -rate_pct
 
 
+@dataclass(frozen=True)
+class MexcMarketRules:
+    spot_symbol: str
+    perp_symbol: str
+    spot_trading_allowed: bool
+    spot_margin_allowed: bool
+    spot_quantity_step: float
+    perp_api_allowed: bool
+    perp_state: int
+    contract_size: float
+    contract_volume_step: float
+    min_contract_volume: float
+    max_contract_volume: float
+
+
 @dataclass
 class FundingSnapshot:
     observed_at_utc: datetime
@@ -150,6 +165,20 @@ class OpportunityRow:
     basis_std_pct: Optional[float] = None
     basis_percentile: Optional[float] = None
     basis_trend_pct: Optional[float] = None
+    spot_margin_allowed: bool = False
+    short_spot_available: bool = False
+    perp_api_allowed: bool = False
+    contract_size: float = 0.0
+    contract_volume_step: float = 0.0
+    perp_contracts: float = 0.0
+    hedged_base_quantity: float = 0.0
+    residual_delta_pct: float = 0.0
+    spot_entry_notional_usd: float = 0.0
+    perp_entry_notional_usd: float = 0.0
+
+    @property
+    def opportunity_key(self) -> str:
+        return f"{iso(self.timestamp_utc)}|{self.base}|{self.direction}|{self.notional_usd:g}"
 
     def to_csv_row(self) -> dict:
         row = asdict(self)
@@ -162,8 +191,10 @@ class OpportunityRow:
     def from_csv_row(cls, row: dict) -> "OpportunityRow":
         return cls(
             timestamp_utc=parse_datetime(row.get("timestamp_utc")) or utc_now(),
-            event_key=str(row.get("event_key", "")), base=str(row.get("base", "")),
-            direction=str(row.get("direction", "")), spot_symbol=str(row.get("spot_symbol", "")),
+            event_key=str(row.get("event_key", "")),
+            base=str(row.get("base", "")),
+            direction=str(row.get("direction", "")),
+            spot_symbol=str(row.get("spot_symbol", "")),
             perp_symbol=str(row.get("perp_symbol", "")),
             funding_rate_pct=parse_float(row.get("funding_rate_pct")),
             predicted_funding_rate_pct=parse_float(row.get("predicted_funding_rate_pct")),
@@ -182,12 +213,23 @@ class OpportunityRow:
             perp_exit_slippage_pct=parse_float(row.get("perp_exit_slippage_pct")),
             expected_edge_pct=parse_float(row.get("expected_edge_pct")),
             round_trip_fillable=parse_bool(row.get("round_trip_fillable")),
-            decision=str(row.get("decision", "")), reason=str(row.get("reason", "")),
+            decision=str(row.get("decision", "")),
+            reason=str(row.get("reason", "")),
             basis_observation_count=parse_int(row.get("basis_observation_count")),
             basis_mean_pct=parse_float(row.get("basis_mean_pct")),
             basis_std_pct=parse_float(row.get("basis_std_pct")),
             basis_percentile=parse_float(row.get("basis_percentile")),
             basis_trend_pct=parse_float(row.get("basis_trend_pct")),
+            spot_margin_allowed=parse_bool(row.get("spot_margin_allowed")),
+            short_spot_available=parse_bool(row.get("short_spot_available")),
+            perp_api_allowed=parse_bool(row.get("perp_api_allowed")),
+            contract_size=parse_float(row.get("contract_size"), 0.0) or 0.0,
+            contract_volume_step=parse_float(row.get("contract_volume_step"), 0.0) or 0.0,
+            perp_contracts=parse_float(row.get("perp_contracts"), 0.0) or 0.0,
+            hedged_base_quantity=parse_float(row.get("hedged_base_quantity"), 0.0) or 0.0,
+            residual_delta_pct=parse_float(row.get("residual_delta_pct"), 0.0) or 0.0,
+            spot_entry_notional_usd=parse_float(row.get("spot_entry_notional_usd"), 0.0) or 0.0,
+            perp_entry_notional_usd=parse_float(row.get("perp_entry_notional_usd"), 0.0) or 0.0,
         )
 
 
@@ -224,15 +266,33 @@ class PaperPosition:
     funding_events_captured: int = 0
     funding_interval_hours: Optional[float] = None
     last_layer_at_utc: Optional[datetime] = None
+    management_state: str = "HOLDING"
+    last_exit_at_utc: Optional[datetime] = None
 
     def to_csv_row(self) -> dict:
         row = asdict(self)
-        for key in ("entry_at_utc", "updated_at_utc", "funding_time_utc", "exit_at_utc", "last_layer_at_utc"):
+        for key in (
+            "entry_at_utc", "updated_at_utc", "funding_time_utc", "exit_at_utc",
+            "last_layer_at_utc", "last_exit_at_utc",
+        ):
             row[key] = iso(row[key])
         return row
 
     @classmethod
     def from_csv_row(cls, row: dict) -> "PaperPosition":
+        status = str(row.get("status", "OPEN"))
+        exit_reason = str(row.get("exit_reason", ""))
+        management_state = str(row.get("management_state") or "")
+        if status == "CLOSED":
+            management_state = "CLOSED"
+        elif not management_state and exit_reason.startswith("prefunding_"):
+            management_state = "EXITING_PREFUNDING"
+        elif not management_state and exit_reason.startswith((
+            "gentle_unwind", "next_funding_weak", "basis_take_profit", "basis_near_flat",
+        )):
+            management_state = "EXITING_POSTFUNDING"
+        elif not management_state:
+            management_state = "HOLDING"
         return cls(
             position_id=str(row.get("position_id", "")),
             event_key=str(row.get("event_key", "")),
@@ -253,9 +313,9 @@ class PaperPosition:
             funding_pnl_pct=parse_float(row.get("funding_pnl_pct"), 0.0) or 0.0,
             estimated_net_pnl_pct=parse_float(row.get("estimated_net_pnl_pct"), 0.0) or 0.0,
             realised_pnl_usd=parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0,
-            status=str(row.get("status", "OPEN")),
+            status=status,
             exit_at_utc=parse_datetime(row.get("exit_at_utc")),
-            exit_reason=str(row.get("exit_reason", "")),
+            exit_reason=exit_reason,
             spot_qty=parse_float(row.get("spot_qty"), 0.0) or 0.0,
             perp_qty=parse_float(row.get("perp_qty"), 0.0) or 0.0,
             spot_entry_price=parse_float(row.get("spot_entry_price"), 0.0) or 0.0,
@@ -265,4 +325,6 @@ class PaperPosition:
             funding_events_captured=parse_int(row.get("funding_events_captured")),
             funding_interval_hours=parse_float(row.get("funding_interval_hours")),
             last_layer_at_utc=parse_datetime(row.get("last_layer_at_utc")),
+            management_state=management_state,
+            last_exit_at_utc=parse_datetime(row.get("last_exit_at_utc")),
         )

@@ -4,6 +4,7 @@ import argparse
 import time
 
 from mexc_extreme_funding.config import DEFAULT_CONFIG
+from mexc_extreme_funding.mexc_public_client import MexcPublicClient
 from mexc_extreme_funding.paper_strategy import run_paper_strategy_once
 
 
@@ -12,8 +13,9 @@ def main() -> None:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--interval", type=float, default=DEFAULT_CONFIG.strategy_interval_seconds)
     args = parser.parse_args()
+    client = MexcPublicClient(DEFAULT_CONFIG)
     while True:
-        result = run_paper_strategy_once(DEFAULT_CONFIG)
+        result = run_paper_strategy_once(DEFAULT_CONFIG, client=client)
         print("MEXC paper " + " ".join(f"{key}={value}" for key, value in result.items()), flush=True)
         if not args.loop:
             return

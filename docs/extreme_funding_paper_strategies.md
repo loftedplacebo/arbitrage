@@ -35,20 +35,22 @@ All three define basis as perpetual price divided by spot price minus one.
 Positive-funding basis improves when it falls; negative-funding basis improves
 when it rises.
 
-The short-spot direction is paper modeling. Live use requires margin borrow
-availability and borrow-cost checks that are not currently implemented.
+Binance and KuCoin still model the short-spot direction on paper. MEXC V2 only
+allows it when the public spot metadata reports margin trading or the symbol is
+explicitly listed as inventory-backed. Live use still requires authenticated
+borrow availability, borrow-cost, recall, and balance checks.
 
 ## Key Differences
 
 | Rule | Binance | MEXC | KuCoin |
 | --- | ---: | ---: | ---: |
 | Nominal funding floor | `0.50%` absolute | `0.50%` absolute | `0.03%` directional |
-| Practical fixed-cost funding floor before slippage | `0.35%` for `0.02%` edge, but `0.50%` trigger dominates | `0.34%` for `0.02%` edge, but `0.50%` trigger dominates | About `0.37%` |
-| Minimum time before funding | 15 minutes | 15 minutes | 15 minutes |
-| Signal persistence | Continuous streak: 2 observations/2 minutes; larger layers require 10/30/60 minutes | 2 observations and 1 minute | No equivalent signal-age gate |
+| Practical fixed-cost funding floor before slippage | `0.35%` for `0.02%` edge, but `0.50%` trigger dominates | `0.42%` for `0.10%` edge, but `0.50%` trigger dominates | About `0.37%` |
+| Minimum time before funding | 15 minutes | 7 minutes | 15 minutes |
+| Signal persistence | Continuous streak: 2 observations/2 minutes; larger layers require 10/30/60 minutes | Continuous streak: 3 observations; layers require 2/15/30/45 minutes | No equivalent signal-age gate |
 | Scanner cadence | 60 seconds | 60 seconds | 60 seconds |
 | Entry chunks | `$100/$250/$500/$1,000` | `$50/$100/$250/$500` | `$100/$250/$500/$1,000` |
-| Layer interpretation | Finite ordered four-step ladder | Finite ordered four-step ladder | Best chunk menu, repeatable each fresh tick |
+| Layer interpretation | Finite ordered four-step ladder | Finite ordered ladder at 120/60/30/12 minutes | Best chunk menu, repeatable each fresh tick |
 | Symbol cap | `$5,000` | `$2,000` | `$5,000` |
 | Total cap | `$20,000` | `$10,000` | `$50,000` |
 | Position-count cap | 40 | 30 | 100 |
@@ -60,8 +62,8 @@ availability and borrow-cost checks that are not currently implemented.
 | Time-based exit | None | None | None |
 
 The practical fixed-cost floor is funding benefit minus modeled fixed costs
-needed to leave `0.02%` expected edge before measured slippage. Every strategy
-still performs the complete depth-priced calculation.
+needed to leave each strategy's minimum expected edge before measured slippage.
+Every strategy still performs the complete depth-priced calculation.
 
 ## Shared Scanner Invariants
 
@@ -136,21 +138,45 @@ layer remains depth-priced and profitable. Basis standard deviation above
 MEXC uses the same gate order as Binance, with these exchange-specific rules:
 
 - Ordered layers are `$50`, `$100`, `$250`, then `$500`.
+- The four layers become available only at 120, 60, 30, and 12 minutes before
+  funding. Their signal-age requirements are 2, 15, 30, and 45 minutes.
+- A signal needs three continuous observations. A gap over 90 seconds, funding
+  reversal, stale event, or loss of eligibility resets the streak.
+- Funding-prediction haircuts are `0.25%`, `0.20%`, `0.12%`, and `0.05%` at
+  lead-time bands of 60, 30, 15, and 7 minutes.
+- Conservative expected edge must be at least `0.25%`, `0.20%`, `0.15%`, and
+  `0.10%` for the four layers. The measured entry-plus-exit cost may not exceed
+  `0.60%`.
 - Symbol cap is `$2,000`; total cap is `$10,000`; position cap is 30.
 - MEXC `collectCycle` supplies the funding interval.
-- Futures depth volume is contract count. It is multiplied by the contract's
-  `contractSize` before slippage or hedge quantity is calculated.
+- Spot trading and perpetual API trading must be enabled. Negative funding also
+  requires public margin eligibility or an explicit inventory-backed allowlist.
+- Futures depth volume is contract count. Each layer is rounded down to MEXC's
+  `volUnit`, checked against `minVol`/`maxVol`, converted through `contractSize`,
+  and matched to the same base quantity on spot. A residual hedge above `0.25%`
+  is rejected.
+- Both books must be no more than two seconds old and no more than two seconds
+  apart. Missing capability or contract metadata rejects execution but does not
+  remove the event from the research history.
 - Requests are paced by 0.11 seconds.
-- Missing contract metadata rejects the opportunity.
+- Basis volatility above `0.75%` standard deviation or an absolute trend above
+  `2.00%` pauses new layers for 60 minutes.
 
 ### Hold and exit
 
-- Before funding, basis improvement of `0.75%` activates one best profitable
-  `$50/$100/$250` chunk per cycle.
+- Before funding, adverse basis never closes the position and may still permit
+  the next timed layer when every entry gate passes.
+- Basis improvement of `0.75%` enters persistent `EXITING_PREFUNDING` state,
+  permanently blocks re-layering for that position, and removes at most one
+  profitable `$50/$100/$250` chunk every five minutes.
+- The exit chooser takes the largest profitable chunk within `0.05%` of the
+  best chunk's return. A remainder no larger than `$250` may close in full.
 - After funding, the `1.00%` juicy hold and `0.30%` weak-funding thresholds match
   Binance.
-- Full post-funding exits require `0.02%` profit excluding funding.
-- Partial exits use `$50/$100/$250`.
+- Post-funding exit requests enter persistent `EXITING_POSTFUNDING` state and
+  use the same controlled five-minute chunk cadence.
+- Full post-funding exits require `0.02%` profit excluding funding. Partial
+  exits use `$50/$100/$250`.
 - Weak-funding harvest uses `$50` and requires at least `$0.15` total allocated
   profit including funding.
 - Adverse basis never forces an exit.
@@ -207,10 +233,15 @@ All strategies:
 
 - Store the predicted/displayed rate at entry.
 - Fetch actual settlement history after the funding timestamp.
-- Book funding using open notional and held direction.
+- Book funding using held direction and the quantity open at settlement.
 - Advance to the next exchange interval, with an eight-hour fallback.
 - Can catch up across multiple crossed settlements after downtime.
 - Allocate accrued funding proportionally when a partial exit reduces notional.
+
+MEXC values that quantity at the settlement fair price from the one-minute fair
+price kline, with snapshot mark price and entry price as fallbacks. This avoids
+calculating MEXC funding from a stale configured layer nominal after contract
+rounding or partial exits.
 
 ## Failure And Pause Behavior
 

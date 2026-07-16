@@ -228,7 +228,9 @@ Full specifications:
 
 - `binance_extreme_funding/README.md`: Binance V2 continuous funding streak,
   timed confidence layers, funding, hold, and controlled exit rules.
-- `mexc_extreme_funding/README.md`: MEXC rules, including contract-size handling.
+- `mexc_extreme_funding/README.md`: MEXC V2 capability-gated shorting,
+  contract-rounded equal-quantity hedges, timed layers, funding accounting, and
+  controlled exit rules.
 - `kucoin-basis-funding-arb/kucoin_basis/README.md`: canonical KuCoin rules in
   the independent local KuCoin checkout.
 - `docs/extreme_funding_paper_strategies.md`: repository-level comparison, data

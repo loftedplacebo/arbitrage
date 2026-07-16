@@ -3,12 +3,19 @@ from __future__ import annotations
 import csv
 from datetime import timedelta
 from pathlib import Path
+from typing import Iterator
 
 from mexc_extreme_funding.basis_history import append_basis_observation, calculate_basis_stats
-from mexc_extreme_funding.config import DEFAULT_CONFIG, MexcExtremeFundingConfig
 from mexc_extreme_funding.mexc_public_client import MexcPublicClient
+from mexc_extreme_funding.config import MexcExtremeFundingConfig, DEFAULT_CONFIG
 from mexc_extreme_funding.models import (
-    FundingSnapshot, OpportunityRow, benefit_for_direction, iso, parse_datetime, parse_float, utc_now,
+    FundingSnapshot,
+    OpportunityRow,
+    benefit_for_direction,
+    iso,
+    parse_datetime,
+    parse_float,
+    utc_now,
 )
 from mexc_extreme_funding.orderbook import estimate_basis_round_trip
 from mexc_extreme_funding.paper_store import PaperStore
@@ -38,12 +45,22 @@ OPPORTUNITY_FIELDS = [
     "spot_exit_slippage_pct", "perp_exit_slippage_pct", "expected_edge_pct",
     "round_trip_fillable", "decision", "reason", "basis_observation_count",
     "basis_mean_pct", "basis_std_pct", "basis_percentile", "basis_trend_pct",
+    "spot_margin_allowed", "short_spot_available", "perp_api_allowed",
+    "contract_size", "contract_volume_step", "perp_contracts",
+    "hedged_base_quantity", "residual_delta_pct", "spot_entry_notional_usd",
+    "perp_entry_notional_usd",
 ]
 
 
 def _write_csv(path: Path, rows: list[dict], fields: list[str], append: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = append and path.exists() and path.stat().st_size > 0
+    if exists:
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            current_fields = next(csv.reader(handle), [])
+        if current_fields != fields:
+            existing_rows = _read_csv(path)
+            _write_csv(path, existing_rows, fields, append=False)
     with path.open("a" if append else "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         if not exists:
@@ -56,6 +73,13 @@ def _read_csv(path: Path) -> list[dict]:
         return []
     with path.open("r", newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def _iter_csv(path: Path) -> Iterator[dict]:
+    if not path.exists():
+        return
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        yield from csv.DictReader(handle)
 
 
 def latest_snapshot_path(config: MexcExtremeFundingConfig = DEFAULT_CONFIG) -> Path:
@@ -74,16 +98,63 @@ def load_latest_opportunities(config: MexcExtremeFundingConfig = DEFAULT_CONFIG)
     return [OpportunityRow.from_csv_row(row) for row in _read_csv(latest_opportunities_path(config))]
 
 
+def backfill_extreme_observations(
+    config: MexcExtremeFundingConfig = DEFAULT_CONFIG,
+) -> dict[str, int]:
+    output_dir = config.data_dir / "extreme_observations"
+    files_created = rows_written = 0
+    for source in sorted(config.snapshots_dir.glob("snapshots_*.csv")):
+        suffix = source.stem.removeprefix("snapshots_")
+        target = output_dir / f"extreme_observations_{suffix}.csv"
+        if target.exists():
+            continue
+        batch: list[dict] = []
+        for row in _iter_csv(source):
+            rate = parse_float(row.get("predicted_funding_rate_pct"))
+            if rate is None or abs(rate) < config.min_abs_funding_rate_pct:
+                continue
+            batch.append(row)
+            if len(batch) >= 1_000:
+                _write_csv(target, batch, SNAPSHOT_FIELDS, append=True)
+                rows_written += len(batch)
+                batch.clear()
+        if batch:
+            _write_csv(target, batch, SNAPSHOT_FIELDS, append=True)
+            rows_written += len(batch)
+        if target.exists():
+            files_created += 1
+    return {"files_created": files_created, "rows_written": rows_written}
+
+
+def _fixed_cost_pct(config: MexcExtremeFundingConfig) -> float:
+    return config.round_trip_fees_pct
+
+
 def _entry_decision(
-    *, snapshot: FundingSnapshot, direction: str, expected_edge_pct: float,
-    exit_cost_pct: float, fillable: bool, observation_count: int,
-    percentile: float | None, config: MexcExtremeFundingConfig,
+    *,
+    snapshot: FundingSnapshot,
+    direction: str,
+    expected_edge_pct: float,
+    exit_cost_pct: float,
+    fillable: bool,
+    observation_count: int,
+    percentile: float | None,
+    short_spot_available: bool,
+    perp_api_allowed: bool,
+    residual_delta_pct: float,
+    config: MexcExtremeFundingConfig,
 ) -> tuple[str, str]:
     rate = snapshot.current_funding_rate_pct
     if not snapshot.eligible or direction != snapshot.direction:
         return "REJECT", "open_position_watchlist"
     if rate is None or benefit_for_direction(direction, rate) < config.min_abs_funding_rate_pct:
         return "REJECT", "funding_below_threshold"
+    if direction == "SHORT_SPOT_LONG_PERP" and not short_spot_available:
+        return "REJECT", "spot_short_unavailable"
+    if not perp_api_allowed:
+        return "REJECT", "perp_api_unavailable"
+    if residual_delta_pct > config.max_residual_delta_pct:
+        return "REJECT", "residual_delta_too_high"
     if expected_edge_pct < config.min_expected_edge_pct:
         return "REJECT", "expected_edge_below_threshold"
     if not fillable:
@@ -128,9 +199,22 @@ def _build_opportunities(
         if not directions or not snapshot.spot_symbol:
             continue
         try:
+            rules = client.fetch_market_rules(snapshot.spot_symbol, snapshot.perp_symbol)
             spot_book, perp_book = client.fetch_orderbooks(
                 snapshot.spot_symbol, snapshot.perp_symbol, snapshot.observed_at_utc, limit=100,
             )
+            book_now = utc_now()
+            book_age_ms = max(
+                (book_now - spot_book.observed_at_utc).total_seconds() * 1_000,
+                (book_now - perp_book.observed_at_utc).total_seconds() * 1_000,
+            )
+            book_skew_ms = abs(
+                (perp_book.observed_at_utc - spot_book.observed_at_utc).total_seconds() * 1_000
+            )
+            if book_age_ms > config.max_orderbook_age_ms:
+                raise ValueError(f"order books stale by {book_age_ms:.0f}ms")
+            if book_skew_ms > config.max_orderbook_age_ms:
+                raise ValueError(f"spot/perp order-book skew {book_skew_ms:.0f}ms")
             spot_mid = (spot_book.bids[0].price + spot_book.asks[0].price) / 2
             perp_mid = (perp_book.bids[0].price + perp_book.asks[0].price) / 2
             basis_pct = (perp_mid / spot_mid - 1) * 100
@@ -145,17 +229,22 @@ def _build_opportunities(
             for watched_notionals in watched.values():
                 notionals.update(watched_notionals)
             for direction in sorted(directions):
+                short_spot_available = (
+                    direction != "SHORT_SPOT_LONG_PERP"
+                    or rules.spot_margin_allowed
+                    or snapshot.spot_symbol in config.inventory_backed_short_spot_symbols
+                )
                 for notional in sorted(value for value in notionals if value > 0):
                     estimate = estimate_basis_round_trip(
                         direction=direction, spot_book=spot_book, perp_book=perp_book,
-                        notional_usd=notional,
+                        notional_usd=notional, rules=rules,
                     )
                     rate = snapshot.current_funding_rate_pct or 0.0
                     expected_edge = (
                         benefit_for_direction(direction, rate)
                         - estimate.spot_entry.slippage_pct - estimate.perp_entry.slippage_pct
                         - estimate.spot_exit.slippage_pct - estimate.perp_exit.slippage_pct
-                        - config.round_trip_fees_pct
+                        - _fixed_cost_pct(config)
                     )
                     exit_cost = (
                         estimate.spot_exit.slippage_pct + estimate.perp_exit.slippage_pct
@@ -165,6 +254,9 @@ def _build_opportunities(
                         snapshot=snapshot, direction=direction, expected_edge_pct=expected_edge,
                         exit_cost_pct=exit_cost, fillable=estimate.round_trip_fillable,
                         observation_count=stats.observation_count, percentile=stats.percentile,
+                        short_spot_available=short_spot_available,
+                        perp_api_allowed=rules.perp_api_allowed and rules.perp_state == 0,
+                        residual_delta_pct=estimate.residual_delta_pct,
                         config=config,
                     )
                     if notional not in config.layer_ladder_usd and decision == "ENTER_CANDIDATE":
@@ -193,6 +285,16 @@ def _build_opportunities(
                         basis_observation_count=stats.observation_count,
                         basis_mean_pct=stats.mean_pct, basis_std_pct=stats.std_pct,
                         basis_percentile=stats.percentile, basis_trend_pct=stats.trend_pct,
+                        spot_margin_allowed=rules.spot_margin_allowed,
+                        short_spot_available=short_spot_available,
+                        perp_api_allowed=rules.perp_api_allowed and rules.perp_state == 0,
+                        contract_size=rules.contract_size,
+                        contract_volume_step=rules.contract_volume_step,
+                        perp_contracts=estimate.perp_contracts,
+                        hedged_base_quantity=estimate.hedged_base_quantity,
+                        residual_delta_pct=estimate.residual_delta_pct,
+                        spot_entry_notional_usd=estimate.spot_entry.filled_notional,
+                        perp_entry_notional_usd=estimate.perp_entry.filled_notional,
                     ))
         except Exception as error:
             errors.append(f"{snapshot.perp_symbol}: {error}")
@@ -204,8 +306,9 @@ def _reconcile_settlements(client: MexcPublicClient, config: MexcExtremeFundingC
     comparison_path = config.data_dir / "settlement_comparisons.csv"
     completed = {row.get("comparison_key", "") for row in _read_csv(comparison_path)}
     candidates: dict[str, list[dict]] = {}
-    for path in sorted(config.snapshots_dir.glob("snapshots_*.csv"))[-2:]:
-        for row in _read_csv(path):
+    extreme_dir = config.data_dir / "extreme_observations"
+    for path in sorted(extreme_dir.glob("extreme_observations_*.csv"))[-2:]:
+        for row in _iter_csv(path):
             funding_time = parse_datetime(row.get("next_funding_time_utc"))
             observed = parse_datetime(row.get("observed_at_utc"))
             rate = parse_float(row.get("predicted_funding_rate_pct"))
@@ -264,6 +367,17 @@ def scan_once(
     daily_path = config.snapshots_dir / f"snapshots_{now:%Y%m%d}.csv"
     _write_csv(daily_path, rows, SNAPSHOT_FIELDS, append=True)
     _write_csv(latest_snapshot_path(config), rows, SNAPSHOT_FIELDS, append=False)
+    extreme_rows = [
+        row for row in rows
+        if abs(parse_float(row.get("predicted_funding_rate_pct"), 0.0) or 0.0)
+        >= config.min_abs_funding_rate_pct
+    ]
+    extreme_path = (
+        config.data_dir / "extreme_observations"
+        / f"extreme_observations_{now:%Y%m%d}.csv"
+    )
+    if extreme_rows:
+        _write_csv(extreme_path, extreme_rows, SNAPSHOT_FIELDS, append=True)
     opportunities, errors = _build_opportunities(client, snapshots, config)
     opportunity_rows = [row.to_csv_row() for row in opportunities]
     opportunity_path = config.opportunities_dir / f"opportunities_{now:%Y%m%d}.csv"

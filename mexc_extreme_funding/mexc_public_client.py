@@ -7,7 +7,7 @@ from typing import Any, Optional
 import requests
 
 from mexc_extreme_funding.config import DEFAULT_CONFIG, MexcExtremeFundingConfig
-from mexc_extreme_funding.models import FundingSnapshot, parse_float, utc_now
+from mexc_extreme_funding.models import FundingSnapshot, MexcMarketRules, parse_bool, parse_float, parse_int, utc_now
 from core.models import OrderBook, OrderBookLevel
 from core.orderbook import parse_orderbook_levels
 
@@ -54,7 +54,8 @@ class MexcPublicClient:
         self.config = config
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "mexc-extreme-funding-paper/1.0"})
-        self._contract_size_cache: dict[str, float] | None = None
+        self._spot_rule_cache: dict[str, dict] | None = None
+        self._contract_rule_cache: dict[str, dict] | None = None
 
     def _get(self, base_url: str, path: str, params: Optional[dict] = None) -> Any:
         response = self.session.get(
@@ -75,18 +76,48 @@ class MexcPublicClient:
         data = payload.get("data") if isinstance(payload, dict) else {}
         return data if isinstance(data, dict) else {}
 
-    def _contract_size(self, symbol: str) -> float:
-        if self._contract_size_cache is None:
-            payload = self._get(CONTRACT_URL, "/api/v1/contract/detail")
-            rows = payload.get("data") if isinstance(payload, dict) else []
-            self._contract_size_cache = {
-                str(row.get("symbol")): parse_float(row.get("contractSize"), 0.0) or 0.0
+    def _load_market_rules(self) -> None:
+        if self._spot_rule_cache is None:
+            payload = self._get(SPOT_URL, "/api/v3/exchangeInfo")
+            rows = (payload.get("symbols") or []) if isinstance(payload, dict) else []
+            self._spot_rule_cache = {
+                str(row.get("symbol")): row
                 for row in rows if isinstance(row, dict) and row.get("symbol")
             }
-        size = self._contract_size_cache.get(symbol, 0.0)
-        if size <= 0:
-            raise ValueError(f"MEXC contract size missing for {symbol}")
-        return size
+        if self._contract_rule_cache is None:
+            payload = self._get(CONTRACT_URL, "/api/v1/contract/detail")
+            rows = (payload.get("data") or []) if isinstance(payload, dict) else []
+            if isinstance(rows, dict):
+                rows = [rows]
+            self._contract_rule_cache = {
+                str(row.get("symbol")): row
+                for row in rows if isinstance(row, dict) and row.get("symbol")
+            }
+
+    def fetch_market_rules(self, spot_symbol: str, perp_symbol: str) -> MexcMarketRules:
+        self._load_market_rules()
+        spot = (self._spot_rule_cache or {}).get(spot_symbol, {})
+        perp = (self._contract_rule_cache or {}).get(perp_symbol, {})
+        contract_size = parse_float(perp.get("contractSize"), 0.0) or 0.0
+        volume_step = parse_float(perp.get("volUnit"), 0.0) or 0.0
+        if contract_size <= 0 or volume_step <= 0:
+            raise ValueError(f"MEXC contract rules missing for {perp_symbol}")
+        return MexcMarketRules(
+            spot_symbol=spot_symbol,
+            perp_symbol=perp_symbol,
+            spot_trading_allowed=parse_bool(spot.get("isSpotTradingAllowed")),
+            spot_margin_allowed=parse_bool(spot.get("isMarginTradingAllowed")),
+            spot_quantity_step=parse_float(spot.get("baseSizePrecision"), 0.0) or 0.0,
+            perp_api_allowed=parse_bool(perp.get("apiAllowed")),
+            perp_state=parse_int(perp.get("state"), -1),
+            contract_size=contract_size,
+            contract_volume_step=volume_step,
+            min_contract_volume=parse_float(perp.get("minVol"), 0.0) or 0.0,
+            max_contract_volume=parse_float(perp.get("maxVol"), 0.0) or 0.0,
+        )
+
+    def _contract_size(self, spot_symbol: str, perp_symbol: str) -> float:
+        return self.fetch_market_rules(spot_symbol, perp_symbol).contract_size
 
     def fetch_snapshots(self, now: Optional[datetime] = None) -> list[FundingSnapshot]:
         observed = now or utc_now()
@@ -186,6 +217,27 @@ class MexcPublicClient:
                 nearest = (diff, rate * 100)
         return None if nearest is None else nearest[1]
 
+    def fetch_settlement_fair_price(self, symbol: str, funding_time: datetime) -> Optional[float]:
+        target_seconds = int(funding_time.timestamp())
+        payload = self._get(
+            CONTRACT_URL,
+            f"/api/v1/contract/kline/fair_price/{symbol}",
+            params={"interval": "Min1", "start": target_seconds - 120, "end": target_seconds + 120},
+        )
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        times = data.get("time", []) if isinstance(data, dict) else []
+        closes = data.get("close", []) if isinstance(data, dict) else []
+        nearest: tuple[float, float] | None = None
+        for timestamp, close in zip(times, closes):
+            price = parse_float(close)
+            try:
+                diff = abs(float(timestamp) - target_seconds)
+            except (TypeError, ValueError):
+                continue
+            if price is not None and price > 0 and (nearest is None or diff < nearest[0]):
+                nearest = (diff, price)
+        return None if nearest is None else nearest[1]
+
     def fetch_orderbooks(
         self,
         spot_symbol: str,
@@ -194,9 +246,11 @@ class MexcPublicClient:
         limit: int = 100,
     ) -> tuple[OrderBook, OrderBook]:
         spot = self._get(SPOT_URL, "/api/v3/depth", params={"symbol": spot_symbol, "limit": limit})
+        spot_observed_at = utc_now()
         perp_payload = self._get(CONTRACT_URL, f"/api/v1/contract/depth/{perp_symbol}", params={"limit": limit})
+        perp_observed_at = utc_now()
         perp = perp_payload.get("data") if isinstance(perp_payload, dict) else {}
-        contract_size = self._contract_size(perp_symbol)
+        contract_size = self._contract_size(spot_symbol, perp_symbol)
 
         def contract_levels(raw_levels) -> list[OrderBookLevel]:
             levels: list[OrderBookLevel] = []
@@ -217,13 +271,13 @@ class MexcPublicClient:
                 exchange_symbol=spot_symbol,
                 bids=parse_orderbook_levels(spot.get("bids", []), max_levels=limit),
                 asks=parse_orderbook_levels(spot.get("asks", []), max_levels=limit),
-                observed_at_utc=observed_at,
+                observed_at_utc=spot_observed_at,
             ),
             OrderBook(
                 exchange="mexc", market_type="futures", standard_symbol=spot_symbol,
                 exchange_symbol=perp_symbol,
                 bids=contract_levels(perp.get("bids", []) if isinstance(perp, dict) else []),
                 asks=contract_levels(perp.get("asks", []) if isinstance(perp, dict) else []),
-                observed_at_utc=observed_at,
+                observed_at_utc=perp_observed_at,
             ),
         )
