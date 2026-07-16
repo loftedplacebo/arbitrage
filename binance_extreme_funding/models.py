@@ -231,10 +231,15 @@ class PaperPosition:
     funding_events_captured: int = 0
     funding_interval_hours: Optional[float] = None
     last_layer_at_utc: Optional[datetime] = None
+    management_state: str = "HOLDING"
+    last_exit_at_utc: Optional[datetime] = None
 
     def to_csv_row(self) -> dict:
         row = asdict(self)
-        for key in ("entry_at_utc", "updated_at_utc", "funding_time_utc", "exit_at_utc", "last_layer_at_utc"):
+        for key in (
+            "entry_at_utc", "updated_at_utc", "funding_time_utc", "exit_at_utc",
+            "last_layer_at_utc", "last_exit_at_utc",
+        ):
             row[key] = iso(row[key])
         return row
 
@@ -272,4 +277,6 @@ class PaperPosition:
             funding_events_captured=parse_int(row.get("funding_events_captured")),
             funding_interval_hours=parse_float(row.get("funding_interval_hours")),
             last_layer_at_utc=parse_datetime(row.get("last_layer_at_utc")),
+            management_state=str(row.get("management_state") or "HOLDING"),
+            last_exit_at_utc=parse_datetime(row.get("last_exit_at_utc")),
         )

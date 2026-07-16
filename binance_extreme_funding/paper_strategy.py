@@ -23,6 +23,7 @@ from binance_extreme_funding.scanner import load_latest_opportunities, load_late
 def _update_signals(
     store: PaperStore,
     snapshots: list[FundingSnapshot],
+    config: BinanceExtremeFundingConfig,
     now: datetime,
 ) -> dict[str, dict]:
     signals = store.load_signals()
@@ -38,6 +39,11 @@ def _update_signals(
             signal["status"] = "REVERSED"
         elif not current.eligible:
             signal["status"] = "WATCH"
+        if signal["status"] != "ACTIVE":
+            signal["streak_started_utc"] = ""
+            signal["streak_last_seen_utc"] = ""
+            signal["streak_observations"] = 0
+            signal["streak_min_abs_rate_pct"] = ""
 
     for snapshot in snapshots:
         if not snapshot.eligible:
@@ -53,10 +59,15 @@ def _update_signals(
                 "last_seen_utc": iso(snapshot.observed_at_utc), "observations": 1,
                 "first_rate_pct": rate, "latest_rate_pct": rate,
                 "min_abs_rate_pct": abs(rate), "max_abs_rate_pct": abs(rate), "status": "ACTIVE",
+                "streak_started_utc": iso(snapshot.observed_at_utc),
+                "streak_last_seen_utc": iso(snapshot.observed_at_utc),
+                "streak_observations": 1, "streak_min_abs_rate_pct": abs(rate),
             }
             continue
+        previous_status = signal.get("status")
         last_seen = parse_datetime(signal.get("last_seen_utc"))
-        if last_seen is None or snapshot.observed_at_utc > last_seen:
+        is_new_observation = last_seen is None or snapshot.observed_at_utc > last_seen
+        if is_new_observation:
             signal["observations"] = parse_int(signal.get("observations")) + 1
             signal["last_seen_utc"] = iso(snapshot.observed_at_utc)
         signal["latest_rate_pct"] = rate
@@ -66,6 +77,26 @@ def _update_signals(
         signal["max_abs_rate_pct"] = max(
             parse_float(signal.get("max_abs_rate_pct"), abs(rate)) or abs(rate), abs(rate),
         )
+        streak_last_seen = parse_datetime(signal.get("streak_last_seen_utc"))
+        gap_seconds = (
+            (snapshot.observed_at_utc - streak_last_seen).total_seconds()
+            if streak_last_seen is not None else None
+        )
+        continuing = (
+            previous_status == "ACTIVE"
+            and gap_seconds is not None
+            and 0 < gap_seconds <= config.max_signal_observation_gap_seconds
+        )
+        if is_new_observation or not signal.get("streak_started_utc"):
+            if continuing:
+                signal["streak_observations"] = parse_int(signal.get("streak_observations")) + 1
+                previous_min = parse_float(signal.get("streak_min_abs_rate_pct"), abs(rate)) or abs(rate)
+                signal["streak_min_abs_rate_pct"] = min(previous_min, abs(rate))
+            else:
+                signal["streak_started_utc"] = iso(snapshot.observed_at_utc)
+                signal["streak_observations"] = 1
+                signal["streak_min_abs_rate_pct"] = abs(rate)
+            signal["streak_last_seen_utc"] = iso(snapshot.observed_at_utc)
         signal["status"] = "ACTIVE"
     store.write_signals(signals)
     return signals
@@ -166,6 +197,28 @@ def _basis_improvement(position: PaperPosition) -> float:
     if position.direction == "LONG_SPOT_SHORT_PERP":
         return position.entry_basis_pct - position.current_basis_pct
     return position.current_basis_pct - position.entry_basis_pct
+
+
+def _prediction_haircut(minutes_to_funding: float | None, config: BinanceExtremeFundingConfig) -> float:
+    if minutes_to_funding is None:
+        return max(haircut for _, haircut in config.funding_prediction_haircuts_pct)
+    for lower_bound, haircut in config.funding_prediction_haircuts_pct:
+        if minutes_to_funding > lower_bound:
+            return haircut
+    return 0.0
+
+
+def _conservative_edge(
+    row: OpportunityRow,
+    signal: dict,
+    layer_index: int,
+    config: BinanceExtremeFundingConfig,
+) -> float:
+    current_benefit = abs(row.funding_rate_pct or 0.0)
+    streak_min = parse_float(signal.get("streak_min_abs_rate_pct"), current_benefit) or current_benefit
+    deterioration = max(0.0, current_benefit - streak_min)
+    haircut = 0.0 if layer_index == 0 else _prediction_haircut(row.minutes_to_funding, config)
+    return (row.expected_edge_pct or 0.0) - deterioration - haircut
 
 
 def _estimate_exit(
@@ -276,6 +329,8 @@ def _close_position_chunk(
     })
     if full_close:
         position.status = "CLOSED"
+        position.management_state = "CLOSED"
+        position.last_exit_at_utc = now
         position.exit_at_utc = now
         position.exit_reason = reason
         position.estimated_net_pnl_pct = estimate["total_net_pct"]
@@ -296,6 +351,7 @@ def _close_position_chunk(
         position.realised_funding_pnl_usd / position.notional_usd * 100
         if position.notional_usd > 0 else 0.0
     )
+    position.last_exit_at_utc = now
     position.exit_reason = reason
     return False
 
@@ -313,6 +369,11 @@ def _try_profitable_exit(
     config: BinanceExtremeFundingConfig,
     now: datetime,
 ) -> tuple[bool, bool]:
+    if position.last_exit_at_utc is not None:
+        elapsed = (now - position.last_exit_at_utc).total_seconds() / 60
+        if elapsed < config.min_exit_interval_minutes:
+            return False, False
+
     def try_full() -> tuple[bool, bool]:
         if not allow_full:
             return False, False
@@ -344,7 +405,12 @@ def _try_profitable_exit(
             if estimate is not None and estimate["net_ex_funding_pct"] >= config.full_exit_min_profit_pct:
                 profitable_chunks.append((estimate["net_ex_funding_pct"], notional, row, estimate))
         if profitable_chunks:
-            _, notional, row, estimate = max(profitable_chunks, key=lambda item: (item[0], item[1]))
+            best_edge = max(item[0] for item in profitable_chunks)
+            near_best = [
+                item for item in profitable_chunks
+                if item[0] >= best_edge - config.max_chunk_edge_sacrifice_pct
+            ]
+            _, notional, row, estimate = max(near_best, key=lambda item: item[1])
             _close_position_chunk(
                 position=position, row=row, estimate=estimate, notional_usd=notional,
                 reason=f"{reason}_partial", store=store, config=config, now=now,
@@ -396,7 +462,12 @@ def _mark_and_manage_positions(
         position.updated_at_utc = now
 
         if position.funding_events_captured == 0:
-            if _basis_improvement(position) >= config.basis_take_profit_pct:
+            wants_prefunding_exit = (
+                position.management_state == "EXITING_PREFUNDING"
+                or _basis_improvement(position) >= config.basis_take_profit_pct
+            )
+            if wants_prefunding_exit:
+                position.management_state = "EXITING_PREFUNDING"
                 changed, closed = _try_profitable_exit(
                     position=position, rows=rows, reason="prefunding_basis_take_profit",
                     allow_funding_harvest=False, allow_partial=True, prefer_partial=True,
@@ -435,6 +506,8 @@ def _mark_and_manage_positions(
             continue
         changed, closed = _try_profitable_exit(
             position=position, rows=rows, reason=reason, allow_funding_harvest=allow_harvest,
+            allow_partial=True, prefer_partial=True,
+            allow_full=position.notional_usd <= max(config.gentle_unwind_chunk_ladder_usd),
             store=store, config=config, now=now,
         )
         if changed:
@@ -545,14 +618,28 @@ def _open_layers(
         signal = signals.get(row.event_key)
         reason = "layer_allowed"
         allowed = True
+        signal_age_minutes = 0.0
+        streak_observations = 0
+        conservative_edge = _conservative_edge(row, signal or {}, next_index, config)
         if signal is None or signal.get("status") != "ACTIVE":
             allowed, reason = False, "signal_not_active"
-        elif parse_int(signal.get("observations")) < config.min_consistent_observations:
+        elif parse_int(signal.get("streak_observations")) < config.min_consistent_observations:
             allowed, reason = False, "insufficient_observations"
         else:
-            first_seen = parse_datetime(signal.get("first_seen_utc")) or now
-            if (now - first_seen).total_seconds() / 60 < config.min_signal_age_minutes:
-                allowed, reason = False, "signal_too_new"
+            streak_observations = parse_int(signal.get("streak_observations"))
+            streak_started = parse_datetime(signal.get("streak_started_utc")) or now
+            signal_age_minutes = (now - streak_started).total_seconds() / 60
+            min_signal_age = config.layer_min_signal_age_minutes[next_index]
+            if signal_age_minutes < min_signal_age:
+                allowed, reason = False, "layer_signal_age"
+            max_minutes = config.layer_max_minutes_before_funding[next_index]
+            if (
+                allowed and max_minutes is not None
+                and (row.minutes_to_funding is None or row.minutes_to_funding > max_minutes)
+            ):
+                allowed, reason = False, "layer_too_early"
+            if allowed and conservative_edge < config.layer_min_conservative_edge_pct[next_index]:
+                allowed, reason = False, "conservative_edge_below_threshold"
         current = next(
             (position for position in open_positions if position.base == row.base and position.direction == row.direction),
             None,
@@ -563,11 +650,7 @@ def _open_layers(
             elapsed = (now - current.last_layer_at_utc).total_seconds() / 60
             if elapsed < config.min_layer_interval_minutes:
                 allowed, reason = False, "layer_interval"
-        if (
-            allowed
-            and current is not None
-            and current.exit_reason.startswith("prefunding_basis_take_profit")
-        ):
+        if allowed and current is not None and current.management_state == "EXITING_PREFUNDING":
             allowed, reason = False, "controlled_prefunding_exit_in_progress"
         volatile = (
             (row.basis_std_pct is not None and row.basis_std_pct > config.max_basis_std_pct)
@@ -594,6 +677,11 @@ def _open_layers(
             "perp_symbol": row.perp_symbol, "allowed": str(allowed), "reason": reason,
             "layer_index": 0 if current is None else current.layer_index + 1,
             "notional_usd": row.notional_usd,
+            "minutes_to_funding": row.minutes_to_funding,
+            "signal_age_minutes": signal_age_minutes,
+            "signal_observations": streak_observations,
+            "conservative_edge_pct": conservative_edge,
+            "management_state": "" if current is None else current.management_state,
         })
         if not allowed:
             continue
@@ -634,7 +722,7 @@ def run_paper_strategy_once(
         )
     rows = _fresh_rows(opportunities, now, config)
     store = PaperStore(config)
-    signals = _update_signals(store, snapshots, now)
+    signals = _update_signals(store, snapshots, config, now)
     positions = store.load_positions()
     funding_captures, exits, partial_exits = _mark_and_manage_positions(
         positions=positions, snapshots=snapshots, rows=rows, store=store,

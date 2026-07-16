@@ -210,7 +210,9 @@ Outputs are written under `data/funding_lock_research/`. See
 ## Independent Extreme-Funding Paper Strategies
 
 Binance and MEXC each have a standalone live scanner, paper ledger, strategy,
-and four-tab dashboard. They do not consume funding-lock research CSVs.
+and four-tab dashboard in this repository. KuCoin runs from its independent
+`kucoin-basis-funding-arb` repository and uses the same dashboard tunnel. None
+of the strategies consumes funding-lock research CSVs.
 
 ```bash
 python -m binance_extreme_funding.run_scanner
@@ -222,8 +224,15 @@ python -m mexc_extreme_funding.run_paper_strategy
 python -m mexc_extreme_funding.run_dashboard --port 8771
 ```
 
-See `docs/extreme_funding_paper_strategies.md` for rules, data ownership,
-service names, and the combined dashboard SSH tunnel.
+Full specifications:
+
+- `binance_extreme_funding/README.md`: Binance V2 continuous funding streak,
+  timed confidence layers, funding, hold, and controlled exit rules.
+- `mexc_extreme_funding/README.md`: MEXC rules, including contract-size handling.
+- `kucoin-basis-funding-arb/kucoin_basis/README.md`: canonical KuCoin rules in
+  the independent local KuCoin checkout.
+- `docs/extreme_funding_paper_strategies.md`: repository-level comparison, data
+  ownership, services, cost assumptions, and combined dashboard tunnel.
 
 ## Clean Paper Restart
 

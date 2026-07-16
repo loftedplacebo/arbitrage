@@ -72,8 +72,8 @@ HTML = r"""<!doctype html>
     let active="funding";
     const columns={
       funding:[["perp_symbol","Contract"],["current_funding_rate_pct","Displayed"],["minutes_to_funding","Minutes"],["mark_index_basis_pct","Mark / index"],["executable_basis_pct","Spot / perp"],["spot_symbol","Spot"],["reason","State"]],
-      shortlist:[["perp_symbol","Contract"],["direction","Direction"],["latest_rate_pct","Latest"],["min_abs_rate_pct","Min abs"],["max_abs_rate_pct","Max abs"],["observations","Observations"],["first_seen_utc","First seen"],["funding_time_utc","Funding"],["status","State"]],
-      positions:[["position_id","Position"],["perp_symbol","Contract"],["direction","Direction"],["layer_index","Layer"],["notional_usd","Notional"],["displayed_rate_at_entry_pct","Entry rate"],["actual_funding_rate_pct","Actual rate"],["entry_basis_pct","Entry basis"],["current_basis_pct","Current basis"],["basis_pnl_pct","Basis PnL"],["estimated_net_pnl_pct","Net PnL"],["status","State"],["exit_reason","Exit"]],
+      shortlist:[["perp_symbol","Contract"],["direction","Direction"],["latest_rate_pct","Latest"],["streak_min_abs_rate_pct","Streak min"],["streak_observations","Streak obs"],["streak_started_utc","Streak start"],["funding_time_utc","Funding"],["status","State"]],
+      positions:[["position_id","Position"],["perp_symbol","Contract"],["direction","Direction"],["layer_index","Layer"],["notional_usd","Notional"],["displayed_rate_at_entry_pct","Entry rate"],["actual_funding_rate_pct","Actual rate"],["entry_basis_pct","Entry basis"],["current_basis_pct","Current basis"],["basis_pnl_pct","Basis PnL"],["estimated_net_pnl_pct","Net PnL"],["management_state","Management"],["status","State"],["exit_reason","Exit"]],
       summary:[["label","Measure"],["value","Value"]]
     };
     function cls(v,k){ if(k==="reason"||k==="status") return String(v).includes("eligible")||v==="ACTIVE"||v==="OPEN"?"good":"warn"; if(["current_funding_rate_pct","latest_rate_pct","basis_pnl_pct","estimated_net_pnl_pct"].includes(k)) return Number(v)>=0?"good":"bad"; return ""; }
@@ -122,7 +122,7 @@ def _shortlist_payload(config: BinanceExtremeFundingConfig) -> dict:
         {"label": "Active signals", "value": str(sum(row.get("status") == "ACTIVE" for row in items))},
         {"label": "Tracked events", "value": str(len(items))},
         {"label": "Required observations", "value": str(config.min_consistent_observations)},
-        {"label": "Minimum layer interval", "value": f"{config.min_layer_interval_minutes:.0f} min"},
+        {"label": "Probe confirmation", "value": f"{config.layer_min_signal_age_minutes[0]:.0f} min"},
     ]}
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import timedelta
 from pathlib import Path
+from typing import Iterator
 
 from binance_extreme_funding.basis_history import append_basis_observation, calculate_basis_stats
 from binance_extreme_funding.binance_public_client import BinancePublicClient
@@ -64,6 +65,13 @@ def _read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(handle))
 
 
+def _iter_csv(path: Path) -> Iterator[dict]:
+    if not path.exists():
+        return
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        yield from csv.DictReader(handle)
+
+
 def latest_snapshot_path(config: BinanceExtremeFundingConfig = DEFAULT_CONFIG) -> Path:
     return config.data_dir / "latest_snapshots.csv"
 
@@ -78,6 +86,34 @@ def latest_opportunities_path(config: BinanceExtremeFundingConfig = DEFAULT_CONF
 
 def load_latest_opportunities(config: BinanceExtremeFundingConfig = DEFAULT_CONFIG) -> list[OpportunityRow]:
     return [OpportunityRow.from_csv_row(row) for row in _read_csv(latest_opportunities_path(config))]
+
+
+def backfill_extreme_observations(
+    config: BinanceExtremeFundingConfig = DEFAULT_CONFIG,
+) -> dict[str, int]:
+    output_dir = config.data_dir / "extreme_observations"
+    files_created = rows_written = 0
+    for source in sorted(config.snapshots_dir.glob("snapshots_*.csv")):
+        suffix = source.stem.removeprefix("snapshots_")
+        target = output_dir / f"extreme_observations_{suffix}.csv"
+        if target.exists():
+            continue
+        batch: list[dict] = []
+        for row in _iter_csv(source):
+            rate = parse_float(row.get("predicted_funding_rate_pct"))
+            if rate is None or abs(rate) < config.min_abs_funding_rate_pct:
+                continue
+            batch.append(row)
+            if len(batch) >= 1_000:
+                _write_csv(target, batch, SNAPSHOT_FIELDS, append=True)
+                rows_written += len(batch)
+                batch.clear()
+        if batch:
+            _write_csv(target, batch, SNAPSHOT_FIELDS, append=True)
+            rows_written += len(batch)
+        if target.exists():
+            files_created += 1
+    return {"files_created": files_created, "rows_written": rows_written}
 
 
 def _fixed_cost_pct(config: BinanceExtremeFundingConfig) -> float:
@@ -147,6 +183,18 @@ def _build_opportunities(
             spot_book, perp_book = client.fetch_orderbooks(
                 snapshot.spot_symbol, snapshot.perp_symbol, snapshot.observed_at_utc, limit=100,
             )
+            book_now = utc_now()
+            book_age_ms = max(
+                (book_now - spot_book.observed_at_utc).total_seconds() * 1_000,
+                (book_now - perp_book.observed_at_utc).total_seconds() * 1_000,
+            )
+            book_skew_ms = abs(
+                (perp_book.observed_at_utc - spot_book.observed_at_utc).total_seconds() * 1_000
+            )
+            if book_age_ms > config.max_orderbook_age_ms:
+                raise ValueError(f"order books stale by {book_age_ms:.0f}ms")
+            if book_skew_ms > config.max_orderbook_age_ms:
+                raise ValueError(f"spot/perp order-book skew {book_skew_ms:.0f}ms")
             spot_mid = (spot_book.bids[0].price + spot_book.asks[0].price) / 2
             perp_mid = (perp_book.bids[0].price + perp_book.asks[0].price) / 2
             basis_pct = (perp_mid / spot_mid - 1) * 100
@@ -220,8 +268,9 @@ def _reconcile_settlements(client: BinancePublicClient, config: BinanceExtremeFu
     comparison_path = config.data_dir / "settlement_comparisons.csv"
     completed = {row.get("comparison_key", "") for row in _read_csv(comparison_path)}
     candidates: dict[str, list[dict]] = {}
-    for path in sorted(config.snapshots_dir.glob("snapshots_*.csv"))[-2:]:
-        for row in _read_csv(path):
+    extreme_dir = config.data_dir / "extreme_observations"
+    for path in sorted(extreme_dir.glob("extreme_observations_*.csv"))[-2:]:
+        for row in _iter_csv(path):
             funding_time = parse_datetime(row.get("next_funding_time_utc"))
             observed = parse_datetime(row.get("observed_at_utc"))
             rate = parse_float(row.get("predicted_funding_rate_pct"))
@@ -280,6 +329,17 @@ def scan_once(
     daily_path = config.snapshots_dir / f"snapshots_{now:%Y%m%d}.csv"
     _write_csv(daily_path, rows, SNAPSHOT_FIELDS, append=True)
     _write_csv(latest_snapshot_path(config), rows, SNAPSHOT_FIELDS, append=False)
+    extreme_rows = [
+        row for row in rows
+        if abs(parse_float(row.get("predicted_funding_rate_pct"), 0.0) or 0.0)
+        >= config.min_abs_funding_rate_pct
+    ]
+    extreme_path = (
+        config.data_dir / "extreme_observations"
+        / f"extreme_observations_{now:%Y%m%d}.csv"
+    )
+    if extreme_rows:
+        _write_csv(extreme_path, extreme_rows, SNAPSHOT_FIELDS, append=True)
     opportunities, errors = _build_opportunities(client, snapshots, config)
     opportunity_rows = [row.to_csv_row() for row in opportunities]
     opportunity_path = config.opportunities_dir / f"opportunities_{now:%Y%m%d}.csv"

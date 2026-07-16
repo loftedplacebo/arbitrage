@@ -15,12 +15,13 @@ POSITION_FIELDS = [
     "realised_pnl_usd", "status", "exit_at_utc", "exit_reason",
     "spot_qty", "perp_qty", "spot_entry_price", "perp_entry_price",
     "entry_fees_usd", "realised_funding_pnl_usd", "funding_events_captured",
-    "funding_interval_hours", "last_layer_at_utc",
+    "funding_interval_hours", "last_layer_at_utc", "management_state", "last_exit_at_utc",
 ]
 SIGNAL_FIELDS = [
     "event_key", "base", "perp_symbol", "direction", "funding_time_utc", "first_seen_utc",
     "last_seen_utc", "observations", "first_rate_pct", "latest_rate_pct", "min_abs_rate_pct",
-    "max_abs_rate_pct", "status",
+    "max_abs_rate_pct", "status", "streak_started_utc", "streak_last_seen_utc",
+    "streak_observations", "streak_min_abs_rate_pct",
 ]
 FILL_FIELDS = [
     "timestamp_utc", "event_type", "position_id", "event_key", "perp_symbol", "direction",
@@ -29,7 +30,8 @@ FILL_FIELDS = [
 ]
 DECISION_FIELDS = [
     "timestamp_utc", "decision", "event_key", "perp_symbol", "allowed", "reason",
-    "layer_index", "notional_usd",
+    "layer_index", "notional_usd", "minutes_to_funding", "signal_age_minutes",
+    "signal_observations", "conservative_edge_pct", "management_state",
 ]
 FUNDING_FIELDS = [
     "timestamp_utc", "position_id", "event_key", "perp_symbol", "funding_time_utc",
@@ -67,6 +69,12 @@ class PaperStore:
     @staticmethod
     def append_row(path: Path, fields: list[str], row: dict) -> None:
         exists = path.exists() and path.stat().st_size > 0
+        if exists:
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                current_fields = next(csv.reader(handle), [])
+            if current_fields != fields:
+                existing_rows = PaperStore.read_rows(path)
+                PaperStore.write_rows(path, fields, existing_rows)
         with path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
             if not exists:

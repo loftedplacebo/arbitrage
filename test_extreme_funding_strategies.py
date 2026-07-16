@@ -8,8 +8,10 @@ from pathlib import Path
 
 from binance_extreme_funding.config import DEFAULT_CONFIG as BINANCE_DEFAULT
 from binance_extreme_funding.models import FundingSnapshot as BinanceSnapshot
+from binance_extreme_funding.paper_store import POSITION_FIELDS as BINANCE_POSITION_FIELDS
 from binance_extreme_funding.paper_store import PaperStore as BinanceStore
 from binance_extreme_funding.paper_strategy import run_paper_strategy_once as run_binance
+from binance_extreme_funding.scanner import backfill_extreme_observations as backfill_binance_extremes
 from binance_extreme_funding.scanner import scan_once as scan_binance
 from mexc_extreme_funding.config import DEFAULT_CONFIG as MEXC_DEFAULT
 from mexc_extreme_funding.mexc_public_client import MexcPublicClient
@@ -34,6 +36,7 @@ class FakeScannerClient(FakeClient):
     def __init__(self, snapshots, settled_rate_pct):
         super().__init__(settled_rate_pct)
         self.snapshots = snapshots
+        self.book_observed_at = None
 
     def fetch_snapshots(self, now):
         return self.snapshots
@@ -41,9 +44,10 @@ class FakeScannerClient(FakeClient):
     def fetch_orderbooks(self, spot_symbol, perp_symbol, observed_at, limit=100):
         bids = [OrderBookLevel(price=99.95, quantity=1_000.0)]
         asks = [OrderBookLevel(price=100.05, quantity=1_000.0)]
+        fresh = self.book_observed_at or datetime.now(timezone.utc)
         return (
-            OrderBook("binance", "spot", spot_symbol, spot_symbol, bids, asks, observed_at),
-            OrderBook("binance", "futures", perp_symbol, perp_symbol, bids, asks, observed_at),
+            OrderBook("binance", "spot", spot_symbol, spot_symbol, bids, asks, fresh),
+            OrderBook("binance", "futures", perp_symbol, perp_symbol, bids, asks, fresh),
         )
 
 
@@ -80,17 +84,27 @@ def snapshot(snapshot_type, observed, funding_time, rate_pct, basis_pct, exchang
     )
 
 
+def fast_binance_config(root: Path, **overrides):
+    values = {
+        "data_dir": root,
+        "snapshots_dir": root / "snapshots",
+        "opportunities_dir": root / "opportunities",
+        "paper_dir": root / "paper",
+        "layer_min_signal_age_minutes": (1.0, 1.0, 1.0, 1.0),
+        "layer_max_minutes_before_funding": (None, None, None, None),
+        "funding_prediction_haircuts_pct": ((0.0, 0.0),),
+        "max_signal_observation_gap_seconds": 100_000.0,
+        "min_exit_interval_minutes": 0.0,
+    }
+    values.update(overrides)
+    return replace(BINANCE_DEFAULT, **values)
+
+
 class ExtremeFundingStrategyTests(unittest.TestCase):
     def test_scanner_owns_snapshot_and_settlement_comparison_data(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                BINANCE_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-            )
+            config = fast_binance_config(root)
             now = datetime.now(timezone.utc)
             item = snapshot(
                 BinanceSnapshot,
@@ -109,23 +123,66 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
             self.assertEqual(result["opportunities"], 4)
             self.assertEqual(result["errors"], [])
             self.assertTrue((root / "latest_snapshots.csv").exists())
+            self.assertEqual(len(list((root / "extreme_observations").glob("*.csv"))), 1)
             opportunities = BinanceStore.read_rows(root / "latest_opportunities.csv")
             self.assertTrue(all(row["round_trip_fillable"] == "True" for row in opportunities))
             self.assertTrue(all(float(row["expected_edge_pct"]) > 0 for row in opportunities))
             comparisons = BinanceStore.read_rows(root / "settlement_comparisons.csv")
             self.assertEqual(comparisons[0]["actual_rate_pct"], "0.55")
             self.assertEqual(comparisons[0]["same_direction"], "True")
+            extreme_path = next((root / "extreme_observations").glob("*.csv"))
+            extreme_path.unlink()
+            backfill = backfill_binance_extremes(config)
+            self.assertEqual(backfill["files_created"], 1)
+            self.assertEqual(backfill["rows_written"], 1)
+            self.assertEqual(backfill_binance_extremes(config)["files_created"], 0)
+
+    def test_binance_scanner_rejects_stale_orderbooks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_binance_config(root)
+            now = datetime.now(timezone.utc)
+            item = snapshot(
+                BinanceSnapshot, now, now + timedelta(hours=2),
+                0.60, 1.50, "BINANCE", "TESTUSDT",
+            )
+            client = FakeScannerClient([item], settled_rate_pct=None)
+            client.book_observed_at = now - timedelta(seconds=2)
+            result = scan_binance(config, client=client)
+            self.assertEqual(result["opportunities"], 0)
+            self.assertEqual(len(result["errors"]), 1)
+            self.assertIn("order books stale", result["errors"][0])
+
+    def test_binance_legacy_position_schema_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_binance_config(root)
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(hours=4)
+            client = FakeClient()
+            first = snapshot(BinanceSnapshot, start, funding_time, 0.70, 2.0, "BINANCE", "TESTUSDT")
+            second = snapshot(
+                BinanceSnapshot, start + timedelta(minutes=1), funding_time,
+                0.70, 2.0, "BINANCE", "TESTUSDT",
+            )
+            run_binance(config, client=client, snapshots=[first], now=start)
+            run_binance(config, client=client, snapshots=[second], now=start + timedelta(minutes=1))
+
+            store = BinanceStore(config)
+            legacy_rows = store.read_rows(store.positions_path)
+            store.write_rows(store.positions_path, BINANCE_POSITION_FIELDS[:-2], legacy_rows)
+            positions = store.load_positions()
+            self.assertEqual(positions[0].management_state, "HOLDING")
+            self.assertIsNone(positions[0].last_exit_at_utc)
+            store.write_positions(positions)
+            header = store.positions_path.read_text(encoding="utf-8").splitlines()[0]
+            self.assertIn("management_state", header)
+            self.assertIn("last_exit_at_utc", header)
 
     def test_binance_holds_adverse_basis_and_aggregates_layers_before_funding(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                BINANCE_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-            )
+            config = fast_binance_config(root)
             start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
             funding_time = start + timedelta(hours=4)
             client = FakeClient(settled_rate_pct=0.55)
@@ -167,14 +224,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
     def test_binance_can_close_profitable_basis_before_funding(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                BINANCE_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-                layer_ladder_usd=(100.0,),
-            )
+            config = fast_binance_config(root, layer_ladder_usd=(100.0,))
             start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
             funding_time = start + timedelta(hours=4)
             client = FakeClient()
@@ -197,13 +247,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
     def test_binance_prefunding_basis_exit_uses_one_chunk_and_does_not_relayer(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                BINANCE_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-            )
+            config = fast_binance_config(root)
             start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
             funding_time = start + timedelta(hours=4)
             client = FakeClient()
@@ -227,8 +271,14 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
             self.assertLess(position.notional_usd, 350.0)
             self.assertGreater(position.notional_usd, 0.0)
             self.assertEqual(position.exit_reason, "prefunding_basis_take_profit_partial")
+            self.assertEqual(position.management_state, "EXITING_PREFUNDING")
 
-    def test_binance_captures_funding_then_only_unwinds_a_profitable_chunk(self):
+            next_time = exit_time + timedelta(minutes=1)
+            next_tick = snapshot(BinanceSnapshot, next_time, funding_time, 0.61, 0.90, "BINANCE", "TESTUSDT")
+            result = run_binance(config, client=client, snapshots=[next_tick], now=next_time)
+            self.assertEqual(result["opened"], 0)
+
+    def test_binance_signal_streak_resets_after_funding_drops_below_threshold(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = replace(
@@ -238,6 +288,88 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
                 opportunities_dir=root / "opportunities",
                 paper_dir=root / "paper",
             )
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(hours=4)
+            client = FakeClient()
+
+            first = snapshot(BinanceSnapshot, start, funding_time, 0.70, 2.0, "BINANCE", "TESTUSDT")
+            run_binance(config, client=client, snapshots=[first], now=start)
+            dropped_time = start + timedelta(minutes=1)
+            dropped = snapshot(BinanceSnapshot, dropped_time, funding_time, 0.40, 2.0, "BINANCE", "TESTUSDT")
+            dropped.eligible = False
+            dropped.reason = "funding_below_threshold"
+            run_binance(config, client=client, snapshots=[dropped], now=dropped_time)
+
+            recovered_time = start + timedelta(minutes=2)
+            recovered = snapshot(BinanceSnapshot, recovered_time, funding_time, 0.70, 2.0, "BINANCE", "TESTUSDT")
+            result = run_binance(config, client=client, snapshots=[recovered], now=recovered_time)
+            self.assertEqual(result["opened"], 0)
+            signal = BinanceStore(config).load_signals()[recovered.event_key]
+            self.assertEqual(int(signal["streak_observations"]), 1)
+
+            confirmed_time = start + timedelta(minutes=4)
+            confirmed = snapshot(BinanceSnapshot, confirmed_time, funding_time, 0.70, 2.0, "BINANCE", "TESTUSDT")
+            result = run_binance(config, client=client, snapshots=[confirmed], now=confirmed_time)
+            self.assertEqual(result["opened"], 1)
+
+    def test_binance_v2_layers_across_the_funding_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                BINANCE_DEFAULT,
+                data_dir=root,
+                snapshots_dir=root / "snapshots",
+                opportunities_dir=root / "opportunities",
+                paper_dir=root / "paper",
+                max_signal_observation_gap_seconds=100_000.0,
+            )
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(hours=4)
+            client = FakeClient()
+
+            checkpoints = (
+                (start, 0),
+                (start + timedelta(minutes=2), 1),
+                (start + timedelta(minutes=10), 0),
+                (funding_time - timedelta(minutes=120), 1),
+                (funding_time - timedelta(minutes=60), 1),
+                (funding_time - timedelta(minutes=30), 1),
+            )
+            for observed, expected_opened in checkpoints:
+                item = snapshot(BinanceSnapshot, observed, funding_time, 1.20, 2.0, "BINANCE", "TESTUSDT")
+                result = run_binance(config, client=client, snapshots=[item], now=observed)
+                self.assertEqual(result["opened"], expected_opened, (observed, result))
+
+            position = BinanceStore(config).load_positions()[0]
+            self.assertEqual(position.notional_usd, 1_850.0)
+
+    def test_binance_postfunding_profitable_exit_is_chunked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_binance_config(root)
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(minutes=20)
+            client = FakeClient(settled_rate_pct=0.60)
+            for minute in range(5):
+                observed = start + timedelta(minutes=minute)
+                item = snapshot(BinanceSnapshot, observed, funding_time, 0.70, 2.0, "BINANCE", "TESTUSDT")
+                run_binance(config, client=client, snapshots=[item], now=observed)
+
+            after_time = funding_time + timedelta(minutes=2)
+            after = snapshot(BinanceSnapshot, after_time, funding_time, 0.10, 0.5, "BINANCE", "TESTUSDT")
+            after.eligible = False
+            after.reason = "too_close_to_funding"
+            result = run_binance(config, client=client, snapshots=[after], now=after_time)
+            position = BinanceStore(config).load_positions()[0]
+            self.assertEqual(result["exits"], 0)
+            self.assertEqual(result["partial_exits"], 1)
+            self.assertEqual(position.status, "OPEN")
+            self.assertLess(position.notional_usd, 1_850.0)
+
+    def test_binance_captures_funding_then_only_unwinds_a_profitable_chunk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_binance_config(root)
             start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
             funding_time = start + timedelta(minutes=20)
             client = FakeClient(settled_rate_pct=0.60)
@@ -266,13 +398,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
     def test_binance_holds_unprofitable_adverse_basis_after_funding(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = replace(
-                BINANCE_DEFAULT,
-                data_dir=root,
-                snapshots_dir=root / "snapshots",
-                opportunities_dir=root / "opportunities",
-                paper_dir=root / "paper",
-            )
+            config = fast_binance_config(root)
             start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
             funding_time = start + timedelta(minutes=20)
             client = FakeClient(settled_rate_pct=0.60)
@@ -479,7 +605,20 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
             run_binance(config, client=client, snapshots=[item], now=now + timedelta(seconds=30))
             signal = next(iter(BinanceStore(config).load_signals().values()))
             self.assertEqual(int(signal["observations"]), 1)
+            self.assertEqual(int(signal["streak_observations"]), 1)
             self.assertEqual(len(BinanceStore(config).load_positions()), 0)
+
+            next_item = snapshot(
+                BinanceSnapshot, now + timedelta(minutes=2), now + timedelta(hours=2),
+                0.70, 1.00, "BINANCE", "TESTUSDT",
+            )
+            run_binance(config, client=client, snapshots=[next_item], now=now + timedelta(minutes=2))
+            run_binance(
+                config, client=client, snapshots=[next_item],
+                now=now + timedelta(minutes=2, seconds=30),
+            )
+            signal = next(iter(BinanceStore(config).load_signals().values()))
+            self.assertEqual(int(signal["streak_observations"]), 2)
 
 
 if __name__ == "__main__":

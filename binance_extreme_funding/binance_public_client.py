@@ -167,7 +167,9 @@ class BinancePublicClient:
         limit: int = 100,
     ) -> tuple[OrderBook, OrderBook]:
         spot = self._get(SPOT_URL, "/api/v3/depth", params={"symbol": spot_symbol, "limit": limit})
+        spot_observed_at = utc_now()
         perp = self._get(FUTURES_URL, "/fapi/v1/depth", params={"symbol": perp_symbol, "limit": limit})
+        perp_observed_at = utc_now()
         standard_symbol = perp_symbol
         return (
             OrderBook(
@@ -175,13 +177,13 @@ class BinancePublicClient:
                 exchange_symbol=spot_symbol,
                 bids=parse_orderbook_levels(spot.get("bids", []), max_levels=limit),
                 asks=parse_orderbook_levels(spot.get("asks", []), max_levels=limit),
-                observed_at_utc=observed_at,
+                observed_at_utc=spot_observed_at,
             ),
             OrderBook(
                 exchange="binance", market_type="futures", standard_symbol=standard_symbol,
                 exchange_symbol=perp_symbol,
                 bids=parse_orderbook_levels(perp.get("bids", []), max_levels=limit),
                 asks=parse_orderbook_levels(perp.get("asks", []), max_levels=limit),
-                observed_at_utc=observed_at,
+                observed_at_utc=perp_observed_at,
             ),
         )

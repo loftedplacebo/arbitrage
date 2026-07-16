@@ -13,9 +13,18 @@ class BinanceExtremeFundingConfig:
     min_abs_funding_rate_pct: float = 0.50
     min_minutes_before_funding: float = 15.0
     min_consistent_observations: int = 2
-    min_signal_age_minutes: float = 1.0
+    max_signal_observation_gap_seconds: float = 180.0
     min_layer_interval_minutes: float = 1.0
     layer_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0, 1_000.0)
+    layer_min_signal_age_minutes: tuple[float, ...] = (2.0, 10.0, 30.0, 60.0)
+    layer_max_minutes_before_funding: tuple[float | None, ...] = (None, 120.0, 60.0, 30.0)
+    layer_min_conservative_edge_pct: tuple[float, ...] = (0.02, 0.02, 0.10, 0.10)
+    funding_prediction_haircuts_pct: tuple[tuple[float, float], ...] = (
+        (120.0, 0.40),
+        (60.0, 0.20),
+        (30.0, 0.10),
+        (15.0, 0.06),
+    )
     max_symbol_notional_usd: float = 5_000.0
     max_total_notional_usd: float = 20_000.0
     max_open_positions: int = 40
@@ -35,10 +44,12 @@ class BinanceExtremeFundingConfig:
     min_basis_observations_for_stats: int = 5
     short_spot_entry_max_basis_percentile: float = 25.0
     long_spot_entry_min_basis_percentile: float = 75.0
-    max_basis_std_pct: float = 5.0
-    max_basis_abs_trend_pct: float = 5.0
+    max_basis_std_pct: float = 0.75
+    max_basis_abs_trend_pct: float = 2.00
     volatility_cooldown_minutes: float = 60.0
     gentle_unwind_chunk_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0)
+    min_exit_interval_minutes: float = 5.0
+    max_chunk_edge_sacrifice_pct: float = 0.05
     funding_harvest_unwind_chunk_usd: float = 100.0
     min_funding_harvest_profit_usd: float = 0.25
     full_exit_min_profit_pct: float = 0.02
