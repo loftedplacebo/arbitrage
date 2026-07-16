@@ -277,6 +277,9 @@ class PaperPosition:
             funding_events_captured=parse_int(row.get("funding_events_captured")),
             funding_interval_hours=parse_float(row.get("funding_interval_hours")),
             last_layer_at_utc=parse_datetime(row.get("last_layer_at_utc")),
-            management_state=str(row.get("management_state") or "HOLDING"),
+            management_state=(
+                "CLOSED" if str(row.get("status", "OPEN")) == "CLOSED"
+                else str(row.get("management_state") or "HOLDING")
+            ),
             last_exit_at_utc=parse_datetime(row.get("last_exit_at_utc")),
         )

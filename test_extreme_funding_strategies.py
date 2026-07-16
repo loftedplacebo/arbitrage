@@ -240,6 +240,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
             self.assertEqual(result["exits"], 1)
             position = BinanceStore(config).load_positions()[0]
             self.assertEqual(position.status, "CLOSED")
+            self.assertEqual(position.management_state, "CLOSED")
             self.assertEqual(position.exit_reason, "prefunding_basis_take_profit")
             self.assertGreater(position.realised_pnl_usd, 0)
             self.assertEqual(position.funding_events_captured, 0)
