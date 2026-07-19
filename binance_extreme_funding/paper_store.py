@@ -27,7 +27,7 @@ SIGNAL_FIELDS = [
 FILL_FIELDS = [
     "timestamp_utc", "event_type", "position_id", "event_key", "perp_symbol", "direction",
     "layer_index", "notional_usd", "basis_pct", "funding_rate_pct", "net_pnl_pct",
-    "realised_pnl_usd", "reason",
+    "basis_pnl_usd", "funding_pnl_usd", "realised_pnl_usd", "reason",
 ]
 DECISION_FIELDS = [
     "timestamp_utc", "decision", "event_key", "perp_symbol", "allowed", "reason",

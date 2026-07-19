@@ -327,6 +327,8 @@ def _close_position_chunk(
         "basis_pct": position.current_basis_pct,
         "funding_rate_pct": position.actual_funding_rate_pct,
         "net_pnl_pct": estimate["total_net_pct"],
+        "basis_pnl_usd": estimate["net_ex_funding_usd"],
+        "funding_pnl_usd": estimate["funding_pnl_usd"],
         "realised_pnl_usd": estimate["total_net_usd"], "reason": reason,
     })
     if full_close:

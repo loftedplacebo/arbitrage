@@ -267,10 +267,11 @@ All files are under `data/binance_extreme_funding/`:
 | `paper/funding_events.csv` | Actual funding accrual ledger |
 | `paper/cooldowns.csv` | Volatility and post-close cooldowns |
 
-The dashboard's Daily PnL tab groups realised exit PnL by UTC day. Funding
-accrual is displayed alongside it as a separate informational amount because a
-later exit already includes its allocated funding; the two columns must not be
-added together.
+The dashboard's Daily PnL tab groups exits by UTC day and separates realised
+price/basis PnL (after entry and exit costs) from the funding allocated to that
+exit. `Total realised` is their sum. Open mark-to-market PnL is displayed
+separately and is never included in the daily total. Older fill rows created
+before this split appear as `Legacy unattributed` rather than being guessed.
 
 ## Paper And Live Limitations
 

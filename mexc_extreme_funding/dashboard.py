@@ -27,8 +27,8 @@ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 Inter,Segoe U
 <script>
 const $=s=>document.querySelector(s),esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const pct=v=>v===null||v===""||v===undefined?"-":Number(v).toFixed(4)+"%",usd=v=>v===null||v===""||v===undefined?"-":Number(v).toLocaleString(undefined,{style:"currency",currency:"USD"}),dt=v=>v?new Date(v).toLocaleString():"-";let active="funding";
-const columns={funding:[["perp_symbol","Contract"],["current_funding_rate_pct","Displayed"],["minutes_to_funding","Minutes"],["mark_index_basis_pct","Mark / index"],["executable_basis_pct","Spot / perp"],["spot_symbol","Spot"],["reason","State"]],shortlist:[["perp_symbol","Contract"],["direction","Direction"],["latest_rate_pct","Latest"],["min_abs_rate_pct","Min abs"],["max_abs_rate_pct","Max abs"],["streak_observations","Streak"],["streak_age_minutes","Streak age"],["funding_time_utc","Funding"],["status","State"]],positions:[["position_id","Position"],["perp_symbol","Contract"],["direction","Direction"],["layer_index","Layer"],["notional_usd","Notional"],["displayed_rate_at_entry_pct","Entry rate"],["actual_funding_rate_pct","Actual rate"],["entry_basis_pct","Entry basis"],["current_basis_pct","Current basis"],["basis_pnl_pct","Basis PnL"],["estimated_net_pnl_pct","Net PnL"],["management_state","Management"],["status","State"],["exit_reason","Exit"]],"daily-pnl":[["date_utc","UTC date"],["realised_pnl_usd","Realised PnL"],["exit_count","Exit events"],["exit_notional_usd","Exited notional"],["funding_accrued_usd","Funding accrued"],["funding_events","Funding events"]],summary:[["label","Measure"],["value","Value"]]};
-function cls(v,k){if(k==="reason"||k==="status")return String(v).includes("eligible")||v==="ACTIVE"||v==="OPEN"?"good":"warn";if(["current_funding_rate_pct","latest_rate_pct","basis_pnl_pct","estimated_net_pnl_pct"].includes(k))return Number(v)>=0?"good":"bad";return""}function val(v,k){if(k.includes("rate")||k.includes("basis")||k.includes("pnl_pct"))return pct(v);if(k.includes("pnl_usd")||k==="notional_usd"||k==="exit_notional_usd"||k==="funding_accrued_usd")return usd(v);if(k==="date_utc")return v??"-";if(k.includes("_utc"))return dt(v);if(k==="minutes_to_funding")return v==null?"-":Number(v).toFixed(1);return v??"-"}
+const columns={funding:[["perp_symbol","Contract"],["current_funding_rate_pct","Displayed"],["minutes_to_funding","Minutes"],["mark_index_basis_pct","Mark / index"],["executable_basis_pct","Spot / perp"],["spot_symbol","Spot"],["reason","State"]],shortlist:[["perp_symbol","Contract"],["direction","Direction"],["latest_rate_pct","Latest"],["min_abs_rate_pct","Min abs"],["max_abs_rate_pct","Max abs"],["streak_observations","Streak"],["streak_age_minutes","Streak age"],["funding_time_utc","Funding"],["status","State"]],positions:[["position_id","Position"],["perp_symbol","Contract"],["direction","Direction"],["layer_index","Layer"],["notional_usd","Notional"],["displayed_rate_at_entry_pct","Entry rate"],["actual_funding_rate_pct","Actual rate"],["entry_basis_pct","Entry basis"],["current_basis_pct","Current basis"],["basis_pnl_pct","Basis PnL"],["estimated_net_pnl_pct","Net PnL"],["management_state","Management"],["status","State"],["exit_reason","Exit"]],"daily-pnl":[["date_utc","UTC date"],["basis_realised_pnl_usd","Basis PnL"],["funding_realised_pnl_usd","Funding PnL"],["total_realised_pnl_usd","Total realised"],["exit_count","Exit events"],["exit_notional_usd","Exited notional"],["legacy_unattributed_pnl_usd","Legacy unattributed"]],summary:[["label","Measure"],["value","Value"]]};
+function cls(v,k){if(k==="reason"||k==="status")return String(v).includes("eligible")||v==="ACTIVE"||v==="OPEN"?"good":"warn";if(["current_funding_rate_pct","latest_rate_pct","basis_pnl_pct","estimated_net_pnl_pct"].includes(k))return Number(v)>=0?"good":"bad";return""}function val(v,k){if(k.includes("pnl_usd")||k==="notional_usd"||k==="exit_notional_usd")return usd(v);if(k.includes("rate")||k.includes("basis")||k.includes("pnl_pct"))return pct(v);if(k==="date_utc")return v??"-";if(k.includes("_utc"))return dt(v);if(k==="minutes_to_funding")return v==null?"-":Number(v).toFixed(1);return v??"-"}
 function render(p){const rows=p.items||[],cols=columns[active];$("#head").innerHTML="<tr>"+cols.map(c=>`<th>${esc(c[1])}</th>`).join("")+"</tr>";$("#body").innerHTML=rows.length?rows.map(r=>"<tr>"+cols.map(c=>`<td class="${cls(r[c[0]],c[0])}">${esc(val(r[c[0]],c[0]))}</td>`).join("")+"</tr>").join(""):`<tr><td class="empty" colspan="${cols.length}">No records yet</td></tr>`;$("#metrics").innerHTML=(p.metrics||[]).map(m=>`<div class="metric"><span>${esc(m.label)}</span><strong>${esc(m.value)}</strong></div>`).join("");$("#status").textContent=`Updated ${dt(p.observedAtUtc)}`}
 async function load(){try{const r=await fetch(`/api/${active}`,{cache:"no-store"}),p=await r.json();if(!r.ok)throw Error(p.error||r.statusText);render(p)}catch(e){$("#status").textContent=e.message}}document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));b.classList.add("active");active=b.dataset.tab;load()});$("#refresh").onclick=load;setInterval(load,30000);load();
 </script></body></html>"""
@@ -87,31 +87,38 @@ def _daily_pnl_payload(config: MexcExtremeFundingConfig) -> dict:
     def day_for(row: dict) -> dict:
         day = str(row.get("timestamp_utc", ""))[:10] or "unknown"
         return days.setdefault(day, {
-            "date_utc": day, "realised_pnl_usd": 0.0, "exit_count": 0,
-            "exit_notional_usd": 0.0, "funding_accrued_usd": 0.0, "funding_events": 0,
+            "date_utc": day, "basis_realised_pnl_usd": 0.0,
+            "funding_realised_pnl_usd": 0.0, "total_realised_pnl_usd": 0.0,
+            "legacy_unattributed_pnl_usd": 0.0, "exit_count": 0, "exit_notional_usd": 0.0,
         })
 
     for row in store.read_rows(store.fills_path):
         if row.get("event_type") not in {"EXIT", "PARTIAL_EXIT"}:
             continue
         day = day_for(row)
-        day["realised_pnl_usd"] += parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
+        total = parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
+        basis = parse_float(row.get("basis_pnl_usd"))
+        funding = parse_float(row.get("funding_pnl_usd"))
+        day["total_realised_pnl_usd"] += total
+        if basis is None or funding is None:
+            day["legacy_unattributed_pnl_usd"] += total
+        else:
+            day["basis_realised_pnl_usd"] += basis
+            day["funding_realised_pnl_usd"] += funding
         day["exit_count"] += 1
         day["exit_notional_usd"] += parse_float(row.get("notional_usd"), 0.0) or 0.0
-    for row in store.read_rows(store.funding_events_path):
-        day = day_for(row)
-        day["funding_accrued_usd"] += parse_float(row.get("funding_pnl_usd"), 0.0) or 0.0
-        day["funding_events"] += 1
-
     items = sorted(days.values(), key=lambda row: row["date_utc"], reverse=True)
     today = utc_now().date().isoformat()
     today_row = next((row for row in items if row["date_utc"] == today), None)
-    realised_total = sum(row["realised_pnl_usd"] for row in items)
+    open_mark_to_market = sum(
+        position.estimated_net_pnl_pct * position.notional_usd / 100
+        for position in store.load_positions() if position.status == "OPEN"
+    )
     return {"observedAtUtc": utc_now().isoformat(), "items": items, "metrics": [
-        {"label": "Today realised PnL", "value": f"${(today_row or {}).get('realised_pnl_usd', 0.0):,.2f}"},
-        {"label": "Today exit events", "value": str((today_row or {}).get("exit_count", 0))},
-        {"label": "Today funding accrued", "value": f"${(today_row or {}).get('funding_accrued_usd', 0.0):,.2f}"},
-        {"label": "All realised PnL", "value": f"${realised_total:,.2f}"},
+        {"label": "Today basis PnL", "value": f"${(today_row or {}).get('basis_realised_pnl_usd', 0.0):,.2f}"},
+        {"label": "Today funding PnL", "value": f"${(today_row or {}).get('funding_realised_pnl_usd', 0.0):,.2f}"},
+        {"label": "Today total realised", "value": f"${(today_row or {}).get('total_realised_pnl_usd', 0.0):,.2f}"},
+        {"label": "Open mark-to-market", "value": f"${open_mark_to_market:,.2f}"},
     ]}
 
 

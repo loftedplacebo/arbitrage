@@ -162,21 +162,21 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
             })
             store.append_fill({
                 "timestamp_utc": "2026-07-17T13:00:00+00:00", "event_type": "EXIT",
-                "notional_usd": 100.0, "realised_pnl_usd": 1.25,
+                "notional_usd": 100.0, "basis_pnl_usd": 0.50,
+                "funding_pnl_usd": 0.75, "realised_pnl_usd": 1.25,
             })
             store.append_fill({
                 "timestamp_utc": "2026-07-18T13:00:00+00:00", "event_type": "PARTIAL_EXIT",
-                "notional_usd": 50.0, "realised_pnl_usd": -0.20,
-            })
-            store.append_funding({
-                "timestamp_utc": "2026-07-17T08:00:00+00:00", "funding_pnl_usd": 0.75,
+                "notional_usd": 50.0, "basis_pnl_usd": -0.20,
+                "funding_pnl_usd": 0.0, "realised_pnl_usd": -0.20,
             })
             payload = binance_daily_pnl_payload(config)
             days = {row["date_utc"]: row for row in payload["items"]}
             self.assertEqual(days["2026-07-17"]["exit_count"], 1)
-            self.assertAlmostEqual(days["2026-07-17"]["realised_pnl_usd"], 1.25)
-            self.assertAlmostEqual(days["2026-07-17"]["funding_accrued_usd"], 0.75)
-            self.assertAlmostEqual(days["2026-07-18"]["realised_pnl_usd"], -0.20)
+            self.assertAlmostEqual(days["2026-07-17"]["basis_realised_pnl_usd"], 0.50)
+            self.assertAlmostEqual(days["2026-07-17"]["funding_realised_pnl_usd"], 0.75)
+            self.assertAlmostEqual(days["2026-07-17"]["total_realised_pnl_usd"], 1.25)
+            self.assertAlmostEqual(days["2026-07-18"]["total_realised_pnl_usd"], -0.20)
 
     def test_mexc_dashboard_groups_realised_pnl_by_utc_day(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -184,21 +184,21 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
             store = MexcStore(config)
             store.append_fill({
                 "timestamp_utc": "2026-07-17T13:00:00+00:00", "event_type": "EXIT",
-                "notional_usd": 50.0, "realised_pnl_usd": 0.75,
+                "notional_usd": 50.0, "basis_pnl_usd": 0.45,
+                "funding_pnl_usd": 0.30, "realised_pnl_usd": 0.75,
             })
             store.append_fill({
                 "timestamp_utc": "2026-07-18T13:00:00+00:00", "event_type": "PARTIAL_EXIT",
-                "notional_usd": 100.0, "realised_pnl_usd": -0.10,
-            })
-            store.append_funding({
-                "timestamp_utc": "2026-07-17T08:00:00+00:00", "funding_pnl_usd": 0.30,
+                "notional_usd": 100.0, "basis_pnl_usd": -0.10,
+                "funding_pnl_usd": 0.0, "realised_pnl_usd": -0.10,
             })
             payload = mexc_daily_pnl_payload(config)
             days = {row["date_utc"]: row for row in payload["items"]}
             self.assertEqual(days["2026-07-17"]["exit_count"], 1)
-            self.assertAlmostEqual(days["2026-07-17"]["realised_pnl_usd"], 0.75)
-            self.assertAlmostEqual(days["2026-07-17"]["funding_accrued_usd"], 0.30)
-            self.assertAlmostEqual(days["2026-07-18"]["realised_pnl_usd"], -0.10)
+            self.assertAlmostEqual(days["2026-07-17"]["basis_realised_pnl_usd"], 0.45)
+            self.assertAlmostEqual(days["2026-07-17"]["funding_realised_pnl_usd"], 0.30)
+            self.assertAlmostEqual(days["2026-07-17"]["total_realised_pnl_usd"], 0.75)
+            self.assertAlmostEqual(days["2026-07-18"]["total_realised_pnl_usd"], -0.10)
 
     def test_scanner_owns_snapshot_and_settlement_comparison_data(self):
         with tempfile.TemporaryDirectory() as temporary:
