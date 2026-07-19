@@ -243,6 +243,10 @@ All files are under `data/mexc_extreme_funding/`:
 | `paper/funding_events.csv` | Fair-price funding ledger |
 | `paper/cooldowns.csv` | Volatility and post-close cooldowns |
 
+The dashboard's Daily PnL tab groups realised exit PnL by UTC day. Funding
+accrual is shown beside it as an informational amount: do not add the two,
+because a later exit already includes its allocated funding.
+
 CSV headers migrate when first rewritten. Existing open positions retain their
 stored quantities and continue to be managed. Old rows with no execution
 quantities remain open but are marked `legacy_position_missing_execution_quantities`

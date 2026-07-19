@@ -15,6 +15,7 @@ from binance_extreme_funding.paper_strategy import run_paper_strategy_once as ru
 from binance_extreme_funding.scanner import backfill_extreme_observations as backfill_binance_extremes
 from binance_extreme_funding.scanner import scan_once as scan_binance
 from mexc_extreme_funding.config import DEFAULT_CONFIG as MEXC_DEFAULT
+from mexc_extreme_funding.dashboard import _daily_pnl_payload as mexc_daily_pnl_payload
 from mexc_extreme_funding.mexc_public_client import MexcPublicClient
 from mexc_extreme_funding.models import FundingSnapshot as MexcSnapshot, MexcMarketRules
 from mexc_extreme_funding.orderbook import estimate_basis_round_trip as estimate_mexc_round_trip
@@ -176,6 +177,28 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
             self.assertAlmostEqual(days["2026-07-17"]["realised_pnl_usd"], 1.25)
             self.assertAlmostEqual(days["2026-07-17"]["funding_accrued_usd"], 0.75)
             self.assertAlmostEqual(days["2026-07-18"]["realised_pnl_usd"], -0.20)
+
+    def test_mexc_dashboard_groups_realised_pnl_by_utc_day(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = fast_mexc_config(Path(temporary))
+            store = MexcStore(config)
+            store.append_fill({
+                "timestamp_utc": "2026-07-17T13:00:00+00:00", "event_type": "EXIT",
+                "notional_usd": 50.0, "realised_pnl_usd": 0.75,
+            })
+            store.append_fill({
+                "timestamp_utc": "2026-07-18T13:00:00+00:00", "event_type": "PARTIAL_EXIT",
+                "notional_usd": 100.0, "realised_pnl_usd": -0.10,
+            })
+            store.append_funding({
+                "timestamp_utc": "2026-07-17T08:00:00+00:00", "funding_pnl_usd": 0.30,
+            })
+            payload = mexc_daily_pnl_payload(config)
+            days = {row["date_utc"]: row for row in payload["items"]}
+            self.assertEqual(days["2026-07-17"]["exit_count"], 1)
+            self.assertAlmostEqual(days["2026-07-17"]["realised_pnl_usd"], 0.75)
+            self.assertAlmostEqual(days["2026-07-17"]["funding_accrued_usd"], 0.30)
+            self.assertAlmostEqual(days["2026-07-18"]["realised_pnl_usd"], -0.10)
 
     def test_scanner_owns_snapshot_and_settlement_comparison_data(self):
         with tempfile.TemporaryDirectory() as temporary:
