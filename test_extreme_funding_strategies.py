@@ -39,6 +39,15 @@ class FakeScannerClient(FakeClient):
         super().__init__(settled_rate_pct)
         self.snapshots = snapshots
         self.book_observed_at = None
+        self.spot_buy_available = True
+        self.short_spot_available = True
+
+    def fetch_account_capacity(self, **kwargs):
+        return {
+            "spot_buy_available": self.spot_buy_available,
+            "short_spot_available": self.short_spot_available,
+            "source": "test_account",
+        }
 
     def fetch_snapshots(self, now):
         return self.snapshots
@@ -245,6 +254,7 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
             header = store.positions_path.read_text(encoding="utf-8").splitlines()[0]
             self.assertIn("management_state", header)
             self.assertIn("last_exit_at_utc", header)
+            self.assertIn("exit_started_at_utc", header)
 
     def test_binance_holds_adverse_basis_and_aggregates_layers_before_funding(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -463,6 +473,90 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
             self.assertEqual(position.funding_events_captured, 1)
             self.assertNotEqual(position.exit_reason, "max_adverse_basis")
 
+    def test_binance_weak_funding_closes_small_tail_on_total_funding_profit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_binance_config(root, layer_ladder_usd=(250.0,))
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(minutes=10)
+            client = FakeClient(settled_rate_pct=0.60)
+            for minute in (0, 1):
+                observed = start + timedelta(minutes=minute)
+                item = snapshot(BinanceSnapshot, observed, funding_time, 0.65, 2.0, "BINANCE", "TESTUSDT")
+                run_binance(config, client=client, snapshots=[item], now=observed)
+
+            after = snapshot(
+                BinanceSnapshot, funding_time + timedelta(minutes=2), funding_time + timedelta(hours=8),
+                0.10, 2.0, "BINANCE", "TESTUSDT",
+            )
+            after.eligible = False
+            result = run_binance(config, client=client, snapshots=[after], now=after.observed_at_utc)
+            position = BinanceStore(config).load_positions()[0]
+            self.assertEqual(result["exits"], 1)
+            self.assertEqual(position.status, "CLOSED")
+            self.assertEqual(position.exit_reason, "next_funding_weak_funding_harvest_full_close")
+
+    def test_binance_postfunding_exit_state_blocks_relayering(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_binance_config(root, layer_ladder_usd=(100.0, 250.0))
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(minutes=10)
+            client = FakeClient(settled_rate_pct=0.10)
+            for minute in (0, 1):
+                observed = start + timedelta(minutes=minute)
+                item = snapshot(BinanceSnapshot, observed, funding_time, 0.65, 2.0, "BINANCE", "TESTUSDT")
+                run_binance(config, client=client, snapshots=[item], now=observed)
+
+            unwind = snapshot(
+                BinanceSnapshot, funding_time + timedelta(minutes=2), funding_time + timedelta(hours=8),
+                0.10, 2.0, "BINANCE", "TESTUSDT",
+            )
+            unwind.eligible = False
+            run_binance(config, client=client, snapshots=[unwind], now=unwind.observed_at_utc)
+            position = BinanceStore(config).load_positions()[0]
+            self.assertEqual(position.management_state, "EXITING_POSTFUNDING")
+            self.assertEqual(position.status, "OPEN")
+            self.assertEqual(position.exit_started_at_utc, unwind.observed_at_utc)
+
+            fresh = snapshot(
+                BinanceSnapshot, unwind.observed_at_utc + timedelta(minutes=1), funding_time + timedelta(hours=8),
+                0.70, 2.0, "BINANCE", "TESTUSDT",
+            )
+            result = run_binance(config, client=client, snapshots=[fresh], now=fresh.observed_at_utc)
+            position = BinanceStore(config).load_positions()[0]
+            self.assertEqual(result["opened"], 0)
+            self.assertEqual(position.notional_usd, 100.0)
+            self.assertEqual(position.management_state, "EXITING_POSTFUNDING")
+
+    def test_binance_timed_postfunding_tail_can_close_near_flat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = fast_binance_config(
+                root,
+                layer_ladder_usd=(100.0,),
+                post_funding_exit_timeout_hours=0.0,
+                timed_exit_max_loss_usd=0.50,
+            )
+            start = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+            funding_time = start + timedelta(minutes=10)
+            client = FakeClient(settled_rate_pct=0.10)
+            for minute in (0, 1):
+                observed = start + timedelta(minutes=minute)
+                item = snapshot(BinanceSnapshot, observed, funding_time, 0.65, 2.0, "BINANCE", "TESTUSDT")
+                run_binance(config, client=client, snapshots=[item], now=observed)
+
+            after = snapshot(
+                BinanceSnapshot, funding_time + timedelta(minutes=2), funding_time + timedelta(hours=8),
+                0.10, 2.0, "BINANCE", "TESTUSDT",
+            )
+            after.eligible = False
+            result = run_binance(config, client=client, snapshots=[after], now=after.observed_at_utc)
+            position = BinanceStore(config).load_positions()[0]
+            self.assertEqual(result["exits"], 1)
+            self.assertEqual(position.status, "CLOSED")
+            self.assertEqual(position.exit_reason, "postfunding_timed_near_flat_exit")
+
     def test_binance_holds_unprofitable_adverse_basis_after_funding(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -667,7 +761,9 @@ class ExtremeFundingStrategyTests(unittest.TestCase):
                 MexcSnapshot, now, now + timedelta(hours=2),
                 -0.80, -1.0, "MEXC", "TEST_USDT",
             )
-            result = scan_mexc(config, client=FakeScannerClient([item], settled_rate_pct=None))
+            client = FakeScannerClient([item], settled_rate_pct=None)
+            client.short_spot_available = False
+            result = scan_mexc(config, client=client)
             self.assertEqual(result["opportunities"], 4)
             rows = MexcStore.read_rows(root / "latest_opportunities.csv")
             self.assertTrue(all(row["decision"] == "REJECT" for row in rows))

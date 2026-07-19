@@ -165,6 +165,7 @@ class OpportunityRow:
     basis_std_pct: Optional[float] = None
     basis_percentile: Optional[float] = None
     basis_trend_pct: Optional[float] = None
+    spot_buy_available: bool = False
     spot_margin_allowed: bool = False
     short_spot_available: bool = False
     perp_api_allowed: bool = False
@@ -220,6 +221,7 @@ class OpportunityRow:
             basis_std_pct=parse_float(row.get("basis_std_pct")),
             basis_percentile=parse_float(row.get("basis_percentile")),
             basis_trend_pct=parse_float(row.get("basis_trend_pct")),
+            spot_buy_available=parse_bool(row.get("spot_buy_available")),
             spot_margin_allowed=parse_bool(row.get("spot_margin_allowed")),
             short_spot_available=parse_bool(row.get("short_spot_available")),
             perp_api_allowed=parse_bool(row.get("perp_api_allowed")),
@@ -268,12 +270,13 @@ class PaperPosition:
     last_layer_at_utc: Optional[datetime] = None
     management_state: str = "HOLDING"
     last_exit_at_utc: Optional[datetime] = None
+    exit_started_at_utc: Optional[datetime] = None
 
     def to_csv_row(self) -> dict:
         row = asdict(self)
         for key in (
             "entry_at_utc", "updated_at_utc", "funding_time_utc", "exit_at_utc",
-            "last_layer_at_utc", "last_exit_at_utc",
+            "last_layer_at_utc", "last_exit_at_utc", "exit_started_at_utc",
         ):
             row[key] = iso(row[key])
         return row
@@ -327,4 +330,5 @@ class PaperPosition:
             last_layer_at_utc=parse_datetime(row.get("last_layer_at_utc")),
             management_state=management_state,
             last_exit_at_utc=parse_datetime(row.get("last_exit_at_utc")),
+            exit_started_at_utc=parse_datetime(row.get("exit_started_at_utc")),
         )

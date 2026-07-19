@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import hmac
+import time
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -53,7 +57,69 @@ class BinancePublicClient:
         self.config = config
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "binance-extreme-funding-paper/1.0"})
+        self._account_balance_cache: tuple[float, dict[str, float]] | None = None
+        self._borrow_cache: dict[tuple[str, str], tuple[float, float, str]] = {}
 
+    def _signed_get(self, base_url: str, path: str, params: dict[str, Any] | None = None) -> Any:
+        if not self.config.api_key or not self.config.api_secret:
+            raise PermissionError("account_capacity_credentials_missing")
+        query = dict(params or {})
+        query.update({"recvWindow": 5_000, "timestamp": int(time.time() * 1_000)})
+        encoded = urlencode(query)
+        query["signature"] = hmac.new(
+            self.config.api_secret.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256,
+        ).hexdigest()
+        response = self.session.get(
+            f"{base_url}{path}", params=query,
+            headers={"X-MBX-APIKEY": self.config.api_key}, timeout=self.config.request_timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def fetch_account_capacity(
+        self, *, base_asset: str, spot_symbol: str, quote_notional_usd: float, base_quantity: float,
+    ) -> dict[str, Any]:
+        """Return executable spot capacity; this check never borrows or moves funds."""
+        if not self.config.api_key or not self.config.api_secret:
+            return {"spot_buy_available": False, "short_spot_available": False,
+                    "source": "credentials_missing"}
+        try:
+            now = time.monotonic()
+            if self._account_balance_cache is None or now - self._account_balance_cache[0] > 30:
+                account = self._signed_get(SPOT_URL, "/api/v3/account")
+                balances = {str(item.get("asset", "")): float(item.get("free", 0) or 0)
+                            for item in account.get("balances", [])}
+                self._account_balance_cache = (now, balances)
+            quote_free = self._account_balance_cache[1].get("USDT", 0.0)
+            required_quote = quote_notional_usd * (1 + self.config.account_capacity_reserve_pct / 100)
+            cross_amount, isolated_amount = 0.0, 0.0
+            sources: list[str] = []
+            for mode, params in (("cross", {"asset": base_asset}), (
+                "isolated", {"asset": base_asset, "isolatedSymbol": spot_symbol, "isIsolated": "TRUE"},
+            )):
+                key = (mode, base_asset)
+                cached = self._borrow_cache.get(key)
+                if cached is None or now - cached[0] > 30:
+                    try:
+                        payload = self._signed_get(SPOT_URL, "/sapi/v1/margin/maxBorrowable", params)
+                        cached = (now, float(payload.get("amount", 0) or 0), mode)
+                    except requests.RequestException:
+                        cached = (now, 0.0, mode)
+                    self._borrow_cache[key] = cached
+                if mode == "cross":
+                    cross_amount = cached[1]
+                else:
+                    isolated_amount = cached[1]
+                if cached[1] >= base_quantity:
+                    sources.append(mode)
+            return {
+                "spot_buy_available": quote_free >= required_quote,
+                "short_spot_available": bool(sources),
+                "source": "spot_usdt+" + ("_or_".join(sources) if sources else "no_margin_borrow"),
+            }
+        except (requests.RequestException, ValueError, TypeError, PermissionError) as error:
+            return {"spot_buy_available": False, "short_spot_available": False,
+                    "source": f"account_check_error:{type(error).__name__}"}
     def _get(self, base_url: str, path: str, params: Optional[dict] = None) -> Any:
         response = self.session.get(
             f"{base_url}{path}",

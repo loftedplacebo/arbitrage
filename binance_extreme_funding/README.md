@@ -160,7 +160,9 @@ continue adding the same chunk indefinitely after all four layers are used.
 
 ## Hold Rules
 
-There is no maximum holding time and no adverse-basis liquidation rule.
+There is no adverse-basis liquidation rule. A normal holding position has no
+maximum age, but a post-funding unwind has an eight-hour completion timeout for
+a small near-flat remainder.
 
 Before the first funding event:
 
@@ -178,7 +180,10 @@ After at least one funding event:
    profitable unwind.
 3. If next funding is missing, below `0.30%`, or has reversed against the held
    direction, request a weak-funding unwind and permit funding-harvest logic.
-4. If the requested exit is not fillable and profitable under its rule, hold.
+4. The first post-funding unwind request enters persistent `EXITING_POSTFUNDING`
+   state and blocks every later layer, even if a later displayed rate improves.
+5. If the requested exit is not fillable and profitable under its rule, keep
+   working the controlled exit rather than rebuilding the position.
 
 The configured `0.50%` near-flat basis threshold is recorded for diagnostics,
 but with a known next funding rate the funding hierarchy above determines the
@@ -217,7 +222,14 @@ For a requested post-funding unwind:
 3. For weak, missing, or reversed next funding only, it can close a `$100`
    funding-harvest chunk when total profit including allocated accrued funding
    is at least `$0.25`.
-4. If no full, partial, or harvest exit passes, it records
+4. For a weak-funding remainder no larger than `$500`, it may close the full
+   remainder when total executable PnL including accrued funding is at least
+   `$0.25`; this avoids leaving a funding-profitable tail open solely because
+   the basis leg is still below its standalone hurdle.
+5. Eight hours after post-funding unwinding begins, a fillable remainder no
+   larger than `$500` can close at no worse than `-$0.25` total PnL. This is a
+   bounded near-flat timeout, not an adverse-basis stop for larger positions.
+6. If no full, partial, or harvest exit passes, it records
    `exit_wanted_no_profitable_chunk` and holds.
 
 An adverse basis move never bypasses these profitability and fillability checks.
@@ -262,8 +274,12 @@ added together.
 
 ## Paper And Live Limitations
 
-- Negative funding requires a short spot leg. The paper model does not verify
-  margin borrow availability, borrow interest, recalls, or liquidation risk.
+- Every new entry and layer is capacity-gated with authenticated read-only account
+  checks. Positive funding needs free USDT for the spot buy (including a 2%
+  reserve); negative funding needs sufficient `maxBorrowable` base asset in either
+  Binance cross margin or the matching isolated-margin pair. The scanner records
+  candidates that fail this check as research rows but cannot shortlist or trade
+  them. The check never borrows, transfers, or places an order.
 - Account-specific fee tier, rebates, precision, minimum notional, and order-rate
   limits must be validated before live execution.
 - Public REST books are snapshots, not atomic cross-market execution guarantees.

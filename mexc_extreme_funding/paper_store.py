@@ -16,6 +16,7 @@ POSITION_FIELDS = [
     "spot_qty", "perp_qty", "spot_entry_price", "perp_entry_price",
     "entry_fees_usd", "realised_funding_pnl_usd", "funding_events_captured",
     "funding_interval_hours", "last_layer_at_utc", "management_state", "last_exit_at_utc",
+    "exit_started_at_utc",
 ]
 SIGNAL_FIELDS = [
     "event_key", "base", "perp_symbol", "direction", "funding_time_utc", "first_seen_utc",

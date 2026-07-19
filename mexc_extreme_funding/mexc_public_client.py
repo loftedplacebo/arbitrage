@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
+import hashlib
+import hmac
+import time
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -54,9 +58,50 @@ class MexcPublicClient:
         self.config = config
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "mexc-extreme-funding-paper/1.0"})
+        self._account_balance_cache: tuple[float, dict[str, float]] | None = None
         self._spot_rule_cache: dict[str, dict] | None = None
         self._contract_rule_cache: dict[str, dict] | None = None
 
+    def _signed_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        if not self.config.api_key or not self.config.api_secret:
+            raise PermissionError("account_capacity_credentials_missing")
+        query = dict(params or {})
+        query.update({"recvWindow": 5_000, "timestamp": int(time.time() * 1_000)})
+        encoded = urlencode(query)
+        query["signature"] = hmac.new(
+            self.config.api_secret.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256,
+        ).hexdigest()
+        response = self.session.get(
+            f"{SPOT_URL}{path}", params=query,
+            headers={"X-MEXC-APIKEY": self.config.api_key}, timeout=self.config.request_timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def fetch_account_capacity(
+        self, *, base_asset: str, spot_symbol: str, quote_notional_usd: float, base_quantity: float,
+    ) -> dict[str, Any]:
+        """MEXC Spot v3 exposes balances, not a documented margin borrow-limit query."""
+        if not self.config.api_key or not self.config.api_secret:
+            return {"spot_buy_available": False, "short_spot_available": False,
+                    "source": "credentials_missing"}
+        try:
+            now = time.monotonic()
+            if self._account_balance_cache is None or now - self._account_balance_cache[0] > 30:
+                account = self._signed_get("/api/v3/account")
+                balances = {str(item.get("asset", "")): float(item.get("free", 0) or 0)
+                            for item in account.get("balances", [])}
+                self._account_balance_cache = (now, balances)
+            balances = self._account_balance_cache[1]
+            required_quote = quote_notional_usd * (1 + self.config.account_capacity_reserve_pct / 100)
+            return {
+                "spot_buy_available": balances.get("USDT", 0.0) >= required_quote,
+                "short_spot_available": balances.get(base_asset, 0.0) >= base_quantity,
+                "source": "authenticated_spot_balance_only",
+            }
+        except (requests.RequestException, ValueError, TypeError, PermissionError) as error:
+            return {"spot_buy_available": False, "short_spot_available": False,
+                    "source": f"account_check_error:{type(error).__name__}"}
     def _get(self, base_url: str, path: str, params: Optional[dict] = None) -> Any:
         response = self.session.get(
             f"{base_url}{path}",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 
@@ -53,11 +54,18 @@ class BinanceExtremeFundingConfig:
     funding_harvest_unwind_chunk_usd: float = 100.0
     min_funding_harvest_profit_usd: float = 0.25
     full_exit_min_profit_pct: float = 0.02
+    post_funding_exit_timeout_hours: float = 8.0
+    timed_exit_max_notional_usd: float = 500.0
+    timed_exit_max_loss_usd: float = 0.25
     post_close_cooldown_minutes: float = 60.0
     fallback_funding_interval_hours: float = 8.0
     scanner_interval_seconds: float = 60.0
     strategy_interval_seconds: float = 60.0
     request_timeout_seconds: float = 20.0
+    api_key: str = os.getenv("BINANCE_EXTREME_FUNDING_API_KEY", "")
+    api_secret: str = os.getenv("BINANCE_EXTREME_FUNDING_API_SECRET", "")
+    account_capacity_required: bool = True
+    account_capacity_reserve_pct: float = 2.0
     data_dir: Path = REPO_ROOT / "data" / "binance_extreme_funding"
     snapshots_dir: Path = data_dir / "snapshots"
     opportunities_dir: Path = data_dir / "opportunities"

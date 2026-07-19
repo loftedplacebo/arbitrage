@@ -150,6 +150,9 @@ class OpportunityRow:
     basis_std_pct: Optional[float] = None
     basis_percentile: Optional[float] = None
     basis_trend_pct: Optional[float] = None
+    spot_buy_available: bool = False
+    short_spot_available: bool = False
+    account_capacity_source: str = ""
 
     @property
     def opportunity_key(self) -> str:
@@ -195,6 +198,9 @@ class OpportunityRow:
             basis_std_pct=parse_float(row.get("basis_std_pct")),
             basis_percentile=parse_float(row.get("basis_percentile")),
             basis_trend_pct=parse_float(row.get("basis_trend_pct")),
+            spot_buy_available=parse_bool(row.get("spot_buy_available")),
+            short_spot_available=parse_bool(row.get("short_spot_available")),
+            account_capacity_source=str(row.get("account_capacity_source", "")),
         )
 
 
@@ -233,18 +239,32 @@ class PaperPosition:
     last_layer_at_utc: Optional[datetime] = None
     management_state: str = "HOLDING"
     last_exit_at_utc: Optional[datetime] = None
+    exit_started_at_utc: Optional[datetime] = None
 
     def to_csv_row(self) -> dict:
         row = asdict(self)
         for key in (
             "entry_at_utc", "updated_at_utc", "funding_time_utc", "exit_at_utc",
-            "last_layer_at_utc", "last_exit_at_utc",
+            "last_layer_at_utc", "last_exit_at_utc", "exit_started_at_utc",
         ):
             row[key] = iso(row[key])
         return row
 
     @classmethod
     def from_csv_row(cls, row: dict) -> "PaperPosition":
+        status = str(row.get("status", "OPEN"))
+        exit_reason = str(row.get("exit_reason", ""))
+        management_state = str(row.get("management_state") or "")
+        if status == "CLOSED":
+            management_state = "CLOSED"
+        elif not management_state and exit_reason.startswith("prefunding_"):
+            management_state = "EXITING_PREFUNDING"
+        elif not management_state and exit_reason.startswith((
+            "gentle_unwind", "next_funding_weak", "basis_take_profit", "basis_near_flat",
+        )):
+            management_state = "EXITING_POSTFUNDING"
+        elif not management_state:
+            management_state = "HOLDING"
         return cls(
             position_id=str(row.get("position_id", "")),
             event_key=str(row.get("event_key", "")),
@@ -265,9 +285,9 @@ class PaperPosition:
             funding_pnl_pct=parse_float(row.get("funding_pnl_pct"), 0.0) or 0.0,
             estimated_net_pnl_pct=parse_float(row.get("estimated_net_pnl_pct"), 0.0) or 0.0,
             realised_pnl_usd=parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0,
-            status=str(row.get("status", "OPEN")),
+            status=status,
             exit_at_utc=parse_datetime(row.get("exit_at_utc")),
-            exit_reason=str(row.get("exit_reason", "")),
+            exit_reason=exit_reason,
             spot_qty=parse_float(row.get("spot_qty"), 0.0) or 0.0,
             perp_qty=parse_float(row.get("perp_qty"), 0.0) or 0.0,
             spot_entry_price=parse_float(row.get("spot_entry_price"), 0.0) or 0.0,
@@ -277,9 +297,7 @@ class PaperPosition:
             funding_events_captured=parse_int(row.get("funding_events_captured")),
             funding_interval_hours=parse_float(row.get("funding_interval_hours")),
             last_layer_at_utc=parse_datetime(row.get("last_layer_at_utc")),
-            management_state=(
-                "CLOSED" if str(row.get("status", "OPEN")) == "CLOSED"
-                else str(row.get("management_state") or "HOLDING")
-            ),
+            management_state=management_state,
             last_exit_at_utc=parse_datetime(row.get("last_exit_at_utc")),
+            exit_started_at_utc=parse_datetime(row.get("exit_started_at_utc")),
         )

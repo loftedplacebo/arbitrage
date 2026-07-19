@@ -35,10 +35,12 @@ All three define basis as perpetual price divided by spot price minus one.
 Positive-funding basis improves when it falls; negative-funding basis improves
 when it rises.
 
-Binance and KuCoin still model the short-spot direction on paper. MEXC V2 only
-allows it when the public spot metadata reports margin trading or the symbol is
-explicitly listed as inventory-backed. Live use still requires authenticated
-borrow availability, borrow-cost, recall, and balance checks.
+Both paper strategies now use authenticated read-only account capacity before
+shortlisting a new layer. Binance requires free USDT for a long-spot hedge and
+checks the actual cross and isolated-margin `maxBorrowable` quantity for a
+short-spot hedge. MEXC's documented Spot v3 API exposes account balances but no
+borrow-limit endpoint, so it permits a short only from sufficient authenticated
+base inventory; public margin metadata alone never qualifies a trade.
 
 ## Key Differences
 
@@ -76,7 +78,7 @@ All three strategies require:
 5. Positive expected edge after measured slippage, fees, and safety allowance.
 6. Fresh market rows.
 7. Directionally favorable basis once enough history exists.
-8. Portfolio exposure capacity.
+8. Authenticated spot/margin capacity for the direction and exact layer size.
 
 All scanners keep open positions on a watchlist so an exit can still be priced
 after the original entry signal disappears.
@@ -124,12 +126,16 @@ layer remains depth-priced and profitable. Basis standard deviation above
 - After funding, hold next directional funding of `1.00%` or more.
 - From `0.30%` to below `1.00%`, request a profitable unwind.
 - Below `0.30%`, missing, or reversed, request a weak-funding unwind.
+- The first post-funding unwind enters persistent `EXITING_POSTFUNDING` state,
+  blocks re-layering, and continues through a later juicy displayed rate.
 - Post-funding uses the same controlled five-minute chunk cadence and selection
-  rule. A full close is allowed only when the remainder is no larger than
-  `$500` and makes at least `0.02%` excluding funding.
+  rule. A full close is normally limited to a remainder no larger than `$500`
+  with `0.02%` profit excluding funding.
 - Weak-funding paths may harvest `$100` when allocated total PnL including
-  funding is at least `$0.25`.
-- If no exit passes, hold regardless of basis or age.
+  funding is at least `$0.25`; a funding-profitable remainder no larger than
+  `$500` may close in full at the same dollar hurdle.
+- Eight hours after the post-funding exit begins, a fillable remainder no larger
+  than `$500` may close at no worse than `-$0.25` total PnL.
 
 ## MEXC Decision Lifecycle
 
@@ -149,8 +155,9 @@ MEXC uses the same gate order as Binance, with these exchange-specific rules:
   `0.60%`.
 - Symbol cap is `$2,000`; total cap is `$10,000`; position cap is 30.
 - MEXC `collectCycle` supplies the funding interval.
-- Spot trading and perpetual API trading must be enabled. Negative funding also
-  requires public margin eligibility or an explicit inventory-backed allowlist.
+- Spot trading and perpetual API trading must be enabled. Positive funding needs
+  authenticated free USDT; negative funding needs authenticated free base
+  inventory because MEXC has no documented borrow-limit endpoint.
 - Futures depth volume is contract count. Each layer is rounded down to MEXC's
   `volUnit`, checked against `minVol`/`maxVol`, converted through `contractSize`,
   and matched to the same base quantity on spot. A residual hedge above `0.25%`
@@ -175,8 +182,10 @@ MEXC uses the same gate order as Binance, with these exchange-specific rules:
   Binance.
 - Post-funding exit requests enter persistent `EXITING_POSTFUNDING` state and
   use the same controlled five-minute chunk cadence.
-- Full post-funding exits require `0.02%` profit excluding funding. Partial
-  exits use `$50/$100/$250`.
+- Full post-funding exits require `0.02%` profit excluding funding. On weak
+  funding, a remainder at most `$250` may instead close with total PnL at least
+  `$0.15`; after eight hours it may close no worse than `-$0.15`. Partial exits
+  use `$50/$100/$250` at most once every five minutes.
 - Weak-funding harvest uses `$50` and requires at least `$0.15` total allocated
   profit including funding.
 - Adverse basis never forces an exit.
@@ -292,7 +301,8 @@ None of these packages is ready to submit live orders. A live implementation
 still needs:
 
 - Authenticated clients and idempotent order state.
-- Spot borrow availability, cost, recall, and margin controls.
+- MEXC margin borrow-limit, cost, recall, and margin controls if/when a
+  documented authenticated borrow API becomes available.
 - Exchange-specific quantity/price precision and minimum-size validation.
 - Account fee tiers and rebates.
 - Atomic or failure-aware two-leg execution.

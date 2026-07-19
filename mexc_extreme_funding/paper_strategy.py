@@ -117,6 +117,7 @@ def _synthetic_opportunities(
             direction != "SHORT_SPOT_LONG_PERP"
             or snapshot.spot_symbol in config.inventory_backed_short_spot_symbols
         )
+        spot_buy_available = True
         if direction == "LONG_SPOT_SHORT_PERP":
             spot_entry, perp_entry = snapshot.spot_ask, snapshot.perp_bid
             spot_exit, perp_exit = snapshot.spot_bid, snapshot.perp_ask
@@ -155,6 +156,7 @@ def _synthetic_opportunities(
                     else snapshot.reason
                 ),
                 short_spot_available=short_spot_available,
+                spot_buy_available=spot_buy_available,
                 perp_api_allowed=True,
                 hedged_base_quantity=hedged_quantity,
                 spot_entry_notional_usd=hedged_quantity * (spot_entry or 0.0),
@@ -399,6 +401,8 @@ def _try_profitable_exit(
     allow_partial: bool = True,
     prefer_partial: bool = False,
     allow_full: bool = True,
+    allow_full_funding_harvest: bool = False,
+    timed_exit_max_loss_usd: float | None = None,
     store: PaperStore,
     config: MexcExtremeFundingConfig,
     now: datetime,
@@ -428,6 +432,37 @@ def _try_profitable_exit(
         changed, closed = try_full()
         if changed:
             return changed, closed
+
+    def try_full_funding_harvest() -> tuple[bool, bool]:
+        if not allow_full or not allow_full_funding_harvest:
+            return False, False
+        full_row = _row_for(rows, position, position.notional_usd)
+        estimate = None if full_row is None else _estimate_exit(position, full_row, position.notional_usd, config)
+        if estimate is None or estimate["total_net_usd"] < config.min_funding_harvest_profit_usd:
+            return False, False
+        return True, _close_position_chunk(
+            position=position, row=full_row, estimate=estimate, notional_usd=position.notional_usd,
+            reason=f"{reason}_funding_harvest_full_close", store=store, config=config, now=now,
+        )
+
+    def try_timed_near_flat_full_close() -> tuple[bool, bool]:
+        if not allow_full or timed_exit_max_loss_usd is None:
+            return False, False
+        full_row = _row_for(rows, position, position.notional_usd)
+        estimate = None if full_row is None else _estimate_exit(position, full_row, position.notional_usd, config)
+        if estimate is None or estimate["total_net_usd"] < -timed_exit_max_loss_usd:
+            return False, False
+        return True, _close_position_chunk(
+            position=position, row=full_row, estimate=estimate, notional_usd=position.notional_usd,
+            reason="postfunding_timed_near_flat_exit", store=store, config=config, now=now,
+        )
+
+    changed, closed = try_full_funding_harvest()
+    if changed:
+        return changed, closed
+    changed, closed = try_timed_near_flat_full_close()
+    if changed:
+        return changed, closed
 
     if allow_partial:
         profitable_chunks: list[tuple[float, float, OpportunityRow, dict[str, float]]] = []
@@ -536,11 +571,10 @@ def _mark_and_manage_positions(
         improvement = _basis_improvement(position)
         near_flat = abs(position.current_basis_pct) <= config.basis_near_flat_exit_abs_pct
         if position.management_state == "EXITING_POSTFUNDING":
-            reason = (
-                "next_funding_weak" if "next_funding_weak" in position.exit_reason
-                else "gentle_unwind"
-            )
-            allow_harvest = reason == "next_funding_weak"
+            if next_benefit is None or next_benefit < config.min_hold_funding_rate_pct:
+                reason, allow_harvest = "next_funding_weak", True
+            else:
+                reason, allow_harvest = "gentle_unwind", False
         elif next_benefit is None or next_benefit < config.min_hold_funding_rate_pct:
             reason, allow_harvest = "next_funding_weak", True
         elif next_benefit < config.juicy_hold_funding_rate_pct:
@@ -553,10 +587,24 @@ def _mark_and_manage_positions(
             position.exit_reason = "hold"
             continue
         position.management_state = "EXITING_POSTFUNDING"
+        if position.exit_started_at_utc is None:
+            position.exit_started_at_utc = now
+        timed_exit_due = (
+            position.exit_started_at_utc is not None
+            and now - position.exit_started_at_utc >= timedelta(hours=config.post_funding_exit_timeout_hours)
+        )
         changed, closed = _try_profitable_exit(
             position=position, rows=rows, reason=reason, allow_funding_harvest=allow_harvest,
             allow_partial=True, prefer_partial=True,
             allow_full=position.notional_usd <= max(config.gentle_unwind_chunk_ladder_usd),
+            allow_full_funding_harvest=(
+                allow_harvest and position.notional_usd <= config.timed_exit_max_notional_usd
+            ),
+            timed_exit_max_loss_usd=(
+                config.timed_exit_max_loss_usd
+                if timed_exit_due and position.notional_usd <= config.timed_exit_max_notional_usd
+                else None
+            ),
             store=store, config=config, now=now,
         )
         if changed:
@@ -699,6 +747,8 @@ def _open_layers(
                 allowed, reason = False, "layer_too_early"
             if allowed and conservative_edge < config.layer_min_conservative_edge_pct[next_index]:
                 allowed, reason = False, "conservative_edge_below_threshold"
+        if allowed and config.account_capacity_required and row.direction == "LONG_SPOT_SHORT_PERP" and not row.spot_buy_available:
+            allowed, reason = False, "spot_buy_unavailable"
         if allowed and row.direction == "SHORT_SPOT_LONG_PERP" and not row.short_spot_available:
             allowed, reason = False, "spot_short_unavailable"
         if allowed and not row.perp_api_allowed:

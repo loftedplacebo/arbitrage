@@ -45,6 +45,7 @@ OPPORTUNITY_FIELDS = [
     "spot_exit_slippage_pct", "perp_exit_slippage_pct", "expected_edge_pct",
     "round_trip_fillable", "decision", "reason", "basis_observation_count",
     "basis_mean_pct", "basis_std_pct", "basis_percentile", "basis_trend_pct",
+    "spot_buy_available", "short_spot_available", "account_capacity_source",
 ]
 
 
@@ -129,6 +130,8 @@ def _entry_decision(
     fillable: bool,
     observation_count: int,
     percentile: float | None,
+    spot_buy_available: bool,
+    short_spot_available: bool,
     config: BinanceExtremeFundingConfig,
 ) -> tuple[str, str]:
     rate = snapshot.current_funding_rate_pct
@@ -136,6 +139,10 @@ def _entry_decision(
         return "REJECT", "open_position_watchlist"
     if rate is None or benefit_for_direction(direction, rate) < config.min_abs_funding_rate_pct:
         return "REJECT", "funding_below_threshold"
+    if config.account_capacity_required and direction == "LONG_SPOT_SHORT_PERP" and not spot_buy_available:
+        return "REJECT", "spot_buy_unavailable"
+    if config.account_capacity_required and direction == "SHORT_SPOT_LONG_PERP" and not short_spot_available:
+        return "REJECT", "spot_short_unavailable"
     if expected_edge_pct < config.min_expected_edge_pct:
         return "REJECT", "expected_edge_below_threshold"
     if not fillable:
@@ -225,10 +232,19 @@ def _build_opportunities(
                         estimate.spot_exit.slippage_pct + estimate.perp_exit.slippage_pct
                         + config.estimated_exit_fee_pct
                     )
+                    entry_price = estimate.spot_entry.average_price or 0.0
+                    capacity = client.fetch_account_capacity(
+                        base_asset=snapshot.base, spot_symbol=snapshot.spot_symbol,
+                        quote_notional_usd=estimate.spot_entry.filled_notional or notional,
+                        base_quantity=(estimate.spot_entry.filled_notional or notional) / entry_price
+                        if entry_price > 0 else float("inf"),
+                    )
                     decision, reason = _entry_decision(
                         snapshot=snapshot, direction=direction, expected_edge_pct=expected_edge,
                         exit_cost_pct=exit_cost, fillable=estimate.round_trip_fillable,
                         observation_count=stats.observation_count, percentile=stats.percentile,
+                        spot_buy_available=bool(capacity.get("spot_buy_available")),
+                        short_spot_available=bool(capacity.get("short_spot_available")),
                         config=config,
                     )
                     if notional not in config.layer_ladder_usd and decision == "ENTER_CANDIDATE":
@@ -257,6 +273,9 @@ def _build_opportunities(
                         basis_observation_count=stats.observation_count,
                         basis_mean_pct=stats.mean_pct, basis_std_pct=stats.std_pct,
                         basis_percentile=stats.percentile, basis_trend_pct=stats.trend_pct,
+                        spot_buy_available=bool(capacity.get("spot_buy_available")),
+                        short_spot_available=bool(capacity.get("short_spot_available")),
+                        account_capacity_source=str(capacity.get("source", "")),
                     ))
         except Exception as error:
             errors.append(f"{snapshot.perp_symbol}: {error}")

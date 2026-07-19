@@ -45,7 +45,7 @@ OPPORTUNITY_FIELDS = [
     "spot_exit_slippage_pct", "perp_exit_slippage_pct", "expected_edge_pct",
     "round_trip_fillable", "decision", "reason", "basis_observation_count",
     "basis_mean_pct", "basis_std_pct", "basis_percentile", "basis_trend_pct",
-    "spot_margin_allowed", "short_spot_available", "perp_api_allowed",
+    "spot_margin_allowed", "spot_buy_available", "short_spot_available", "perp_api_allowed",
     "contract_size", "contract_volume_step", "perp_contracts",
     "hedged_base_quantity", "residual_delta_pct", "spot_entry_notional_usd",
     "perp_entry_notional_usd",
@@ -139,6 +139,7 @@ def _entry_decision(
     fillable: bool,
     observation_count: int,
     percentile: float | None,
+    spot_buy_available: bool,
     short_spot_available: bool,
     perp_api_allowed: bool,
     residual_delta_pct: float,
@@ -149,6 +150,8 @@ def _entry_decision(
         return "REJECT", "open_position_watchlist"
     if rate is None or benefit_for_direction(direction, rate) < config.min_abs_funding_rate_pct:
         return "REJECT", "funding_below_threshold"
+    if config.account_capacity_required and direction == "LONG_SPOT_SHORT_PERP" and not spot_buy_available:
+        return "REJECT", "spot_buy_unavailable"
     if direction == "SHORT_SPOT_LONG_PERP" and not short_spot_available:
         return "REJECT", "spot_short_unavailable"
     if not perp_api_allowed:
@@ -229,11 +232,6 @@ def _build_opportunities(
             for watched_notionals in watched.values():
                 notionals.update(watched_notionals)
             for direction in sorted(directions):
-                short_spot_available = (
-                    direction != "SHORT_SPOT_LONG_PERP"
-                    or rules.spot_margin_allowed
-                    or snapshot.spot_symbol in config.inventory_backed_short_spot_symbols
-                )
                 for notional in sorted(value for value in notionals if value > 0):
                     estimate = estimate_basis_round_trip(
                         direction=direction, spot_book=spot_book, perp_book=perp_book,
@@ -250,10 +248,18 @@ def _build_opportunities(
                         estimate.spot_exit.slippage_pct + estimate.perp_exit.slippage_pct
                         + config.estimated_exit_fee_pct
                     )
+                    capacity = client.fetch_account_capacity(
+                        base_asset=snapshot.base, spot_symbol=snapshot.spot_symbol,
+                        quote_notional_usd=estimate.spot_entry.filled_notional or notional,
+                        base_quantity=estimate.hedged_base_quantity,
+                    )
+                    spot_buy_available = bool(capacity.get("spot_buy_available"))
+                    short_spot_available = bool(capacity.get("short_spot_available"))
                     decision, reason = _entry_decision(
                         snapshot=snapshot, direction=direction, expected_edge_pct=expected_edge,
                         exit_cost_pct=exit_cost, fillable=estimate.round_trip_fillable,
                         observation_count=stats.observation_count, percentile=stats.percentile,
+                        spot_buy_available=spot_buy_available,
                         short_spot_available=short_spot_available,
                         perp_api_allowed=rules.perp_api_allowed and rules.perp_state == 0,
                         residual_delta_pct=estimate.residual_delta_pct,
@@ -286,6 +292,7 @@ def _build_opportunities(
                         basis_mean_pct=stats.mean_pct, basis_std_pct=stats.std_pct,
                         basis_percentile=stats.percentile, basis_trend_pct=stats.trend_pct,
                         spot_margin_allowed=rules.spot_margin_allowed,
+                        spot_buy_available=spot_buy_available,
                         short_spot_available=short_spot_available,
                         perp_api_allowed=rules.perp_api_allowed and rules.perp_state == 0,
                         contract_size=rules.contract_size,

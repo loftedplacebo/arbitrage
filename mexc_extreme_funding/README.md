@@ -27,13 +27,16 @@ below must pass independently.
 | Displayed funding | Hedge | Funding receiver | Default V2 status |
 | --- | --- | --- | --- |
 | Positive | Long spot, short perpetual | Short perpetual | Eligible when all other gates pass |
-| Negative | Short spot, long perpetual | Long perpetual | Rejected unless the spot symbol is margin-enabled or explicitly inventory-backed |
+| Negative | Short spot, long perpetual | Long perpetual | Requires authenticated free base-asset inventory sufficient for the hedge |
 
-MEXC `exchangeInfo` is the capability source. V2 records
-`spot_margin_allowed`, `short_spot_available`, and `perp_api_allowed` on every
-depth-priced opportunity. The scanner continues researching an unborrowable
-negative-rate event, but writes `spot_short_unavailable` and the strategy cannot
-open it.
+MEXC `exchangeInfo` remains the market-structure source, while signed Spot v3
+account data is the capacity source. V2 records `spot_buy_available`,
+`short_spot_available`, and `perp_api_allowed` on every depth-priced opportunity.
+It requires free USDT plus a 2% reserve for a positive-funding spot buy, or free
+base inventory for a negative-funding spot sale. MEXC's documented Spot v3 API
+does not expose a max-borrowable cross/isolated-margin endpoint, so a public
+`isMarginTradingAllowed` flag is never treated as proof that a short can be
+borrowed. Unfunded events remain research rows and cannot open.
 
 `inventory_backed_short_spot_symbols` is empty by default. Adding a symbol is an
 explicit paper assumption that sufficient spot inventory is reserved for the
@@ -179,6 +182,9 @@ After first funding:
 4. Once post-funding exit begins, it remains `EXITING_POSTFUNDING`; new layers
    cannot restart the position.
 5. If no fillable profitable chunk exists, hold.
+6. Eight hours after post-funding unwinding begins, a fillable remainder no larger
+   than `$250` may close at no worse than `-$0.15` total PnL. This is a bounded
+   tail rule, not an adverse-basis stop.
 
 ## Exit Rules
 
@@ -200,6 +206,8 @@ After first funding:
 - Uses the same largest-near-best chunk rule and five-minute pacing.
 - Full closure is considered only when the remainder is at most `$250` and earns
   at least `0.02%` excluding funding.
+- On weak next funding, that same small remainder may close when total PnL,
+  including captured funding, is at least `$0.15`.
 - Weak, missing, or reversed next funding may harvest a `$50` chunk when total
   allocated profit including funding is at least `$0.15`.
 - No qualifying chunk means `exit_wanted_no_profitable_chunk` and continued hold.
@@ -251,6 +259,7 @@ python -m mexc_extreme_funding.print_summary
 python test_extreme_funding_strategies.py
 ```
 
-The package remains deliberately paper-only. A future authenticated executor
-must replace the inventory whitelist with real balances/borrows and revalidate
-fees, price/quantity precision, order limits, and both-leg execution risk.
+The package remains deliberately paper-only. It reads authenticated balances but
+does not borrow or trade. A future executor must add MEXC margin-borrow controls
+once MEXC exposes a documented borrow-limit API, then revalidate fees,
+price/quantity precision, order limits, and both-leg execution risk.
