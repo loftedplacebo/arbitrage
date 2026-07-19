@@ -57,6 +57,7 @@ HTML = r"""<!doctype html>
     <button class="tab active" data-tab="funding">Funding</button>
     <button class="tab" data-tab="shortlist">Shortlist</button>
     <button class="tab" data-tab="positions">Positions</button>
+    <button class="tab" data-tab="daily-pnl">Daily PnL</button>
     <button class="tab" data-tab="summary">Summary</button>
   </nav>
   <main>
@@ -74,10 +75,11 @@ HTML = r"""<!doctype html>
       funding:[["perp_symbol","Contract"],["current_funding_rate_pct","Displayed"],["minutes_to_funding","Minutes"],["mark_index_basis_pct","Mark / index"],["executable_basis_pct","Spot / perp"],["spot_symbol","Spot"],["reason","State"]],
       shortlist:[["perp_symbol","Contract"],["direction","Direction"],["latest_rate_pct","Latest"],["streak_min_abs_rate_pct","Streak min"],["streak_observations","Streak obs"],["streak_started_utc","Streak start"],["funding_time_utc","Funding"],["status","State"]],
       positions:[["position_id","Position"],["perp_symbol","Contract"],["direction","Direction"],["layer_index","Layer"],["notional_usd","Notional"],["displayed_rate_at_entry_pct","Entry rate"],["actual_funding_rate_pct","Actual rate"],["entry_basis_pct","Entry basis"],["current_basis_pct","Current basis"],["basis_pnl_pct","Basis PnL"],["estimated_net_pnl_pct","Net PnL"],["management_state","Management"],["status","State"],["exit_reason","Exit"]],
+      "daily-pnl":[["date_utc","UTC date"],["realised_pnl_usd","Realised PnL"],["exit_count","Exit events"],["exit_notional_usd","Exited notional"],["funding_accrued_usd","Funding accrued"],["funding_events","Funding events"]],
       summary:[["label","Measure"],["value","Value"]]
     };
     function cls(v,k){ if(k==="reason"||k==="status") return String(v).includes("eligible")||v==="ACTIVE"||v==="OPEN"?"good":"warn"; if(["current_funding_rate_pct","latest_rate_pct","basis_pnl_pct","estimated_net_pnl_pct"].includes(k)) return Number(v)>=0?"good":"bad"; return ""; }
-    function val(v,k){ if(k.includes("rate")||k.includes("basis")||k.includes("pnl_pct")) return pct(v); if(k==="notional_usd") return usd(v); if(k.includes("_utc")) return dt(v); if(k==="minutes_to_funding") return v==null?"-":Number(v).toFixed(1); return v??"-"; }
+    function val(v,k){ if(k.includes("rate")||k.includes("basis")||k.includes("pnl_pct")) return pct(v); if(k.includes("pnl_usd")||k==="exit_notional_usd"||k==="funding_accrued_usd") return usd(v); if(k==="date_utc") return v??"-"; if(k.includes("_utc")) return dt(v); if(k==="minutes_to_funding") return v==null?"-":Number(v).toFixed(1); return v??"-"; }
     function render(payload){
       const rows=payload.items||[]; const cols=columns[active];
       $("#head").innerHTML="<tr>"+cols.map(c=>`<th>${esc(c[1])}</th>`).join("")+"</tr>";
@@ -138,6 +140,45 @@ def _positions_payload(config: BinanceExtremeFundingConfig) -> dict:
     ]}
 
 
+def _daily_pnl_payload(config: BinanceExtremeFundingConfig) -> dict:
+    store = PaperStore(config)
+    days: dict[str, dict] = {}
+
+    def day_for(row: dict) -> dict:
+        day = str(row.get("timestamp_utc", ""))[:10] or "unknown"
+        return days.setdefault(day, {
+            "date_utc": day,
+            "realised_pnl_usd": 0.0,
+            "exit_count": 0,
+            "exit_notional_usd": 0.0,
+            "funding_accrued_usd": 0.0,
+            "funding_events": 0,
+        })
+
+    for row in store.read_rows(store.fills_path):
+        if row.get("event_type") not in {"EXIT", "PARTIAL_EXIT"}:
+            continue
+        day = day_for(row)
+        day["realised_pnl_usd"] += parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
+        day["exit_count"] += 1
+        day["exit_notional_usd"] += parse_float(row.get("notional_usd"), 0.0) or 0.0
+    for row in store.read_rows(store.funding_events_path):
+        day = day_for(row)
+        day["funding_accrued_usd"] += parse_float(row.get("funding_pnl_usd"), 0.0) or 0.0
+        day["funding_events"] += 1
+
+    items = sorted(days.values(), key=lambda row: row["date_utc"], reverse=True)
+    today = utc_now().date().isoformat()
+    today_row = next((row for row in items if row["date_utc"] == today), None)
+    realised_total = sum(row["realised_pnl_usd"] for row in items)
+    return {"observedAtUtc": utc_now().isoformat(), "items": items, "metrics": [
+        {"label": "Today realised PnL", "value": f"${(today_row or {}).get('realised_pnl_usd', 0.0):,.2f}"},
+        {"label": "Today exit events", "value": str((today_row or {}).get("exit_count", 0))},
+        {"label": "Today funding accrued", "value": f"${(today_row or {}).get('funding_accrued_usd', 0.0):,.2f}"},
+        {"label": "All realised PnL", "value": f"${realised_total:,.2f}"},
+    ]}
+
+
 def _summary_payload(config: BinanceExtremeFundingConfig) -> dict:
     comparisons = _read(config.data_dir / "settlement_comparisons.csv")
     events = {row.get("event_key", "") for row in comparisons}
@@ -169,7 +210,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(HTTPStatus.OK, HTML.encode(), "text/html; charset=utf-8")
             return
-        loaders = {"/api/funding": _funding_payload, "/api/shortlist": _shortlist_payload, "/api/positions": _positions_payload, "/api/summary": _summary_payload}
+        loaders = {"/api/funding": _funding_payload, "/api/shortlist": _shortlist_payload, "/api/positions": _positions_payload, "/api/daily-pnl": _daily_pnl_payload, "/api/summary": _summary_payload}
         loader = loaders.get(path)
         if loader is None:
             self._send(HTTPStatus.NOT_FOUND, b"Not found", "text/plain")

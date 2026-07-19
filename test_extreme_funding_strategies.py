@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from binance_extreme_funding.config import DEFAULT_CONFIG as BINANCE_DEFAULT
+from binance_extreme_funding.dashboard import _daily_pnl_payload as binance_daily_pnl_payload
 from binance_extreme_funding.models import FundingSnapshot as BinanceSnapshot
 from binance_extreme_funding.paper_store import POSITION_FIELDS as BINANCE_POSITION_FIELDS
 from binance_extreme_funding.paper_store import PaperStore as BinanceStore
@@ -141,6 +142,32 @@ def fast_mexc_config(root: Path, **overrides):
 
 
 class ExtremeFundingStrategyTests(unittest.TestCase):
+    def test_binance_dashboard_groups_realised_pnl_by_utc_day(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = fast_binance_config(Path(temporary))
+            store = BinanceStore(config)
+            store.append_fill({
+                "timestamp_utc": "2026-07-17T12:00:00+00:00", "event_type": "ENTRY",
+                "realised_pnl_usd": 0.0,
+            })
+            store.append_fill({
+                "timestamp_utc": "2026-07-17T13:00:00+00:00", "event_type": "EXIT",
+                "notional_usd": 100.0, "realised_pnl_usd": 1.25,
+            })
+            store.append_fill({
+                "timestamp_utc": "2026-07-18T13:00:00+00:00", "event_type": "PARTIAL_EXIT",
+                "notional_usd": 50.0, "realised_pnl_usd": -0.20,
+            })
+            store.append_funding({
+                "timestamp_utc": "2026-07-17T08:00:00+00:00", "funding_pnl_usd": 0.75,
+            })
+            payload = binance_daily_pnl_payload(config)
+            days = {row["date_utc"]: row for row in payload["items"]}
+            self.assertEqual(days["2026-07-17"]["exit_count"], 1)
+            self.assertAlmostEqual(days["2026-07-17"]["realised_pnl_usd"], 1.25)
+            self.assertAlmostEqual(days["2026-07-17"]["funding_accrued_usd"], 0.75)
+            self.assertAlmostEqual(days["2026-07-18"]["realised_pnl_usd"], -0.20)
+
     def test_scanner_owns_snapshot_and_settlement_comparison_data(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
